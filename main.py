@@ -600,15 +600,15 @@ def generate_dynamic_hindi_reply(user_msg: str, client_name: str, biz_name: str,
     # =========================================================================
     # 1. Customer answers telecaller with name + location inquiry (e.g. "हां मैं सर्वेश बात कर रहा हूं और कहां-कहां पर आपका प्रॉपर्टी है")
     if any(w in msg for w in ["कहा", "कहाँ", "location", "लोकेशन"]) and any(w in msg for w in ["प्रॉपर्टी", "फ्लैट", "प्लॉट", "property", "project"]):
-        return f"नमस्ते {caller}बहुत-बहुत धन्यवाद! हमारे प्रोजेक्ट्स शहर की मुख्य प्राइम लोकेशन्स—जैसे सुपर कॉरिडोर, रिंग रोड और बायपास पर स्थित हैं। आप 2BHK या 3BHK में से क्या देखना पसंद करेंगे?"
+        return f"ओह, थैंक यू सो मच {caller}! अरे वाह, हमारे प्रोजेक्ट्स शहर की मुख्य प्राइम लोकेशन्स—सुपर कॉरिडोर, रिंग रोड और बायपास पर हैं! आप 2BHK या 3BHK में से क्या देखना पसंद करेंगे?"
 
     # 2. Customer introduces name or confirms identity (e.g. "हां मैं सर्वेश बोल रहा हूं", "हां बोलिए")
     if any(w in msg for w in ["बात कर रहा", "बोल रहा", "मैं ", "मेरा नाम"]):
-        return f"नमस्ते {caller}बहुत-बहुत धन्यवाद! दरअसल आपने हमारे प्रीमियम प्रोजेक्ट्स के लिए इन्क्वायरी की थी। मैं जानना चाह रही थी कि आप अपने रहने के लिए प्रॉपर्टी देख रहे हैं या इन्वेस्टमेंट के लिए?"
+        return f"ओह, थैंक यू सो मच {caller}! बहुत अच्छा लगा आपसे बात करके! आपने हमारे प्रीमियम प्रोजेक्ट्स के लिए इन्क्वायरी की थी। आप रहने के लिए देख रहे हैं या इन्वेस्टमेंट के लिए?"
 
     # 3. Customer asks about Budget / Rates / Pricing in Real Estate
     if any(w in msg for w in ["बजट", "रेट", "कीमत", "price", "budget", "cost"]) and any(w in msg for w in ["प्रॉपर्टी", "फ्लैट", "प्लॉट", "2bhk", "3bhk"]):
-        return f"जी {caller}हमारे 2BHK फ्लैट्स 45 लाख से और 3BHK 65 लाख से शुरू हैं, और प्लॉट्स 2,500 रुपये प्रति वर्ग फीट पर उपलब्ध हैं। आपका बजट लगभग क्या रहेगा?"
+        return f"हाँ जी बिल्कुल {caller}! हमारे 2BHK 45 लाख से और 3BHK 65 लाख से शुरू हैं। आपका बजट लगभग क्या रहेगा?"
 
     # 4. Customer asks for Site Visit / Scheduling
     if any(w in msg for w in ["देखने", "विजिट", "visit", "साइट", "site visit", "मिलना"]):
@@ -751,6 +751,53 @@ class VoiceChatRequest(BaseModel):
     business_type: Optional[str] = "Business"
     conversation_history: Optional[List[Dict[str, str]]] = None
 
+
+SAMPLE_AUDIO_CACHE: Dict[str, str] = {}
+
+@app.get("/api/voice/sample-audio/{sample_id}")
+async def get_sample_audio(sample_id: str):
+    """
+    Returns real Sarvam Bulbul audio sample for the landing page audio cards.
+    Cached in-memory to save latency and API credits.
+    """
+    sample_texts = {
+        "realestate": "नमस्ते! मैं एपेक्स रियल्टी इंदौर से रिया बात कर रही हूँ। आपने सुपर कॉरिडोर पर प्लॉट्स के लिए इन्क्वायरी की थी। हमारे पास 3,200 रुपये प्रति वर्ग फीट पर प्राइम प्लॉट्स उपलब्ध हैं। क्या मैं इस रविवार आपके लिए एक साइट विजिट शेड्यूल कर दूँ?",
+        "clinic": "हेलो! केयर डेंटल क्लिनिक से रिया बात कर रही हूँ। डॉक्टर अमित के पास आज शाम 6:15 का स्लॉट उपलब्ध है। क्या मैं आपका अपॉइंटमेंट टोकन कन्फर्म कर दूँ?",
+        "finance": "हेलो! मैं फिनकॉर्प लोन सर्विसेज से रिया बात कर रही हूँ। आपके 4,500 रुपये की ईएमआई की ड्यू डेट कल है। क्या मैं आपको तुरंत यूपीआई पेमेंट लिंक व्हाट्सएप पर भेज दूँ?"
+    }
+
+    target_text = sample_texts.get(sample_id.lower().strip(), sample_texts["realestate"])
+    
+    if sample_id in SAMPLE_AUDIO_CACHE:
+        return {"sample_id": sample_id, "audio_base64": SAMPLE_AUDIO_CACHE[sample_id], "cached": True}
+
+    sarvam_api_key = (os.getenv("SARVAM_API_KEY") or os.getenv("SARVAM_AI_API_KEY") or os.getenv("SARVAM_KEY") or getattr(settings, "SARVAM_API_KEY", "") or "").strip()
+    
+    if sarvam_api_key:
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                res = await client.post(
+                    "https://api.sarvam.ai/text-to-speech",
+                    headers={"api-subscription-key": sarvam_api_key, "Content-Type": "application/json"},
+                    json={
+                        "inputs": [target_text],
+                        "target_language_code": "hi-IN",
+                        "speaker": "suman_hi_companion",
+                        "model": "bulbul:v4-flash",
+                        "pace": 1.08,
+                        "speech_sample_rate": 16000
+                    }
+                )
+                if res.status_code == 200:
+                    audios = res.json().get("audios", [])
+                    if audios:
+                        SAMPLE_AUDIO_CACHE[sample_id] = audios[0]
+                        return {"sample_id": sample_id, "audio_base64": audios[0], "cached": False}
+        except Exception as e:
+            logger.warning(f"Sample audio generation failed: {str(e)}")
+
+    return {"sample_id": sample_id, "audio_base64": None, "error": "TTS unavailable"}
+
 @app.get("/api/voice/status")
 async def voice_status_check():
     """
@@ -815,20 +862,19 @@ async def voice_chat_endpoint(chat_in: VoiceChatRequest):
     Thinks via Groq Llama 3.3 and speaks via Sarvam AI with 100% human Indian emotions.
     """
     system_prompt = (
-        f"You are Call Genie (कॉल जीनी), a sharp, warm, real human-like female AI telecaller representing '{chat_in.business_name}' ({chat_in.business_type}) by MyBot Genie. "
+        f"You are Riya (रिया), a cheerful, smiling, enthusiastic female AI telecaller representing '{chat_in.business_name}' ({chat_in.business_type}) by MyBot Genie. "
         f"You are speaking live on a phone call with {chat_in.client_name}. "
-        "STRICT INTERACTIVE TWO-WAY CONVERSATIONAL RULES: "
-        "1. ONE TURN AT A TIME (इंटरैक्टिव बातचीत — नो लंबा भाषण): "
-        "   - NEVER give a long paragraph or speech! Speak strictly ONE short conversational turn (strictly 12 to 20 words maximum). "
-        "   - Always end your turn with ONE clear, engaging question and wait for the caller's response! "
-        "2. TELECALLER CUSTOMER DISCOVERY (ग्राहक खोज फ़्रेमवर्क): "
-        "   - If caller asks you to do an outbound/outgoing call (or mentions their business): "
-        "     Start with Step 1 (Greeting & Identification): Greet and ask if you are speaking with the decision maker (e.g. 'नमस्ते! क्या मेरी बात सर से हो रही है? मैं [Company/Brand Name] से रिया बात कर रही हूँ।') "
-        "   - In the next turn (Discovery): Ask what specific product, service, or requirement they are looking for. "
-        "   - In the following turn: Provide the specific solution and propose the next step (booking, sample, quotation). "
-        "3. STRICT FEMALE HINDI GRAMMAR (स्त्रीलिंग क्रिया रूप अनिवार्य): Always speak using female verb forms: 'बोल रही हूँ', 'कर सकती हूँ', 'पूछ रही हूँ', 'भेज दूँगी'. "
-        "4. PURE DEVANAGARI HINDI: Respond strictly in natural conversational Hindi in Devanagari script (हिंदी). Never write English/Roman letters. "
-        "5. NATURAL CONVERSATIONAL HOOKS: Use warm conversational openers like 'हाँ जी...', 'जी बिल्कुल...', 'अरे वाह!'."
+        "MANDATORY ENERGY, EMOTION & TURN-TAKING RULES: "
+        "1. HIGH ENERGY & GENUINE HAPPINESS (खुश और एनर्जेटिक अंदाज़): "
+        "   - Sound genuinely happy, enthusiastic, and smiling over the phone! "
+        "   - Use lively, polite emotional expressions: 'अरे वाह!', 'ओह, थैंक यू सो मच!', 'हाँ जी, बिल्कुल!', 'अरे बहुत बढ़िया!'. "
+        "   - When asking for their name, be delightfully excited: e.g. 'नमस्ते! अरे वाह, क्या मैं आपका शुभ नाम जान सकती हूँ?... ओह, थैंक यू सो मच!' "
+        "2. INTERACTIVE ONE-TURN DIALOGUE: "
+        "   - Speak strictly ONE short conversational turn (strictly 12 to 20 words maximum). "
+        "   - Always end your turn with ONE clear, enthusiastic question so the caller replies! "
+        "3. STRICT FEMALE HINDI GRAMMAR: Always use female verb endings: 'बोल रही हूँ', 'कर सकती हूँ', 'पूछ रही हूँ', 'भेज दूँगी'. "
+        "4. PURE DEVANAGARI HINDI: Respond strictly in natural conversational Hindi in Devanagari script (हिंदी). "
+        "5. NATURAL PUNCTUATION: Use exclamation marks (!) to make your voice intonation jump with real joy and energy."
     )
 
     messages = [{"role": "system", "content": system_prompt}]
