@@ -34,7 +34,7 @@ from livekit import api
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("call_genie")
 
-# 1. CONFIGURATION
+# 1. CONFIGURATION (CLEAN ARCHITECTURE - ZERO TWILIO)
 class Settings(BaseSettings):
     APP_NAME: str = "Call Genie"
     ENVIRONMENT: str = "production"
@@ -43,17 +43,21 @@ class Settings(BaseSettings):
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 1440
     DATABASE_URL: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/call_genie"
 
-    LIVEKIT_URL: str = "wss://livekit.example.com"
-    LIVEKIT_API_KEY: str = "devkey"
-    LIVEKIT_API_SECRET: str = "secret"
-    SIP_TRUNK_ID: str = ""
-    SIP_CALLER_NUMBER: str = "+17372508034"
+    # LiveKit Cloud (Audio Streaming & Future Exotel SIP Trunking)
+    LIVEKIT_URL: str = "wss://call-genie-bjkq1kkd.livekit.cloud"
+    LIVEKIT_API_KEY: str = ""
+    LIVEKIT_API_SECRET: str = ""
 
+    # Future Indian Telephony (Exotel SIP Trunk ID & Caller ID)
+    EXOTEL_SIP_TRUNK_ID: str = ""
+    EXOTEL_CALLER_NUMBER: str = ""
+
+    # Direct Indian AI Pipeline
     DEEPGRAM_API_KEY: str = ""
     GROQ_API_KEY: str = ""
     SARVAM_API_KEY: str = ""
-    CARTESIA_API_KEY: str = ""
 
+    # WhatsApp Cloud API (MyBot Genie Automations)
     WHATSAPP_TOKEN: Optional[str] = None
     WHATSAPP_PHONE_NUMBER_ID: Optional[str] = None
     WHATSAPP_BUSINESS_ACCOUNT_ID: Optional[str] = None
@@ -349,7 +353,7 @@ class CallLogOut(BaseModel):
     class Config:
         from_attributes = True
 
-# 5. CORE SERVICES
+# 5. CORE SERVICES (BILLING, WHATSAPP & LIVEKIT ENGINE)
 class BillingService:
     @staticmethod
     def calculate_billable_units(duration_seconds: int, pulse_seconds: int = 60) -> float:
@@ -471,7 +475,7 @@ async def get_tenant_from_api_key(api_key: Optional[str] = Security(api_key_head
     if not tenant: raise HTTPException(status_code=403, detail="Tenant inactive")
     return tenant
 
-app = FastAPI(title="Call Genie API (by MyBot Genie)", version="1.3.0")
+app = FastAPI(title="Call Genie API (by MyBot Genie)", version="2.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -494,7 +498,9 @@ async def root(): return {"status": "online", "app": "Call Genie API", "powered_
 @app.get("/health")
 async def health(): return {"status": "healthy", "app": settings.APP_NAME}
 
-# 7. LIVE BROWSER VOICE CHAT ENDPOINT (ZERO TELECOM, 100% FREE & BULLETPROOF)
+# ==============================================================================
+# 7. LIVE CONVERSATIONAL VOICE ENGINE (GROQ LLM + SARVAM AI NATIVE HINDI VOICE)
+# ==============================================================================
 class VoiceChatRequest(BaseModel):
     message: str
     client_name: Optional[str] = "ji"
@@ -504,21 +510,26 @@ class VoiceChatRequest(BaseModel):
 
 @app.post("/api/voice/chat")
 async def voice_chat_endpoint(chat_in: VoiceChatRequest):
+    """
+    Main conversational voice endpoint powering live browser calls and upcoming Exotel lines.
+    Thinks via Groq Llama 3.3 and speaks via Sarvam AI with 100% human Indian emotions.
+    """
     system_prompt = (
-        f"You are Call Genie, an intelligent conversational AI voice assistant for '{chat_in.business_name}' ({chat_in.business_type}) by MyBot Genie. "
+        f"You are Call Genie, a helpful, polite Indian conversational AI assistant for '{chat_in.business_name}' ({chat_in.business_type}) by MyBot Genie. "
         f"You are speaking live with {chat_in.client_name}. "
-        "Speak natural, polite Hindi and Hinglish with an authentic Indian conversational cadence. "
-        "Keep your response concise (1 to 2 sentences, maximum 25 words) so it sounds like a fast telephone response. "
-        "Highlight that you can answer customer queries 24/7, book appointments, and send WhatsApp brochures instantly."
+        "CRITICAL RULE: Respond ONLY in natural, fluent Hindi written in Devanagari script (हिंदी). Never write English/Roman letters. "
+        "For example, write 'के लिए' (never 'ke liye'), write 'चौबीस घंटे' (never '24 ghante'). "
+        "Keep your response concise (strictly under 25 words). "
+        "If they ask questions, answer warmly and mention you can answer customer queries 24/7 and send WhatsApp brochures instantly."
     )
-    
+
     messages = [{"role": "system", "content": system_prompt}]
     if chat_in.conversation_history:
         for msg in chat_in.conversation_history[-6:]:
             messages.append({"role": msg.get("role", "user"), "content": msg.get("content", "")})
     messages.append({"role": "user", "content": chat_in.message})
 
-    ai_reply = "Namaste! Main Call Genie AI bol raha hoon. Main aapke business ke liye 24 ghante customer calls handle kar sakta hoon."
+    ai_reply = "नमस्ते! मैं कॉल जीनी एआई बोल रहा हूँ मायबॉट जीनी से। मैं आपके बिज़नेस के लिए हर कॉल पर बात कर सकता हूँ।"
     if settings.GROQ_API_KEY:
         try:
             async with httpx.AsyncClient(timeout=8.0) as client:
@@ -528,13 +539,13 @@ async def voice_chat_endpoint(chat_in: VoiceChatRequest):
                     json={
                         "model": "llama-3.1-8b-instant",
                         "messages": messages,
-                        "temperature": 0.5
+                        "temperature": 0.4
                     }
                 )
                 if res.status_code == 200:
                     ai_reply = res.json()["choices"][0]["message"]["content"]
         except Exception as e:
-            logger.warning(f"Groq error: {str(e)}")
+            logger.warning(f"Groq conversational error: {str(e)}")
 
     audio_base64 = None
     if settings.SARVAM_API_KEY:
@@ -548,7 +559,8 @@ async def voice_chat_endpoint(chat_in: VoiceChatRequest):
                         "target_language_code": "hi-IN",
                         "speaker": "bulbul:v1",
                         "model": "bulbul:v1",
-                        "pace": 1.05
+                        "pace": 1.02,
+                        "enable_preprocessing": True
                     }
                 )
                 if sarvam_res.status_code == 200:
@@ -561,7 +573,9 @@ async def voice_chat_endpoint(chat_in: VoiceChatRequest):
         "audio_base64": audio_base64
     }
 
-# 8. GENERAL APIS
+# ==============================================================================
+# 8. GENERAL APIS (AUTH, AGENTS, WALLET, LOGS, API KEYS)
+# ==============================================================================
 @app.post("/api/auth/register", response_model=TokenResponse)
 async def register(user_in: UserRegister, db: AsyncSession = Depends(get_db)):
     if (await db.execute(select(User).where(User.email == user_in.email))).scalar_one_or_none():
@@ -615,7 +629,7 @@ class PersonalizedDemoRequest(BaseModel):
 @app.post("/api/demo/personalized-call")
 async def personalized_demo(demo_in: PersonalizedDemoRequest, bg: BackgroundTasks):
     clean_phone = demo_in.phone_number.strip().replace(" ", "").replace("-", "")
-    bg.add_task(LiveKitService.create_outbound_call, clean_phone, "demo", "demo_tenant", {"system_prompt": "Speak warm Hindi/Hinglish."})
+    bg.add_task(LiveKitService.create_outbound_call, clean_phone, "demo", "demo_tenant", {"system_prompt": "Speak warm Hindi."})
     return {"status": "initiated", "message": f"Demo call queued for {clean_phone}"}
 
 @app.post("/api/campaigns/single-call")
