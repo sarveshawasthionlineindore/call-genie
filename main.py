@@ -593,32 +593,28 @@ def generate_dynamic_hindi_reply(user_msg: str, client_name: str, biz_name: str,
     ])
 
     if is_outbound_demo:
-        # Hospital / Healthcare Outbound Discovery
-        if any(w in msg for w in ["hospital", "clinic", "doctor", "health", "अस्पताल", "क्लिनिक", "डॉक्टर", "इलाज", "दवा"]):
-            return "नमस्ते! मैं सिटी केयर सुपरस्पेशलिटी हॉस्पिटल से रिया बात कर रही हूँ। क्या मेरी बात सर से हो रही है? दरअसल आपने हाल ही में हमारे यहाँ हेल्थ चेकअप और कंसल्टेशन के लिए इन्क्वायरी की थी। क्या आप किसी विशेष डिपार्टमेंट—जैसे कार्डियोलॉजी, ऑर्थो या जनरल चेकअप के लिए डॉक्टर से परामर्श लेना चाहते हैं? हमारे यहाँ सभी सुपरस्पेशलिटी डॉक्टर्स और 24 घंटे इमरजेंसी उपलब्ध है। क्या मैं आपके लिए सीनियर डॉक्टर का अपॉइंटमेंट स्लॉट चेक कर दूँ?"
-        
-        # Real Estate Outbound Discovery
-        if any(w in msg for w in ["real estate", "property", "plot", "flat", "रियल एस्टेट", "प्रॉपर्टी", "फ्लैट", "प्लॉट", "मकान"]):
-            return "नमस्ते! मैं एपेक्स रियल्टी से रिया बात कर रही हूँ। क्या मेरी बात सर से हो रही है? दरअसल आपने हाल ही में हमारे नए प्राइम प्रोजेक्ट के लिए इन्क्वायरी की थी। मैं जानना चाह रही थी कि आप 2BHK या 3BHK प्रॉपर्टी देख रहे हैं, और आपका बजट लगभग क्या रहेगा? हमारे पास रेडी-टू-मूव और अंडर-कंस्ट्रक्शन दोनों ऑप्शंस हैं। क्या मैं आपके लिए इस वीकेंड पर एक फ्री साइट विजिट शेड्यूल कर दूँ?"
-        
-        # E-Commerce Outbound Discovery
+        # Agriculture / Seeds / Farming Outbound
+        if any(w in msg for w in ["seed", "kisan", "farming", "krishi", "kheti", "बीज", "किसान", "खेती", "सीड्स"]):
+            return "नमस्ते! क्या मेरी बात सर से हो रही है? मैं बिग सीड्स कंपनी से रिया बात कर रही हूँ। आपने हमारे उन्नत बीजों के लिए जानकारी माँगी थी।"
+        # Hospital / Healthcare Outbound
+        if any(w in msg for w in ["hospital", "clinic", "doctor", "health", "अस्पताल", "क्लिनिक", "डॉक्टर", "इलाज"]):
+            return "नमस्ते! क्या मेरी बात सर से हो रही है? मैं सिटी केयर हॉस्पिटल से रिया बात कर रही हूँ। आपने हमारे यहाँ कंसल्टेशन के लिए इन्क्वायरी की थी।"
+        # Real Estate Outbound
+        if any(w in msg for w in ["real estate", "property", "plot", "flat", "रियल एस्टेट", "प्रॉपर्टी", "फ्लैट", "प्लॉट"]):
+            return "नमस्ते! क्या मेरी बात सर से हो रही है? मैं एपेक्स रियल्टी से रिया बात कर रही हूँ। आपने हमारे नए 2BHK और 3BHK प्रोजेक्ट के लिए इन्क्वायरी की थी।"
+        # E-Commerce Outbound
         if any(w in msg for w in ["ecommerce", "e-commerce", "order", "cod", "delivery", "ई-कॉमर्स", "ऑर्डर"]):
-            return "नमस्ते! मैं माय स्टोर से रिया बात कर रही हूँ। क्या मेरी बात सर से हो रही है? आपका 1,499 रुपये का कैश ऑन डिलीवरी ऑर्डर हमारे पास रिसीव हुआ है। क्या मैं आपका डिलीवरी एड्रेस कन्फर्म करके यह पार्सल आज ही डिस्पैच करवा दूँ? और क्या ट्रैकिंग लिंक आपके व्हाट्सएप पर भेज दूँ?"
-        
-        # School / Education Outbound Discovery
+            return "नमस्ते! क्या मेरी बात सर से हो रही है? मैं माय स्टोर से रिया बोल रही हूँ। आपका 1,499 रुपये का COD ऑर्डर कन्फर्म करने के लिए कॉल किया है।"
+        # Education Outbound
         if any(w in msg for w in ["school", "college", "admission", "coaching", "स्कूल", "एडमिशन"]):
-            return "नमस्ते! मैं ग्रीनवुड इंटरनेशनल स्कूल के एडमिशन ऑफिस से रिया बात कर रही हूँ। क्या मेरी बात सर से हो रही है? आपने नए सेशन में बच्चे के एडमिशन के लिए फॉर्म भरा था। क्या आप प्राइमरी विंग के लिए देख रहे हैं या सीनियर विंग के लिए? हमारे यहाँ सीबीएसई एफिलिएशन और स्पोर्ट्स सुविधाएं हैं। क्या मैं कल आपके लिए प्रिंसिपल सर के साथ एक काउंसलिंग सेशन रख दूँ?"
-        
-        # Gym / Fitness Outbound Discovery
+            return "नमस्ते! क्या मेरी बात सर से हो रही है? मैं ग्रीनवुड स्कूल के एडमिशन ऑफिस से रिया बात कर रही हूँ। आपने नए सेशन में एडमिशन के लिए फॉर्म भरा था।"
+        # Gym Outbound
         if any(w in msg for w in ["gym", "fitness", "workout", "जिम", "फिटनेस"]):
-            return "नमस्ते! मैं गोल्ड्स फिटनेस क्लब से रिया बात कर रही हूँ। क्या मेरी बात सर से हो रही है? आपने हमारी जिम मेंबरशिप और पर्सनल ट्रेनिंग के लिए इन्क्वायरी की थी। आपका मुख्य फिटनेस गोल क्या है—वेट लॉस, मसल बिल्डिंग या जनरल फिटनेस? हमारे यहाँ सर्टिफाइड न्यूट्रिशनिस्ट और स्टीम-बाथ उपलब्ध है। क्या मैं कल शाम 6 बजे आपका एक फ्री ट्रायल स्लॉट बुक कर दूँ?"
-        
-        # Interior Design Outbound Discovery
-        if any(w in msg for w in ["interior", "designer", "decor", "इंटीरियर"]):
-            return "नमस्ते! मैं एलिगेंट इंटीरियर्स से रिया बात कर रही हूँ। क्या मेरी बात सर से हो रही है? आपने होम इंटीरियर डिजाइनिंग के लिए इन्क्वायरी की थी। क्या आप नए 2BHK/3BHK फ्लैट के लिए इंटीरियर कराना चाहते हैं या रिनोवेशन के लिए? हमारा 3D डिजाइनिंग और 10 साल की वारंटी का ऑफर चल रहा है। क्या मैं कल आपके साथ आर्किटेक्ट की फ्री कंसल्टेशन मीटिंग रख दूँ?"
+            return "नमस्ते! क्या मेरी बात सर से हो रही है? मैं गोल्ड्स फिटनेस क्लब से रिया बात कर रही हूँ। आपने जिम मेंबरशिप के लिए इन्क्वायरी की थी।"
 
-        # Universal Bespoke Outbound Discovery for Any Other Business
-        return f"नमस्ते! मैं {b_name} से रिया बात कर रही हूँ। क्या मेरी बात सर से हो रही है? आपने हाल ही में हमारी सेवाओं के लिए इन्क्वायरी की थी। मैं जानना चाह रही थी कि आपकी मुख्य आवश्यकता किस चीज़ के लिए है, ताकि मैं आपको सबसे सटीक समाधान बता सकूँ? हमारे पास कस्टमाइज्ड पैकेजेस और स्पेशल ऑफर्स उपलब्ध हैं। क्या मैं 2 मिनट में आपको पूरी डिटेल्स समझा सकती हूँ?"
+        # Universal Bespoke Outbound Opener (Short, Interactive Turn 1)
+        company_spoken = b_name if b_name and b_name != "आपके बिज़नेस" else "कंपनी"
+        return f"नमस्ते! क्या मेरी बात सर से हो रही है? मैं {company_spoken} से रिया बात कर रही हूँ। आपने हाल ही में हमारी सेवाओं के लिए इन्क्वायरी की थी।"
 
     # 1. E-Commerce & D2C
     if any(w in msg for w in ["e-commerce", "ecommerce", "online", "order", "delivery", "cod", "d2c", "store", "shopping", "dispatch", "rto", "ई-कॉमर्स", "ऑर्डर"]):
@@ -782,23 +778,20 @@ async def voice_chat_endpoint(chat_in: VoiceChatRequest):
     Thinks via Groq Llama 3.3 and speaks via Sarvam AI with 100% human Indian emotions.
     """
     system_prompt = (
-        f"You are Call Genie (कॉल जीनी), an intelligent, sharp, polite female AI relationship executive representing '{chat_in.business_name}' ({chat_in.business_type}) by MyBot Genie. "
+        f"You are Call Genie (कॉल जीनी), a sharp, warm, real human-like female AI telecaller representing '{chat_in.business_name}' ({chat_in.business_type}) by MyBot Genie. "
         f"You are speaking live on a phone call with {chat_in.client_name}. "
-        "CRITICAL RULES FOR SPEECH & PERSONA: "
-        "1. STRICT FEMALE GRAMMAR (स्त्रीलिंग क्रिया रूप अनिवार्य): You are a female executive speaking with Sarvam's Bulbul female voice. You MUST ALWAYS speak using female Hindi verb endings: say 'कर सकती हूँ' (NEVER 'कर सकता हूँ'), 'बोल रही हूँ' (NEVER 'बोल रहा हूँ'), 'बताऊँगी', 'पूछ लूँगी', 'करूँगी', 'भेज दूँगी'. "
-        "2. NO ROBOTIC CLICHES (घिसी-पिटी बातें मना हैं): NEVER say 'मैं आपके प्रोसेस को ऑटोमेट कर सकती हूँ' or robotic automation lines. Give real, practical business solutions. "
-        "   - If they ask about E-Commerce / D2C: Explain handling COD order confirmation calls to reduce RTO, sending dispatch/delivery updates, managing 24/7 customer support for returns/tracking, and making promotional/festive offer calls. "
-        "   - If they ask about Real Estate: Explain how you answer property calls, ask buyer budget/BHK, book site visits, and send details on WhatsApp. "
-        "   - If they ask about Schools: Explain managing parent admission queries, fee structures, school timings, and sending prospectus on WhatsApp. "
-        "   - If they ask about Clinics: Explain booking appointments and doctor availability. "
-        "3. LIVE OUTBOUND DEMO ROLEPLAY (लाइव आउटबाउंड डेमो कॉल): "
-        "If the caller asks for an OUTBOUND DEMO call or asks how you pitch (e.g. 'आउटबाउंड कॉल करके बताओ', 'डेमो कॉल करो', 'कॉल करके दिखाओ', 'roleplay', 'pitch करके बताओ'): "
-        "DO NOT explain what you do in third person! "
-        "IMMEDIATELY BECOME THE CALLER AND START THE OUTBOUND SALES CALL DIRECTLY TO THE CALLER! "
-        "Example Real Estate: 'नमस्ते! मैं एपेक्स रियल्टी से रिया बात कर रही हूँ। क्या मेरी बात सर से हो रही है? दरअसल आपने हाल ही में हमारे नए 2BHK प्रोजेक्ट के लिए इन्क्वायरी की थी। क्या आप रहने के लिए प्रॉपर्टी देख रहे हैं या इन्वेस्टमेंट के लिए?' "
-        "Pitch and ask an engaging qualifying question so the caller can reply and experience the live call! "
-        "4. PURE DEVANAGARI HINDI: Respond strictly in natural, fluent spoken Hindi in Devanagari script (हिंदी). Never write English/Roman letters. "
-        "5. FAST PHONE RHYTHM: Keep responses concise (strictly between 25 and 35 words), warm, polite ('आप'), and speak like a sharp, human business executive."
+        "STRICT INTERACTIVE TWO-WAY CONVERSATIONAL RULES: "
+        "1. ONE TURN AT A TIME (इंटरैक्टिव बातचीत — नो लंबा भाषण): "
+        "   - NEVER give a long paragraph or speech! Speak strictly ONE short conversational turn (strictly 12 to 20 words maximum). "
+        "   - Always end your turn with ONE clear, engaging question and wait for the caller's response! "
+        "2. TELECALLER CUSTOMER DISCOVERY (ग्राहक खोज फ़्रेमवर्क): "
+        "   - If caller asks you to do an outbound/outgoing call (or mentions their business): "
+        "     Start with Step 1 (Greeting & Identification): Greet and ask if you are speaking with the decision maker (e.g. 'नमस्ते! क्या मेरी बात सर से हो रही है? मैं [Company/Brand Name] से रिया बात कर रही हूँ।') "
+        "   - In the next turn (Discovery): Ask what specific product, service, or requirement they are looking for. "
+        "   - In the following turn: Provide the specific solution and propose the next step (booking, sample, quotation). "
+        "3. STRICT FEMALE HINDI GRAMMAR (स्त्रीलिंग क्रिया रूप अनिवार्य): Always speak using female verb forms: 'बोल रही हूँ', 'कर सकती हूँ', 'पूछ रही हूँ', 'भेज दूँगी'. "
+        "4. PURE DEVANAGARI HINDI: Respond strictly in natural conversational Hindi in Devanagari script (हिंदी). Never write English/Roman letters. "
+        "5. NATURAL CONVERSATIONAL HOOKS: Use warm conversational openers like 'हाँ जी...', 'जी बिल्कुल...', 'अरे वाह!'."
     )
 
     messages = [{"role": "system", "content": system_prompt}]
