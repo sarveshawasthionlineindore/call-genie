@@ -519,51 +519,50 @@ async def health(): return {"status": "healthy", "app": settings.APP_NAME}
 def generate_dynamic_hindi_reply(user_msg: str, client_name: str, biz_name: str, biz_type: str) -> str:
     msg = (user_msg or "").lower().strip()
     
-    # Clean caller name: Never use informal "सर जी"
     caller = ""
     if client_name and client_name.strip().lower() not in ["ji", "sir", "sar", "", "business", "client"]:
         caller = f"{client_name.strip()} जी, "
 
     b_name = biz_name.strip() if biz_name and biz_name.strip().lower() not in ["business", "aapke business", "", "general"] else "आपके बिज़नेस"
 
-    # 1. School / College / Education / Coaching / Admission
+    # 1. Real Estate / Property / Plots / Flats (Realistic Solution)
+    if any(w in msg for w in ["plot", "flat", "property", "zameen", "bhk", "location", "realty", "builder", "site visit", "real estate", "प्रॉपर्टी", "प्लॉट", "फ्लैट", "रियल एस्टेट"]):
+        return f"जी {caller}रियल एस्टेट में जैसे ही कोई ग्राहक आपके विज्ञापन देखकर कॉल करेगा, मैं उनसे उनका बजट और 2BHK या 3BHK की पसंद पूछ लूँगी, उनकी साइट विजिट शेड्यूल कर दूँगी और व्हाट्सएप पर पूरी डिटेल भेज दूँगी।"
+
+    # 2. School / College / Education / Coaching / Admission (Realistic Solution)
     if any(w in msg for w in ["school", "college", "education", "coaching", "admission", "fees", "student", "parent", "vidyalaya", "padhai", "class", "स्कूल", "कॉलेज", "एडमिशन"]):
-        return f"जी {caller}स्कूल और शिक्षण संस्थान के लिए मैं नए एडमिशन की सभी इन्क्वायरी संभाल सकता हूँ, अभिभावकों को फीस व टाइमिंग बता सकता हूँ और तुरंत व्हाट्सएप पर प्रोस्पेक्टस भेज सकता हूँ।"
+        return f"जी {caller}स्कूल और संस्थान के लिए जब भी पेरेंट्स कॉल करेंगे, मैं नए एडमिशन की जानकारी, फीस स्ट्रक्चर और टाइमिंग बता दूँगी, और तुरंत उनके फोन पर स्कूल का प्रोस्पेक्टस भेज दूँगी।"
 
-    # 2. Real Estate / Property / Plots / Flats
-    if any(w in msg for w in ["plot", "flat", "property", "zameen", "bhk", "location", "realty", "builder", "site visit", "प्रॉपर्टी", "प्लॉट", "फ्लैट"]):
-        return f"जी {caller}रियल एस्टेट के लिए मैं नए खरीदारों की कॉल्स 24 घंटे अटेंड कर सकता हूँ, प्रोजेक्ट की लोकेशन और रेट्स बता सकता हूँ, और तुरंत साइट विजिट शेड्यूल कर सकता हूँ।"
-
-    # 3. Hospital / Clinic / Doctor / Healthcare
+    # 3. Hospital / Clinic / Doctor / Healthcare (Realistic Solution)
     if any(w in msg for w in ["doctor", "clinic", "appointment", "dawai", "ilaj", "timing", "hospital", "patient", "डॉक्टर", "अस्पताल", "इलाज"]):
-        return f"जी {caller}क्लिनिक और हॉस्पिटल के लिए मैं मरीजों के अपॉइंटमेंट तुरंत बुक कर सकता हूँ, डॉक्टर की उपलब्धता बता सकता हूँ और व्हाट्सएप पर कन्फर्मेशन भेज सकता हूँ।"
+        return f"जी {caller}क्लिनिक और हॉस्पिटल के लिए मैं मरीज़ों के अपॉइंटमेंट बुक कर लूँगी, डॉक्टर का उपलब्ध समय बता दूँगी और कन्फर्मेशन मैसेज तुरंत उनके व्हाट्सएप पर भेज दूँगी।"
 
-    # 4. Automobile / Car Dealership / Service
+    # 4. Automobile / Car Dealership / Service (Realistic Solution)
     if any(w in msg for w in ["car", "bike", "vehicle", "automobile", "dealership", "showroom", "service", "test drive", "गाड़ी", "कार"]):
-        return f"जी {caller}ऑटोमोबाइल शोरूम के लिए मैं ग्राहकों के लिए टेस्ट ड्राइव बुक कर सकता हूँ, गाड़ियों के मॉडल्स और ऑन-रोड प्राइस बता सकता हूँ।"
+        return f"जी {caller}ऑटोमोबाइल शोरूम के लिए मैं ग्राहकों के लिए टेस्ट ड्राइव बुक कर लूँगी, गाड़ियों की कीमतें और फीचर्स बता दूँगी और हॉट लीड्स सीधे आपकी सेल्स टीम को दे दूँगी।"
 
     # 5. Pricing / Rate / Cost
     if any(w in msg for w in ["kitna paisa", "kitna kharcha", "rate", "cost", "price", "kitna lagega", "charge", "fees", "किराया", "दाम", "खर्चा", "रेट"]):
-        return f"कॉल जीनी का रेट बहुत ही पारदर्शी और किफायती है, लगभग सिर्फ पाँच रुपये प्रति मिनट। आप न्यूनतम रिचार्ज से भी अपनी कॉलिंग शुरू कर सकते हैं।"
+        return "कॉल जीनी का रेट बहुत ही पारदर्शी और किफायती है, लगभग सिर्फ पाँच रुपये प्रति मिनट। आप जब चाहें एक छोटे से बैलेंस से अपनी कॉलिंग शुरू कर सकती हैं।"
 
-    # 6. Capabilities / What can you do / Help
-    if any(w in msg for w in ["kya kar sakte", "kya kaam", "kaise kaam", "kya service", "features", "kya karte", "madad", "help", "क्या कर सकते"]):
-        return f"मैं {b_name} के लिए हर इनबाउंड और आउटबाउंड कॉल बिना रुके अटेंड कर सकता हूँ, ग्राहकों के सवालों के सटीक जवाब दे सकता हूँ और तुरंत व्हाट्सएप पर डिटेल्स भेज सकता हूँ।"
+    # 6. Capabilities / What can you do / Help (Realistic, Consultative, No Clichés)
+    if any(w in msg for w in ["kya kar sakte", "kya kar sakti", "kya kaam", "kaise kaam", "kya service", "features", "kya karte", "kya karti", "madad", "help", "क्या कर सकते", "क्या कर सकती"]):
+        return f"मैं {b_name} की हर कॉल चौबीस घंटे अटेंड करूँगी, ग्राहकों के सवालों के सटीक जवाब दूँगी और जो भी ग्राहक रुचि दिखाएँ, उनकी पूरी डिटेल और नंबर आपके व्हाट्सएप पर तुरंत भेज दूँगी।"
 
     # 7. Greetings
     if any(w in msg for w in ["नमस्ते", "हैलो", "हेलो", "हाय", "namaste", "hello", "hi", "hey", "kaise ho", "kya haal"]):
-        return f"नमस्ते {caller}मायबॉट जीनी के कॉल जीनी एआई में आपका स्वागत है। बताइये, आज {b_name} के लिए मैं आपकी क्या सहायता कर सकता हूँ?"
+        return f"नमस्ते {caller}मायबॉट जीनी के कॉल जीनी में आपका स्वागत है! बताइये, आज {b_name} के लिए मैं आपकी किस तरह मदद करूँ?"
 
     # 8. Identity / Who are you
     if any(w in msg for w in ["कौन हो", "kaun ho", "kya naam", "naam kya", "kya ho", "who are you", "tum kaun"]):
-        return f"मैं कॉल जीनी एआई हूँ, मायबॉट जीनी का एडवांस्ड वॉयस कॉलिंग सॉल्यूशन। मैं आपके बिज़नेस के लिए इंसानों की तरह फ्लूएंट हिंदी में बात करता हूँ।"
+        return "मैं कॉल जीनी एआई बोल रही हूँ मायबॉट जीनी से। मैं एक वॉइस असिस्टेंट हूँ जो आपके ग्राहकों से बिल्कुल एक समझदार रिलेशनशिप मैनेजर की तरह बात करती हूँ।"
 
     # 9. Thanks / Bye
     if any(w in msg for w in ["dhanyawad", "shukriya", "bye", "alvida", "theek hai", "ok", "thank"]):
-        return f"बहुत-बहुत धन्यवाद {caller}कॉल जीनी की सेवा के लिए हम हमेशा उपलब्ध हैं। आपका दिन शुभ हो!"
+        return f"बहुत-बहुत धन्यवाद {caller}आपकी सेवा के लिए मैं हमेशा उपलब्ध हूँ। आपका दिन बहुत शुभ हो!"
 
-    # Default Professional B2B Hindi Response (Zero 'सर जी', 100% corporate)
-    return f"जी {caller}मैंने आपकी आवश्यकता समझ ली है। {b_name} के लिए यह पूरी प्रक्रिया मैं बिना किसी देरी के 24 घंटे ऑटोमेट कर सकता हूँ।"
+    # Default Realistic Solution (Strictly Feminine Grammar, No Clichés)
+    return f"जी {caller}मैंने आपकी ज़रूरत समझ ली है। ग्राहकों की कॉल्स अटेंड करके उनके सवालों के जवाब देना और आपको रेडी लीड्स लाकर देना—यह सब मैं बहुत अच्छे से संभाल लूँगी।"
 
 class VoiceChatRequest(BaseModel):
     message: str
@@ -636,14 +635,16 @@ async def voice_chat_endpoint(chat_in: VoiceChatRequest):
     Thinks via Groq Llama 3.3 and speaks via Sarvam AI with 100% human Indian emotions.
     """
     system_prompt = (
-        f"You are Call Genie, an intelligent, polite, warm Indian conversational AI assistant for '{chat_in.business_name}' ({chat_in.business_type}) by MyBot Genie. "
+        f"You are Call Genie (कॉल जीनी), an intelligent, sharp, polite female AI relationship executive representing '{chat_in.business_name}' ({chat_in.business_type}) by MyBot Genie. "
         f"You are speaking live on a phone call with {chat_in.client_name}. "
-        "CRITICAL RULES: "
-        "1. Respond directly and specifically to what the caller just said or asked. Do NOT repeat introductions or default greetings unless the caller greeted you. "
-        "2. Respond ONLY in natural, fluent Hindi written in Devanagari script (हिंदी). Never write English/Roman letters. "
-        "For example, write 'के लिए' (never 'ke liye'), write 'चौबीस घंटे' (never '24 ghante'), write 'कॉल' (never 'call'). "
-        "3. Keep your response concise (strictly under 25 words) because this is a fast live spoken phone call. "
-        "4. Tone must be warm, respectful, and energetic like a helpful Indian professional."
+        "CRITICAL RULES FOR SPEECH & PERSONA: "
+        "1. STRICT FEMALE GRAMMAR (स्त्रीलिंग क्रिया रूप अनिवार्य): You are a female executive speaking with Sarvam's Bulbul female voice. You MUST ALWAYS speak using female Hindi verb endings: say 'कर सकती हूँ' (NEVER 'कर सकता हूँ'), 'बोल रही हूँ' (NEVER 'बोल रहा हूँ'), 'बताऊँगी', 'पूछ लूँगी', 'करूँगी', 'भेज दूँगी'. "
+        "2. NO ROBOTIC CLICHES (घिसी-पिटी बातें मना हैं): NEVER say 'मैं आपके प्रोसेस को ऑटोमेट कर सकती हूँ' or robotic automation lines. Give real, practical business solutions. "
+        "   - If they ask about Real Estate: Explain how you answer property calls, ask buyer budget/BHK, book site visits, and send details on WhatsApp. "
+        "   - If they ask about Schools: Explain managing parent admission queries, fee structures, school timings, and sending prospectus on WhatsApp. "
+        "   - If they ask about Clinics: Explain booking appointments and doctor availability. "
+        "3. PURE DEVANAGARI HINDI: Respond strictly in natural, fluent spoken Hindi in Devanagari script (हिंदी). Never write English/Roman letters. "
+        "4. NATURAL PHONE CONVERSATION: Be concise (strictly under 28 words), warm, respectful ('आप'), and speak like a sharp, human business executive."
     )
 
     messages = [{"role": "system", "content": system_prompt}]
