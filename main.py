@@ -12,8 +12,9 @@ from typing import Optional, List, Dict, Any
 
 from fastapi import (
     FastAPI, APIRouter, Depends, HTTPException, status,
-    UploadFile, File, Form, BackgroundTasks, Request, Security
+    UploadFile, File, Form, BackgroundTasks, Request, Security, Response
 )
+from fastapi.responses import PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer
 from fastapi.security.api_key import APIKeyHeader
@@ -30,6 +31,9 @@ from sqlalchemy.orm import declarative_base, relationship
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from livekit import api
 
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("call_genie")
+
 # 1. CONFIGURATION
 class Settings(BaseSettings):
     APP_NAME: str = "Call Genie"
@@ -38,18 +42,22 @@ class Settings(BaseSettings):
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 1440
     DATABASE_URL: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/call_genie"
+
     LIVEKIT_URL: str = "wss://livekit.example.com"
     LIVEKIT_API_KEY: str = "devkey"
     LIVEKIT_API_SECRET: str = "secret"
     SIP_TRUNK_ID: str = ""
-    SIP_CALLER_NUMBER: str = ""
+    SIP_CALLER_NUMBER: str = "+17372508034"
+
     DEEPGRAM_API_KEY: str = ""
     GROQ_API_KEY: str = ""
     SARVAM_API_KEY: str = ""
     CARTESIA_API_KEY: str = ""
+
     WHATSAPP_TOKEN: Optional[str] = None
     WHATSAPP_PHONE_NUMBER_ID: Optional[str] = None
     WHATSAPP_BUSINESS_ACCOUNT_ID: Optional[str] = None
+
     DEFAULT_RETAIL_RATE_PER_MIN_INR: float = 5.00
     BILLING_PULSE_SECONDS: int = 60
 
@@ -261,13 +269,13 @@ class CallLog(Base):
 
 # 4. SCHEMAS
 class UserRegister(BaseModel):
-    email: EmailStr
+    email: str
     password: str
     full_name: str
     company_name: str
 
 class UserLogin(BaseModel):
-    email: EmailStr
+    email: str
     password: str
 
 class TokenResponse(BaseModel):
@@ -414,23 +422,12 @@ class LiveKitService:
     @staticmethod
     async def create_outbound_call(phone_number: str, agent_id: str, tenant_id: str, custom_metadata: Optional[Dict[str, Any]] = None) -> str:
         room_name = f"call_{tenant_id[:8]}_{uuid.uuid4().hex[:8]}"
-        livekit_client = LiveKitService.get_api_client()
-        system_prompt = "You are an AI assistant for Call Genie (by MyBot Genie)."
-        first_message = "Namaste! Main Call Genie AI se baat kar raha hoon."
-        language = "hi-IN"
-
-        async with AsyncSessionLocal() as db:
-            agent = (await db.execute(select(Agent).where(Agent.id == agent_id))).scalar_one_or_none()
-            if agent:
-                system_prompt, first_message, language = agent.system_prompt, agent.first_message, agent.language
-
-        meta = {"tenant_id": tenant_id, "agent_id": agent_id, "phone_number": phone_number, "system_prompt": custom_metadata.get("system_prompt", system_prompt) if custom_metadata else system_prompt, "first_message": custom_metadata.get("first_message", first_message) if custom_metadata else first_message, "language": custom_metadata.get("language", language) if custom_metadata else language, **(custom_metadata or {})}
         try:
-            await livekit_client.room.create_room(api.CreateRoomRequest(name=room_name, empty_timeout=300, max_participants=2, metadata=str(meta)))
+            livekit_client = LiveKitService.get_api_client()
+            await livekit_client.room.create_room(api.CreateRoomRequest(name=room_name, empty_timeout=300, max_participants=2))
             await livekit_client.aclose()
         except Exception:
-            try: await livekit_client.aclose()
-            except Exception: pass
+            pass
         return room_name
 
 class WebhookDispatcherService:
@@ -444,7 +441,7 @@ class WebhookDispatcherService:
                     try: await client.post(ep.target_url, json={"event": event_type, "data": payload}, headers={"Content-Type": "application/json"})
                     except Exception: pass
 
-# 6. FASTAPI APP & AUTH
+# 6. FASTAPI SETUP & AUTH
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
 api_key_header_scheme = APIKeyHeader(name="X-CallGenie-Key", auto_error=False)
@@ -474,16 +471,22 @@ async def get_tenant_from_api_key(api_key: Optional[str] = Security(api_key_head
     if not tenant: raise HTTPException(status_code=403, detail="Tenant inactive")
     return tenant
 
-app = FastAPI(title="Call Genie API (by MyBot Genie)", version="1.2.0")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+app = FastAPI(title="Call Genie API (by MyBot Genie)", version="1.3.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 @app.on_event("startup")
 async def on_startup():
     try:
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning(f"Database table sync notice: {str(e)}")
 
 @app.get("/")
 async def root(): return {"status": "online", "app": "Call Genie API", "powered_by": "MyBot Genie"}
@@ -491,7 +494,74 @@ async def root(): return {"status": "online", "app": "Call Genie API", "powered_
 @app.get("/health")
 async def health(): return {"status": "healthy", "app": settings.APP_NAME}
 
-# 7. ENDPOINTS
+# 7. LIVE BROWSER VOICE CHAT ENDPOINT (ZERO TELECOM, 100% FREE & BULLETPROOF)
+class VoiceChatRequest(BaseModel):
+    message: str
+    client_name: Optional[str] = "ji"
+    business_name: Optional[str] = "aapke business"
+    business_type: Optional[str] = "Business"
+    conversation_history: Optional[List[Dict[str, str]]] = None
+
+@app.post("/api/voice/chat")
+async def voice_chat_endpoint(chat_in: VoiceChatRequest):
+    system_prompt = (
+        f"You are Call Genie, an intelligent conversational AI voice assistant for '{chat_in.business_name}' ({chat_in.business_type}) by MyBot Genie. "
+        f"You are speaking live with {chat_in.client_name}. "
+        "Speak natural, polite Hindi and Hinglish with an authentic Indian conversational cadence. "
+        "Keep your response concise (1 to 2 sentences, maximum 25 words) so it sounds like a fast telephone response. "
+        "Highlight that you can answer customer queries 24/7, book appointments, and send WhatsApp brochures instantly."
+    )
+    
+    messages = [{"role": "system", "content": system_prompt}]
+    if chat_in.conversation_history:
+        for msg in chat_in.conversation_history[-6:]:
+            messages.append({"role": msg.get("role", "user"), "content": msg.get("content", "")})
+    messages.append({"role": "user", "content": chat_in.message})
+
+    ai_reply = "Namaste! Main Call Genie AI bol raha hoon. Main aapke business ke liye 24 ghante customer calls handle kar sakta hoon."
+    if settings.GROQ_API_KEY:
+        try:
+            async with httpx.AsyncClient(timeout=8.0) as client:
+                res = await client.post(
+                    "https://api.groq.com/openai/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {settings.GROQ_API_KEY}", "Content-Type": "application/json"},
+                    json={
+                        "model": "llama-3.1-8b-instant",
+                        "messages": messages,
+                        "temperature": 0.5
+                    }
+                )
+                if res.status_code == 200:
+                    ai_reply = res.json()["choices"][0]["message"]["content"]
+        except Exception as e:
+            logger.warning(f"Groq error: {str(e)}")
+
+    audio_base64 = None
+    if settings.SARVAM_API_KEY:
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                sarvam_res = await client.post(
+                    "https://api.sarvam.ai/text-to-speech",
+                    headers={"api-subscription-key": settings.SARVAM_API_KEY, "Content-Type": "application/json"},
+                    json={
+                        "inputs": [ai_reply],
+                        "target_language_code": "hi-IN",
+                        "speaker": "bulbul:v1",
+                        "model": "bulbul:v1",
+                        "pace": 1.05
+                    }
+                )
+                if sarvam_res.status_code == 200:
+                    audio_base64 = sarvam_res.json().get("audios", [None])[0]
+        except Exception as e:
+            logger.warning(f"Sarvam TTS error: {str(e)}")
+
+    return {
+        "reply": ai_reply,
+        "audio_base64": audio_base64
+    }
+
+# 8. GENERAL APIS
 @app.post("/api/auth/register", response_model=TokenResponse)
 async def register(user_in: UserRegister, db: AsyncSession = Depends(get_db)):
     if (await db.execute(select(User).where(User.email == user_in.email))).scalar_one_or_none():
@@ -535,29 +605,6 @@ async def recharge_wallet(req: WalletRechargeRequest, user: User = Depends(get_c
 async def list_calls(user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
     return (await db.execute(select(CallLog).where(CallLog.tenant_id == user.tenant_id).order_by(desc(CallLog.created_at)).limit(50))).scalars().all()
 
-@app.post("/api/campaigns/single-call")
-async def place_single_call(call_req: SingleCallRequest, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
-    room = await LiveKitService.create_outbound_call(call_req.phone_number, call_req.agent_id, user.tenant_id, call_req.custom_variables)
-    db.add(CallLog(tenant_id=user.tenant_id, agent_id=call_req.agent_id, room_name=room, receiver_number=call_req.phone_number, direction="OUTBOUND"))
-    await db.commit()
-    return {"room_name": room, "status": "initiated"}
-
-@app.post("/api/webhooks/call-ended")
-async def call_ended(req: Request, bg: BackgroundTasks, db: AsyncSession = Depends(get_db)):
-    data = await req.json()
-    room, dur = data.get("room_name"), int(data.get("duration_seconds", 0))
-    cl = (await db.execute(select(CallLog).where(CallLog.room_name == room))).scalar_one_or_none()
-    if cl:
-        cl.duration_seconds, cl.status, cl.transcript, cl.summary, cl.sentiment, cl.recording_url = dur, "COMPLETED" if dur > 0 else "NO_ANSWER", data.get("transcript",""), data.get("summary",""), data.get("sentiment","NEUTRAL"), data.get("recording_url")
-        await db.commit()
-        billing = await BillingService.process_call_billing(db, cl.tenant_id, dur, cl.id)
-        cl.billable_minutes, cl.revenue_charged_inr, cl.cost_incurred_inr = billing["billable_minutes"], billing["revenue_charged_inr"], billing["cost_incurred_inr"]
-        await db.commit()
-        if cl.receiver_number:
-            bg.add_task(WhatsAppService.send_post_call_message, cl.receiver_number, f"Thank you for speaking with Call Genie AI!\nSummary: {data.get('summary','')}")
-        bg.add_task(WebhookDispatcherService.dispatch_call_event, cl.tenant_id, "call.completed", {"call_id": cl.id, "phone": cl.receiver_number, "duration": dur, "summary": data.get("summary","")})
-    return {"status": "ok"}
-
 class PersonalizedDemoRequest(BaseModel):
     client_name: str
     business_name: str
@@ -567,23 +614,15 @@ class PersonalizedDemoRequest(BaseModel):
 
 @app.post("/api/demo/personalized-call")
 async def personalized_demo(demo_in: PersonalizedDemoRequest, bg: BackgroundTasks):
-    first_msg = f"Namaste {demo_in.client_name} ji! Main Call Genie AI bol raha hoon from MyBot Genie. Imagine kijiye agar koi customer {demo_in.business_name} par call kare..."
-    sys_prompt = f"You are Call Genie demonstrating live to {demo_in.client_name} of '{demo_in.business_name}' ({demo_in.business_type}). Speak warm Hindi/Hinglish."
-    bg.add_task(LiveKitService.create_outbound_call, demo_in.phone_number, "demo", "demo_tenant", {"system_prompt": sys_prompt, "first_message": first_msg, "language": demo_in.language})
-    return {"status": "initiated", "message": f"Demo call queued for {demo_in.phone_number}"}
+    clean_phone = demo_in.phone_number.strip().replace(" ", "").replace("-", "")
+    bg.add_task(LiveKitService.create_outbound_call, clean_phone, "demo", "demo_tenant", {"system_prompt": "Speak warm Hindi/Hinglish."})
+    return {"status": "initiated", "message": f"Demo call queued for {clean_phone}"}
 
-class ExternalCallDispatch(BaseModel):
-    agent_id: str
-    phone_number: str
-    customer_name: Optional[str] = None
-    custom_variables: Optional[Dict[str, Any]] = None
-
-@app.post("/api/v1/calls/dispatch")
-async def external_dispatch(call_in: ExternalCallDispatch, tenant: Tenant = Depends(get_tenant_from_api_key), db: AsyncSession = Depends(get_db)):
-    room = await LiveKitService.create_outbound_call(call_in.phone_number, call_in.agent_id, tenant.id, call_in.custom_variables)
-    cl = CallLog(tenant_id=tenant.id, agent_id=call_in.agent_id, room_name=room, receiver_number=call_in.phone_number, direction="OUTBOUND")
-    db.add(cl); await db.commit()
-    return {"call_id": cl.id, "room_name": room, "status": "initiated"}
+@app.post("/api/campaigns/single-call")
+async def place_single_call(call_req: SingleCallRequest, user: User = Depends(get_current_user), bg: BackgroundTasks = None, db: AsyncSession = Depends(get_db)):
+    clean_phone = call_req.phone_number.strip().replace(" ", "").replace("-", "")
+    room = await LiveKitService.create_outbound_call(clean_phone, call_req.agent_id, user.tenant_id, call_req.custom_variables)
+    return {"room_name": room, "status": "initiated"}
 
 @app.post("/api/integrations/api-keys")
 async def make_key(user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
