@@ -578,12 +578,49 @@ async def health(): return {"status": "healthy", "app": settings.APP_NAME}
 def generate_dynamic_hindi_reply(user_msg: str, client_name: str, biz_name: str, biz_type: str) -> str:
     msg = (user_msg or "").lower().strip()
     
-    caller = ""
-    if client_name and client_name.strip().lower() not in ["ji", "sir", "sar", "", "business", "client"]:
-        caller = f"{client_name.strip()} जी, "
+    # Robust Caller Name Handling
+    extracted_caller = ""
+    c_lower = (client_name or "").strip().lower()
+    if c_lower and c_lower not in ["ji", "sir", "sar", "business", "client", "general"]:
+        extracted_caller = client_name.strip()
+    
+    # Check if user introduced their name in this message (e.g. "हां मैं सर्वेश बात कर रहा हूं" or "मेरा नाम सर्वेश है")
+    import re
+    m_match = re.search(r'(?:मैं|main|mera naam|मेरा नाम)\s+([A-Za-zऀ-ॿ]{2,15})\s+(?:बात|बोल|हूँ|hoon|hai|है)', user_msg, re.IGNORECASE)
+    if m_match:
+        name_cand = m_match.group(1).strip()
+        if name_cand not in ["बात", "बोल", "और", "यहाँ", "कहाँ", "सर", "जी", "एक"]:
+            extracted_caller = name_cand
 
-    b_name = biz_name.strip() if biz_name and biz_name.strip().lower() not in ["business", "aapke business", "", "general"] else "आपके बिज़नेस"
+    caller = f"{extracted_caller} जी, " if extracted_caller else ""
+    b_name = biz_name.strip() if biz_name and biz_name.strip().lower() not in ["business", "aapke business", "", "general"] else "कंपनी"
 
+    # =========================================================================
+    # A. MID-CALL BUYER / CUSTOMER RESPONSES (Context-Aware Turn Taking)
+    # =========================================================================
+    # 1. Customer answers telecaller with name + location inquiry (e.g. "हां मैं सर्वेश बात कर रहा हूं और कहां-कहां पर आपका प्रॉपर्टी है")
+    if any(w in msg for w in ["कहा", "कहाँ", "location", "लोकेशन"]) and any(w in msg for w in ["प्रॉपर्टी", "फ्लैट", "प्लॉट", "property", "project"]):
+        return f"नमस्ते {caller}बहुत-बहुत धन्यवाद! हमारे प्रोजेक्ट्स शहर की मुख्य प्राइम लोकेशन्स—जैसे सुपर कॉरिडोर, रिंग रोड और बायपास पर स्थित हैं। आप 2BHK या 3BHK में से क्या देखना पसंद करेंगे?"
+
+    # 2. Customer introduces name or confirms identity (e.g. "हां मैं सर्वेश बोल रहा हूं", "हां बोलिए")
+    if any(w in msg for w in ["बात कर रहा", "बोल रहा", "मैं ", "मेरा नाम"]):
+        return f"नमस्ते {caller}बहुत-बहुत धन्यवाद! दरअसल आपने हमारे प्रीमियम प्रोजेक्ट्स के लिए इन्क्वायरी की थी। मैं जानना चाह रही थी कि आप अपने रहने के लिए प्रॉपर्टी देख रहे हैं या इन्वेस्टमेंट के लिए?"
+
+    # 3. Customer asks about Budget / Rates / Pricing in Real Estate
+    if any(w in msg for w in ["बजट", "रेट", "कीमत", "price", "budget", "cost"]) and any(w in msg for w in ["प्रॉपर्टी", "फ्लैट", "प्लॉट", "2bhk", "3bhk"]):
+        return f"जी {caller}हमारे 2BHK फ्लैट्स 45 लाख से और 3BHK 65 लाख से शुरू हैं, और प्लॉट्स 2,500 रुपये प्रति वर्ग फीट पर उपलब्ध हैं। आपका बजट लगभग क्या रहेगा?"
+
+    # 4. Customer asks for Site Visit / Scheduling
+    if any(w in msg for w in ["देखने", "विजिट", "visit", "साइट", "site visit", "मिलना"]):
+        return f"जी {caller}बिल्कुल! मैं इस शनिवार या रविवार को आपकी फ्री साइट विजिट शेड्यूल कर सकती हूँ। आप सुबह 11 बजे आना पसंद करेंगे या शाम 4 बजे?"
+
+    # 5. Customer asks for Brochure / Details on WhatsApp
+    if any(w in msg for w in ["ब्रोशर", "brochure", "whatsapp", "व्हाट्सएप", "डिटेल", "फोटो"]):
+        return f"जी {caller}मैं आपके इसी मोबाइल नंबर पर प्रोजेक्ट का लेआउट, फ्लोर प्लान और ब्रोशर तुरंत व्हाट्सएप पर भेज रही हूँ। क्या मैं थोड़ी देर बाद फॉलो-अप कॉल कर लूँ?"
+
+    # =========================================================================
+    # B. FIRST-TURN OUTBOUND DEMO STARTERS
+    # =========================================================================
     # 0. LIVE OUTBOUND DEMO CALL & CUSTOMER DISCOVERY (Real Telecaller Simulation)
     is_outbound_demo = any(w in msg for w in [
         "outbound call", "outbound", "outgoing", "आउटबाउंड कॉल", "आउटबाउंड", "आउटगोइंग कॉल", "आउटगोइंग",
