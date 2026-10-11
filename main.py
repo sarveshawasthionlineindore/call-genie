@@ -1,6 +1,3 @@
-from dotenv import load_dotenv
-load_dotenv()
-
 import os
 import sys
 import uuid
@@ -10,6 +7,7 @@ import logging
 import asyncio
 import httpx
 import json
+import re
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
 
@@ -17,7 +15,7 @@ from fastapi import (
     FastAPI, APIRouter, Depends, HTTPException, status,
     UploadFile, File, Form, BackgroundTasks, Request, Security, Response
 )
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import PlainTextResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer
 from fastapi.security.api_key import APIKeyHeader
@@ -38,34 +36,38 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("call_genie")
 
 # ==============================================================================
-# 1. CONFIGURATION (CLEAN ARCHITECTURE - ZERO TWILIO)
+# 1. CONFIGURATION (MYBOT GENIE CALL GENIE CLOUD)
 # ==============================================================================
 class Settings(BaseSettings):
     APP_NAME: str = "Call Genie"
     ENVIRONMENT: str = "production"
-    SECRET_KEY: str = "call_genie_super_secret_jwt_key_2026"
+    SECRET_KEY: str = os.getenv("SECRET_KEY", "call_genie_super_secret_jwt_key_2026")
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 1440
-    DATABASE_URL: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/call_genie"
+    DATABASE_URL: str = os.getenv("DATABASE_URL", "sqlite+aiosqlite:////tmp/call_genie_auth.db")
 
-    # LiveKit Cloud (Audio Streaming & Future Exotel SIP Trunking)
-    LIVEKIT_URL: str = "wss://call-genie-bjkq1kkd.livekit.cloud"
-    LIVEKIT_API_KEY: str = ""
-    LIVEKIT_API_SECRET: str = ""
+    # LiveKit Cloud
+    LIVEKIT_URL: str = os.getenv("LIVEKIT_URL", "wss://call-genie-bjkq1kkd.livekit.cloud")
+    LIVEKIT_API_KEY: str = os.getenv("LIVEKIT_API_KEY", "")
+    LIVEKIT_API_SECRET: str = os.getenv("LIVEKIT_API_SECRET", "")
 
-    # Future Indian Telephony (Exotel SIP Trunk ID & Caller ID)
-    EXOTEL_SIP_TRUNK_ID: str = ""
-    EXOTEL_CALLER_NUMBER: str = ""
+    # Exotel Indian Telephony
+    EXOTEL_SIP_TRUNK_ID: str = os.getenv("EXOTEL_SIP_TRUNK_ID", "")
+    EXOTEL_CALLER_NUMBER: str = os.getenv("EXOTEL_CALLER_NUMBER", "")
 
-    # Direct Indian AI Pipeline
-    DEEPGRAM_API_KEY: str = ""
-    GROQ_API_KEY: str = ""
-    SARVAM_API_KEY: str = ""
+    # Indian AI Speech & LLM Pipeline
+    DEEPGRAM_API_KEY: str = os.getenv("DEEPGRAM_API_KEY", "")
+    GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")
+    SARVAM_API_KEY: str = os.getenv("SARVAM_API_KEY", "")
 
-    # WhatsApp Cloud API (MyBot Genie Automations)
-    WHATSAPP_TOKEN: Optional[str] = None
-    WHATSAPP_PHONE_NUMBER_ID: Optional[str] = None
-    WHATSAPP_BUSINESS_ACCOUNT_ID: Optional[str] = None
+    # Meta WhatsApp Cloud API via WhatAPI Gateway
+    WHATSAPP_API_URL: str = os.getenv("WHATSAPP_API_URL", "https://crmapi1.whatapi.in/api/meta")
+    WHATSAPP_TOKEN: Optional[str] = os.getenv("WHATSAPP_TOKEN", None)
+    WHATSAPP_PHONE_NUMBER_ID: Optional[str] = os.getenv("WHATSAPP_PHONE_NUMBER_ID", None)
+    WHATSAPP_BUSINESS_ACCOUNT_ID: Optional[str] = os.getenv("WHATSAPP_BUSINESS_ACCOUNT_ID", None)
+    WHATSAPP_TEMPLATE_NAME: str = os.getenv("WHATSAPP_TEMPLATE_NAME", "newmsg_4578000")
+    WHATSAPP_TEMPLATE_LANG: str = os.getenv("WHATSAPP_TEMPLATE_LANG", "nl")
+    WHATSAPP_BANNER_IMAGE_URL: str = os.getenv("WHATSAPP_BANNER_IMAGE_URL", "https://call.mybotgenie.in/assets/banner.png")
 
     DEFAULT_RETAIL_RATE_PER_MIN_INR: float = 5.00
     BILLING_PULSE_SECONDS: int = 60
@@ -77,7 +79,7 @@ class Settings(BaseSettings):
 settings = Settings()
 
 # ==============================================================================
-# 2. DATABASE & ASYNC ENGINE
+# 2. DATABASE & ASYNC ENGINE (WITH ZERO-FAILURE SQLITE RESILIENCE)
 # ==============================================================================
 db_url = settings.DATABASE_URL
 if db_url.startswith("postgres://"):
@@ -85,14 +87,18 @@ if db_url.startswith("postgres://"):
 elif db_url.startswith("postgresql://") and not db_url.startswith("postgresql+asyncpg://"):
     db_url = db_url.replace("postgresql://", "postgresql+asyncpg://", 1)
 
-engine = create_async_engine(
-    db_url,
-    echo=False,
-    pool_pre_ping=True,
-    pool_size=10,
-    max_overflow=20
-)
+def create_engine_safe(url: str):
+    if "sqlite" in url:
+        return create_async_engine(url, echo=False)
+    return create_async_engine(
+        url,
+        echo=False,
+        pool_pre_ping=True,
+        pool_size=10,
+        max_overflow=20
+    )
 
+engine = create_engine_safe(db_url)
 AsyncSessionLocal = async_sessionmaker(
     bind=engine,
     class_=AsyncSession,
@@ -131,166 +137,160 @@ class Tenant(Base):
     agents = relationship("Agent", back_populates="tenant", cascade="all, delete-orphan")
     campaigns = relationship("Campaign", back_populates="tenant", cascade="all, delete-orphan")
     call_logs = relationship("CallLog", back_populates="tenant", cascade="all, delete-orphan")
-    api_keys = relationship("ApiKey", back_populates="tenant", cascade="all, delete-orphan")
-    webhook_endpoints = relationship("ClientWebhookEndpoint", back_populates="tenant", cascade="all, delete-orphan")
 
 class User(Base):
     __tablename__ = "users"
     id = Column(String(36), primary_key=True, default=generate_uuid)
-    tenant_id = Column(String(36), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False)
+    tenant_id = Column(String(36), ForeignKey("tenants.id"), nullable=False)
     email = Column(String(255), unique=True, index=True, nullable=False)
     hashed_password = Column(String(255), nullable=False)
     full_name = Column(String(255), nullable=True)
-    phone_number = Column(String(50), nullable=True)
-    role = Column(String(50), default="admin")
+    role = Column(String(50), default="tenant_admin")
     is_active = Column(Boolean, default=True)
     created_at = Column(DateTime, default=datetime.utcnow)
+
     tenant = relationship("Tenant", back_populates="users")
-
-class ApiKey(Base):
-    __tablename__ = "api_keys"
-    id = Column(String(36), primary_key=True, default=generate_uuid)
-    tenant_id = Column(String(36), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True)
-    name = Column(String(100), nullable=False, default="Default API Key")
-    key = Column(String(128), unique=True, index=True, nullable=False)
-    is_active = Column(Boolean, default=True)
-    last_used_at = Column(DateTime, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    tenant = relationship("Tenant", back_populates="api_keys")
-
-class ClientWebhookEndpoint(Base):
-    __tablename__ = "client_webhook_endpoints"
-    id = Column(String(36), primary_key=True, default=generate_uuid)
-    tenant_id = Column(String(36), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True)
-    target_url = Column(String(512), nullable=False)
-    description = Column(String(255), nullable=True)
-    secret = Column(String(64), nullable=True)
-    is_active = Column(Boolean, default=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    tenant = relationship("Tenant", back_populates="webhook_endpoints")
 
 class Wallet(Base):
     __tablename__ = "wallets"
     id = Column(String(36), primary_key=True, default=generate_uuid)
-    tenant_id = Column(String(36), ForeignKey("tenants.id", ondelete="CASCADE"), unique=True, nullable=False)
-    balance_inr = Column(Float, default=100.00)
+    tenant_id = Column(String(36), ForeignKey("tenants.id"), unique=True, nullable=False)
+    balance_inr = Column(Float, default=100.0)
+    total_recharged_inr = Column(Float, default=100.0)
+    total_spent_inr = Column(Float, default=0.0)
     currency = Column(String(10), default="INR")
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
     tenant = relationship("Tenant", back_populates="wallet")
     transactions = relationship("WalletTransaction", back_populates="wallet", cascade="all, delete-orphan")
 
 class WalletTransaction(Base):
     __tablename__ = "wallet_transactions"
     id = Column(String(36), primary_key=True, default=generate_uuid)
-    wallet_id = Column(String(36), ForeignKey("wallets.id", ondelete="CASCADE"), nullable=False)
-    tenant_id = Column(String(36), nullable=False, index=True)
+    wallet_id = Column(String(36), ForeignKey("wallets.id"), nullable=False)
+    transaction_type = Column(String(50), nullable=False)
     amount_inr = Column(Float, nullable=False)
-    type = Column(String(20), nullable=False)
-    description = Column(String(255), nullable=True)
-    reference_id = Column(String(100), nullable=True)
+    balance_after_inr = Column(Float, nullable=False)
+    reference = Column(String(255), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
+
     wallet = relationship("Wallet", back_populates="transactions")
 
 class Agent(Base):
     __tablename__ = "agents"
     id = Column(String(36), primary_key=True, default=generate_uuid)
-    tenant_id = Column(String(36), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True)
+    tenant_id = Column(String(36), ForeignKey("tenants.id"), nullable=False)
     name = Column(String(255), nullable=False)
+    description = Column(Text, nullable=True)
+    language = Column(String(20), default="hi-IN")
+    stt_provider = Column(String(50), default="deepgram")
+    stt_model = Column(String(50), default="nova-2-hi")
+    llm_provider = Column(String(50), default="groq")
+    llm_model = Column(String(50), default="llama-3.3-70b-versatile")
+    tts_provider = Column(String(50), default="sarvam")
+    tts_voice = Column(String(50), default="suman_hi_companion")
     system_prompt = Column(Text, nullable=False)
-    first_message = Column(Text, nullable=False)
-    voice_provider = Column(String(50), default="sarvam")
-    voice_id = Column(String(100), default="bulbul:v1")
-    language = Column(String(50), default="hi-IN")
-    temperature = Column(Float, default=0.7)
-    inbound_phone_number = Column(String(50), nullable=True)
+    greeting_message = Column(Text, nullable=False)
+    call_direction = Column(String(20), default="both")
+    max_duration_seconds = Column(Integer, default=600)
+    interruption_threshold = Column(Float, default=0.5)
     post_call_whatsapp_enabled = Column(Boolean, default=True)
     whatsapp_template_name = Column(String(100), nullable=True)
     whatsapp_followup_message = Column(Text, nullable=True)
     is_active = Column(Boolean, default=True)
     created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
     tenant = relationship("Tenant", back_populates="agents")
-    campaigns = relationship("Campaign", back_populates="agent")
     call_logs = relationship("CallLog", back_populates="agent")
-    knowledge_docs = relationship("KnowledgeDocument", back_populates="agent", cascade="all, delete-orphan")
 
 class KnowledgeDocument(Base):
     __tablename__ = "knowledge_documents"
     id = Column(String(36), primary_key=True, default=generate_uuid)
-    tenant_id = Column(String(36), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True)
-    agent_id = Column(String(36), ForeignKey("agents.id", ondelete="CASCADE"), nullable=False, index=True)
+    tenant_id = Column(String(36), ForeignKey("tenants.id"), nullable=False)
     title = Column(String(255), nullable=False)
-    doc_type = Column(String(50), default="TEXT")
+    doc_type = Column(String(50), default="text")
     raw_content = Column(Text, nullable=False)
-    structured_qa = Column(JSON, default=list)
-    is_active = Column(Boolean, default=True)
+    cleaned_chunks = Column(JSON, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
-    agent = relationship("Agent", back_populates="knowledge_docs")
 
 class Campaign(Base):
     __tablename__ = "campaigns"
     id = Column(String(36), primary_key=True, default=generate_uuid)
-    tenant_id = Column(String(36), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True)
-    agent_id = Column(String(36), ForeignKey("agents.id", ondelete="CASCADE"), nullable=False)
+    tenant_id = Column(String(36), ForeignKey("tenants.id"), nullable=False)
+    agent_id = Column(String(36), ForeignKey("agents.id"), nullable=False)
     name = Column(String(255), nullable=False)
-    status = Column(String(50), default="DRAFT")
-    total_contacts = Column(Integer, default=0)
-    completed_contacts = Column(Integer, default=0)
-    successful_calls = Column(Integer, default=0)
-    concurrency_limit = Column(Integer, default=1)
+    status = Column(String(50), default="draft")
+    total_leads = Column(Integer, default=0)
+    completed_calls = Column(Integer, default=0)
+    failed_calls = Column(Integer, default=0)
     created_at = Column(DateTime, default=datetime.utcnow)
-    tenant = relationship("Tenant", back_populates="campaigns")
-    agent = relationship("Agent", back_populates="campaigns")
-    contacts = relationship("Contact", back_populates="campaign", cascade="all, delete-orphan")
 
-class Contact(Base):
-    __tablename__ = "contacts"
+    tenant = relationship("Tenant", back_populates="campaigns")
+    leads = relationship("Lead", back_populates="campaign", cascade="all, delete-orphan")
+
+class Lead(Base):
+    __tablename__ = "leads"
     id = Column(String(36), primary_key=True, default=generate_uuid)
-    campaign_id = Column(String(36), ForeignKey("campaigns.id", ondelete="CASCADE"), nullable=False, index=True)
-    phone_number = Column(String(50), nullable=False)
-    name = Column(String(255), nullable=True)
-    custom_data = Column(JSON, default=dict)
-    status = Column(String(50), default="PENDING")
-    call_id = Column(String(100), nullable=True)
+    campaign_id = Column(String(36), ForeignKey("campaigns.id"), nullable=False)
+    phone_number = Column(String(30), nullable=False)
+    first_name = Column(String(100), nullable=True)
+    custom_variables = Column(JSON, nullable=True)
+    status = Column(String(50), default="pending")
+    call_attempts = Column(Integer, default=0)
     created_at = Column(DateTime, default=datetime.utcnow)
-    campaign = relationship("Campaign", back_populates="contacts")
+
+    campaign = relationship("Campaign", back_populates="leads")
 
 class CallLog(Base):
     __tablename__ = "call_logs"
     id = Column(String(36), primary_key=True, default=generate_uuid)
-    tenant_id = Column(String(36), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True)
-    agent_id = Column(String(36), ForeignKey("agents.id", ondelete="SET NULL"), nullable=True)
-    campaign_id = Column(String(36), ForeignKey("campaigns.id", ondelete="SET NULL"), nullable=True)
-    contact_id = Column(String(36), ForeignKey("contacts.id", ondelete="SET NULL"), nullable=True)
-    room_name = Column(String(255), unique=True, index=True, nullable=False)
-    caller_number = Column(String(50), nullable=True)
-    receiver_number = Column(String(50), nullable=True)
-    direction = Column(String(20), default="OUTBOUND")
+    tenant_id = Column(String(36), ForeignKey("tenants.id"), nullable=False)
+    agent_id = Column(String(36), ForeignKey("agents.id"), nullable=True)
+    lead_phone = Column(String(30), nullable=False)
+    customer_name = Column(String(100), nullable=True)
+    direction = Column(String(20), default="outbound")
     duration_seconds = Column(Integer, default=0)
-    billable_minutes = Column(Float, default=0.0)
-    cost_incurred_inr = Column(Float, default=0.0)
-    revenue_charged_inr = Column(Float, default=0.0)
-    status = Column(String(50), default="INITIATED")
-    recording_url = Column(Text, nullable=True)
-    transcript = Column(Text, nullable=True)
+    billed_minutes = Column(Integer, default=0)
+    cost_inr = Column(Float, default=0.0)
+    call_status = Column(String(50), default="completed")
+    end_reason = Column(String(100), nullable=True)
+    transcript = Column(JSON, nullable=True)
     summary = Column(Text, nullable=True)
     sentiment = Column(String(50), nullable=True)
     whatsapp_status = Column(String(50), default="NONE")
     created_at = Column(DateTime, default=datetime.utcnow)
+
     tenant = relationship("Tenant", back_populates="call_logs")
     agent = relationship("Agent", back_populates="call_logs")
+
+class ApiKey(Base):
+    __tablename__ = "api_keys"
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    tenant_id = Column(String(36), ForeignKey("tenants.id"), nullable=False)
+    key = Column(String(128), unique=True, index=True, nullable=False)
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+class ClientWebhookEndpoint(Base):
+    __tablename__ = "client_webhook_endpoints"
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    tenant_id = Column(String(36), ForeignKey("tenants.id"), nullable=False)
+    target_url = Column(String(512), nullable=False)
+    event_type = Column(String(100), default="call.completed")
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
 
 # ==============================================================================
 # 4. SCHEMAS
 # ==============================================================================
 class UserRegister(BaseModel):
-    email: str
+    email: EmailStr
     password: str
-    full_name: str
     company_name: str
+    full_name: Optional[str] = None
 
 class UserLogin(BaseModel):
-    email: str
+    email: EmailStr
     password: str
 
 class TokenResponse(BaseModel):
@@ -302,13 +302,11 @@ class TokenResponse(BaseModel):
 
 class AgentCreate(BaseModel):
     name: str
-    system_prompt: str
-    first_message: str
-    voice_provider: Optional[str] = "sarvam"
-    voice_id: Optional[str] = "bulbul:v1"
+    description: Optional[str] = None
     language: Optional[str] = "hi-IN"
-    temperature: Optional[float] = 0.7
-    inbound_phone_number: Optional[str] = None
+    tts_voice: Optional[str] = "suman_hi_companion"
+    system_prompt: str
+    greeting_message: str
     post_call_whatsapp_enabled: Optional[bool] = True
     whatsapp_template_name: Optional[str] = None
     whatsapp_followup_message: Optional[str] = None
@@ -316,25 +314,16 @@ class AgentCreate(BaseModel):
 class AgentOut(BaseModel):
     id: str
     name: str
-    system_prompt: str
-    first_message: str
-    voice_provider: str
-    voice_id: str
+    description: Optional[str]
     language: str
-    temperature: float
-    inbound_phone_number: Optional[str]
+    tts_voice: str
+    system_prompt: str
+    greeting_message: str
     post_call_whatsapp_enabled: bool
     whatsapp_followup_message: Optional[str]
     is_active: bool
     created_at: datetime
-    class Config:
-        from_attributes = True
-
-class SingleCallRequest(BaseModel):
-    agent_id: str
-    phone_number: str
-    customer_name: Optional[str] = None
-    custom_variables: Optional[Dict[str, Any]] = None
+    class Config: from_attributes = True
 
 class WalletOut(BaseModel):
     balance_inr: float
@@ -343,189 +332,175 @@ class WalletOut(BaseModel):
 
 class WalletRechargeRequest(BaseModel):
     amount_inr: float
-    payment_reference: str
+    payment_reference: Optional[str] = None
 
 class CallLogOut(BaseModel):
     id: str
-    room_name: str
-    caller_number: Optional[str]
-    receiver_number: Optional[str]
+    lead_phone: str
     direction: str
     duration_seconds: int
-    billable_minutes: float
-    revenue_charged_inr: float
-    status: str
-    recording_url: Optional[str]
-    transcript: Optional[str]
+    billed_minutes: int
+    cost_inr: float
+    call_status: str
     summary: Optional[str]
     sentiment: Optional[str]
     whatsapp_status: str
     created_at: datetime
-    class Config:
-        from_attributes = True
+    class Config: from_attributes = True
+
+class SingleCallRequest(BaseModel):
+    agent_id: str
+    phone_number: str
+    custom_variables: Optional[Dict[str, Any]] = None
 
 # ==============================================================================
-# 5. CORE SERVICES (BILLING, WHATSAPP & LIVEKIT ENGINE)
+# 5. CORE SERVICES (WHATSAPP, LIVEKIT, BILLING)
 # ==============================================================================
-class BillingService:
-    @staticmethod
-    def calculate_billable_units(duration_seconds: int, pulse_seconds: int = 60) -> float:
-        if duration_seconds <= 0: return 0.0
-        pulses = math.ceil(duration_seconds / pulse_seconds)
-        return (pulses * pulse_seconds) / 60.0
-
-    @staticmethod
-    async def check_wallet_balance(db: AsyncSession, tenant_id: str, min_required_inr: float = 5.0) -> bool:
-        stmt = select(Wallet).where(Wallet.tenant_id == tenant_id)
-        wallet = (await db.execute(stmt)).scalar_one_or_none()
-        return bool(wallet and wallet.balance_inr >= min_required_inr)
-
-    @staticmethod
-    async def process_call_billing(db: AsyncSession, tenant_id: str, duration_seconds: int, call_log_id: str) -> dict:
-        stmt = select(Tenant).where(Tenant.id == tenant_id)
-        tenant = (await db.execute(stmt)).scalar_one_or_none()
-        rate_per_min = tenant.rate_per_min_inr if tenant else settings.DEFAULT_RETAIL_RATE_PER_MIN_INR
-        billable_minutes = BillingService.calculate_billable_units(duration_seconds, settings.BILLING_PULSE_SECONDS)
-        revenue_charged = round(billable_minutes * rate_per_min, 2)
-        internal_cogs = round(billable_minutes * 2.10, 2)
-
-        if revenue_charged > 0:
-            wallet = (await db.execute(select(Wallet).where(Wallet.tenant_id == tenant_id))).scalar_one_or_none()
-            if wallet:
-                wallet.balance_inr = round(wallet.balance_inr - revenue_charged, 2)
-                db.add(WalletTransaction(wallet_id=wallet.id, tenant_id=tenant_id, amount_inr=revenue_charged, type="DEBIT", description=f"Call {duration_seconds}s", reference_id=call_log_id))
-                await db.commit()
-
-        return {"billable_minutes": billable_minutes, "revenue_charged_inr": revenue_charged, "cost_incurred_inr": internal_cogs}
-
-    @staticmethod
-    async def credit_wallet(db: AsyncSession, tenant_id: str, amount_inr: float, reference_id: str, description: str = "Wallet Recharge") -> float:
-        wallet = (await db.execute(select(Wallet).where(Wallet.tenant_id == tenant_id))).scalar_one_or_none()
-        if not wallet:
-            wallet = Wallet(tenant_id=tenant_id, balance_inr=amount_inr)
-            db.add(wallet); await db.flush()
-        else:
-            wallet.balance_inr = round(wallet.balance_inr + amount_inr, 2)
-
-        db.add(WalletTransaction(wallet_id=wallet.id, tenant_id=tenant_id, amount_inr=amount_inr, type="CREDIT", description=description, reference_id=reference_id))
-        await db.commit()
-        return wallet.balance_inr
-
 class WhatsAppService:
     @staticmethod
     def _clean_phone_number(phone: str) -> str:
-        digits = "".join(filter(str.isdigit, phone))
-        return f"91{digits}" if len(digits) == 10 else digits
+        digits = "".join(filter(str.isdigit, phone or ""))
+        if len(digits) == 10:
+            return f"91{digits}"
+        if digits.startswith("0") and len(digits) == 11:
+            return f"91{digits[1:]}"
+        return digits
 
     @staticmethod
-    async def send_post_call_message(phone_number: str, message_text: Optional[str] = None, **kwargs) -> Dict[str, Any]:
-        token = (os.getenv("WHATSAPP_TOKEN") or getattr(settings, "WHATSAPP_TOKEN", "") or "").strip().replace('"', '').replace("'", "")
-        phone_id = (os.getenv("WHATSAPP_PHONE_NUMBER_ID") or getattr(settings, "WHATSAPP_PHONE_NUMBER_ID", "") or "").strip().replace('"', '').replace("'", "")
-        base_url = (os.getenv("WHATSAPP_API_URL") or "https://graph.facebook.com").strip().rstrip('/')
-        version = (os.getenv("WHATSAPP_API_VERSION") or "v20.0").strip().lstrip('/')
-
-        if not token or not phone_id:
-            logger.warning("WhatsApp credentials missing in environment.")
-            return {"success": False, "error": "WHATSAPP_TOKEN or WHATSAPP_PHONE_NUMBER_ID missing in environment variables"}
+    async def send_post_call_message(
+        phone_number: str,
+        customer_name: Optional[str] = None,
+        custom_message: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Sends post-call WhatsApp follow-up via WhatAPI Meta Gateway with approved 9-variable template.
+        """
+        if not settings.WHATSAPP_TOKEN or not settings.WHATSAPP_PHONE_NUMBER_ID:
+            logger.warning("WhatsApp credentials not set in environment.")
+            return {"success": False, "error": "Missing WHATSAPP_TOKEN or WHATSAPP_PHONE_NUMBER_ID"}
 
         clean_number = WhatsAppService._clean_phone_number(phone_number)
+        template_name = settings.WHATSAPP_TEMPLATE_NAME.strip().replace(" ", "_")
+        template_lang = settings.WHATSAPP_TEMPLATE_LANG or "nl"
+        banner_url = settings.WHATSAPP_BANNER_IMAGE_URL or "https://call.mybotgenie.in/assets/banner.png"
         
-        # Smart candidate URLs for WhatAPI proxy & official Meta API
-        urls_to_try = []
-        if version:
-            urls_to_try.append(f"{base_url}/{version}/{phone_id}/messages")
-        urls_to_try.append(f"{base_url}/{phone_id}/messages")
-        urls_to_try.append(f"{base_url}/messages")
+        # Display name logic: Discovered name or fallback to 'Sir'
+        display_name = customer_name.strip() if customer_name and customer_name.strip().lower() not in ["ji", "sir", "customer", "user", "none", "null", ""] else "Sir"
+
+        # Clean endpoint URL
+        base_url = settings.WHATSAPP_API_URL.rstrip("/")
+        if base_url.endswith("/messages"):
+            endpoint_url = base_url
+        else:
+            endpoint_url = f"{base_url}/{settings.WHATSAPP_PHONE_NUMBER_ID}/messages"
 
         headers = {
-            "Authorization": f"Bearer {token}",
+            "Authorization": f"Bearer {settings.WHATSAPP_TOKEN}",
             "Content-Type": "application/json"
         }
-        
-        # Meta Cloud API strictly requires underscores in template names (spaces are invalid in Graph API)
-        raw_tmpl = (os.getenv("WHATSAPP_TEMPLATE_NAME") or "newmsg 4578000").strip()
-        names_to_try = [raw_tmpl.replace(" ", "_").lower(), raw_tmpl]
-        
-        template_lang = (os.getenv("WHATSAPP_TEMPLATE_LANG") or "nl").strip()
-        raw_header_img = (os.getenv("WHATSAPP_HEADER_IMAGE_URL") or "https://call.mybotgenie.in/assets/banner.png").strip()
-        images_to_try = [raw_header_img, "https://call.mybotgenie.in/assets/logo.jpg"]
-        
-        c_name = kwargs.get("client_name") or ""
-        clean_name = str(c_name).strip()
-        if not clean_name or clean_name.lower() in ["ji", "sir", "sar", "there", "client", "customer", "unknown", "aap", "none", "aapke business"]:
-            greeting_name = "Sir"
-        else:
-            greeting_name = clean_name[0].upper() + clean_name[1:] if clean_name[0].isascii() else clean_name
 
-        var_1 = f"👋 Hi {greeting_name}, thank you for your interest in MyBot Genie AI Calling Solution! 🤖"
-        var_2 = "📞 Automated AI Calls — Handle customer calls 24/7."
-        var_3 = "⚡ Instant Lead Follow-ups — Connect with leads faster."
-        var_4 = "🎙️ Human-Like Conversations — Engage customers naturally with AI."
-        var_5 = "📈 More Conversions — Never miss an opportunity to follow up."
-        var_6 = "⏱️ Save Time & Costs — Reduce manual calling efforts."
-        var_7 = "🔄 Smart Lead Management — Streamline your calling workflow."
-        var_8 = "🚀 Scale Your Business with intelligent AI-powered calling!"
-        var_9 = "Team MyBot Genie, Indore 💜"
-
-        body_components = [
-            {"type": "text", "text": var_1},
-            {"type": "text", "text": var_2},
-            {"type": "text", "text": var_3},
-            {"type": "text", "text": var_4},
-            {"type": "text", "text": var_5},
-            {"type": "text", "text": var_6},
-            {"type": "text", "text": var_7},
-            {"type": "text", "text": var_8},
-            {"type": "text", "text": var_9}
-        ]
-
-        last_error = ""
-        last_status = 500
-        
-        try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                for target_url in urls_to_try:
-                    for tmpl_name in names_to_try:
-                        for img_url in images_to_try:
-                            payload = {
-                                "messaging_product": "whatsapp",
-                                "recipient_type": "individual",
-                                "to": clean_number,
-                                "type": "template",
-                                "template": {
-                                    "name": tmpl_name,
-                                    "language": {"code": template_lang},
-                                    "components": [
-                                        {
-                                            "type": "header",
-                                            "parameters": [
-                                                {"type": "image", "image": {"link": img_url}}
-                                            ]
-                                        },
-                                        {
-                                            "type": "body",
-                                            "parameters": body_components
-                                        }
-                                    ]
-                                }
+        # Approved Template Components with Image Header + 9 Body Parameters
+        payload_template = {
+            "messaging_product": "whatsapp",
+            "recipient_type": "individual",
+            "to": clean_number,
+            "type": "template",
+            "template": {
+                "name": template_name,
+                "language": {"code": template_lang},
+                "components": [
+                    {
+                        "type": "header",
+                        "parameters": [
+                            {
+                                "type": "image",
+                                "image": {"link": banner_url}
                             }
-                            res = await client.post(target_url, headers=headers, json=payload)
-                            logger.info(f"WhatsApp attempt [{target_url}] tmpl={tmpl_name} img={img_url} -> Status {res.status_code}")
-                            if res.status_code in [200, 201]:
-                                logger.info(f"WhatsApp sent successfully to {clean_number} via {target_url} with template {tmpl_name}")
-                                return {"success": True, "status_code": res.status_code, "data": res.json(), "url_used": target_url, "template_used": tmpl_name}
-                            else:
-                                last_error = res.text
-                                last_status = res.status_code
-                                logger.warning(f"WhatsApp trial failed ({res.status_code}): {res.text[:150]}")
-                                if res.status_code == 404:
-                                    break  # URL is wrong, try next URL immediately
+                        ]
+                    },
+                    {
+                        "type": "body",
+                        "parameters": [
+                            {"type": "text", "text": display_name},
+                            {"type": "text", "text": "Automated AI Calls — Handle customer calls 24/7."},
+                            {"type": "text", "text": "Instant Lead Follow-ups — Connect with leads faster."},
+                            {"type": "text", "text": "Human-Like Conversations — Engage customers naturally with AI."},
+                            {"type": "text", "text": "More Conversions — Never miss an opportunity to follow up."},
+                            {"type": "text", "text": "Save Time & Costs — Reduce manual calling efforts."},
+                            {"type": "text", "text": "Smart Lead Management — Streamline your calling workflow."},
+                            {"type": "text", "text": "Scale Your Business with intelligent AI-powered calling!"},
+                            {"type": "text", "text": "Team MyBot Genie, Indore 💜"}
+                        ]
+                    }
+                ]
+            }
+        }
 
-                logger.error(f"All WhatsApp attempts failed. Last status: {last_status}, Last error: {last_error}")
-                return {"success": False, "status_code": last_status, "error": last_error}
-        except Exception as e:
-            logger.error(f"WhatsApp exception: {str(e)}")
-            return {"success": False, "error": str(e)}
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            try:
+                # 1. Try sending full approved template
+                res = await client.post(endpoint_url, headers=headers, json=payload_template)
+                if res.status_code in [200, 201]:
+                    logger.info(f"WhatsApp template delivered successfully to {clean_number}")
+                    return {"success": True, "mode": "template_9_params", "status_code": res.status_code, "response": res.json()}
+                
+                logger.warning(f"Template attempt failed ({res.status_code}): {res.text}. Trying single-variable fallback...")
+                
+                # 2. Fallback: Template with single variable (name only) in case template is 1-param version
+                payload_single_var = {
+                    "messaging_product": "whatsapp",
+                    "recipient_type": "individual",
+                    "to": clean_number,
+                    "type": "template",
+                    "template": {
+                        "name": template_name,
+                        "language": {"code": template_lang},
+                        "components": [
+                            {
+                                "type": "header",
+                                "parameters": [{"type": "image", "image": {"link": banner_url}}]
+                            },
+                            {
+                                "type": "body",
+                                "parameters": [{"type": "text", "text": display_name}]
+                            }
+                        ]
+                    }
+                }
+                res_single = await client.post(endpoint_url, headers=headers, json=payload_single_var)
+                if res_single.status_code in [200, 201]:
+                    return {"success": True, "mode": "template_1_param", "status_code": res_single.status_code, "response": res_single.json()}
+                
+                # 3. Fallback: Plain text follow-up (works inside 24h window)
+                text_msg = custom_message or (
+                    f"👋 Hi {display_name}, thank you for your interest in MyBot Genie AI Calling Solution! 🤖\n\n"
+                    f"📞 Automated AI Calls — Handle customer calls 24/7.\n"
+                    f"⚡ Instant Lead Follow-ups — Connect with leads faster.\n"
+                    f"🎙️ Human-Like Conversations — Engage customers naturally with AI.\n"
+                    f"📈 More Conversions — Never miss an opportunity to follow up.\n"
+                    f"⏱️ Save Time & Costs — Reduce manual calling efforts.\n"
+                    f"🔄 Smart Lead Management — Streamline your calling workflow.\n\n"
+                    f"🚀 Scale Your Business with intelligent AI-powered calling!\n"
+                    f"Team MyBot Genie, Indore 💜"
+                )
+                payload_text = {
+                    "messaging_product": "whatsapp",
+                    "recipient_type": "individual",
+                    "to": clean_number,
+                    "type": "text",
+                    "text": {"preview_url": True, "body": text_msg}
+                }
+                res_text = await client.post(endpoint_url, headers=headers, json=payload_text)
+                return {
+                    "success": res_text.status_code in [200, 201],
+                    "mode": "text_fallback",
+                    "status_code": res_text.status_code,
+                    "response": res_text.json() if res_text.headers.get("content-type", "").startswith("application/json") else res_text.text,
+                    "primary_template_error": res.text
+                }
+            except Exception as e:
+                logger.error(f"WhatsApp dispatch exception: {str(e)}")
+                return {"success": False, "error": str(e)}
 
 class LiveKitService:
     @staticmethod
@@ -539,60 +514,23 @@ class LiveKitService:
             livekit_client = LiveKitService.get_api_client()
             await livekit_client.room.create_room(api.CreateRoomRequest(name=room_name, empty_timeout=300, max_participants=2))
             await livekit_client.aclose()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"LiveKit room creation note: {str(e)}")
         return room_name
 
-class WebhookDispatcherService:
+class BillingService:
     @staticmethod
-    async def dispatch_call_event(tenant_id: str, event_type: str, payload: Dict[str, Any]):
-        async with AsyncSessionLocal() as db:
-            endpoints = (await db.execute(select(ClientWebhookEndpoint).where(ClientWebhookEndpoint.tenant_id == tenant_id, ClientWebhookEndpoint.is_active == True))).scalars().all()
-            if not endpoints: return
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                for ep in endpoints:
-                    try: await client.post(ep.target_url, json={"event": event_type, "data": payload}, headers={"Content-Type": "application/json"})
-                    except Exception: pass
-
-
-import sqlite3
-
-LOCAL_DB_PATH = "/tmp/call_genie_auth.db"
-
-def init_local_sqlite():
-    try:
-        conn = sqlite3.connect(LOCAL_DB_PATH)
-        c = conn.cursor()
-        c.execute("""CREATE TABLE IF NOT EXISTS tenants (
-            id TEXT PRIMARY KEY,
-            name TEXT,
-            rate_per_min_inr REAL DEFAULT 5.0,
-            is_active INTEGER DEFAULT 1,
-            created_at TEXT
-        )""")
-        c.execute("""CREATE TABLE IF NOT EXISTS users (
-            id TEXT PRIMARY KEY,
-            tenant_id TEXT,
-            email TEXT UNIQUE,
-            hashed_password TEXT,
-            full_name TEXT,
-            role TEXT DEFAULT 'admin',
-            is_active INTEGER DEFAULT 1,
-            created_at TEXT
-        )""")
-        c.execute("""CREATE TABLE IF NOT EXISTS wallets (
-            id TEXT PRIMARY KEY,
-            tenant_id TEXT UNIQUE,
-            balance_inr REAL DEFAULT 100.0,
-            currency TEXT DEFAULT 'INR',
-            updated_at TEXT
-        )""")
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        logger.warning(f"Local sqlite init notice: {str(e)}")
-
-init_local_sqlite()
+    async def credit_wallet(db: AsyncSession, tenant_id: str, amount_inr: float, reference: Optional[str] = None) -> float:
+        wallet = (await db.execute(select(Wallet).where(Wallet.tenant_id == tenant_id))).scalar_one_or_none()
+        if not wallet:
+            wallet = Wallet(tenant_id=tenant_id, balance_inr=0.0)
+            db.add(wallet)
+        wallet.balance_inr += amount_inr
+        wallet.total_recharged_inr += amount_inr
+        tx = WalletTransaction(wallet_id=wallet.id, transaction_type="CREDIT", amount_inr=amount_inr, balance_after_inr=wallet.balance_inr, reference=reference)
+        db.add(tx)
+        await db.commit()
+        return wallet.balance_inr
 
 # ==============================================================================
 # 6. FASTAPI SETUP & AUTH
@@ -601,27 +539,8 @@ pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
 api_key_header_scheme = APIKeyHeader(name="X-CallGenie-Key", auto_error=False)
 
-import hashlib, hmac
-
-def get_password_hash(password: str) -> str:
-    try:
-        return pwd_context.hash(password)
-    except Exception as err:
-        logger.warning(f"passlib fallback to hmac-sha256: {str(err)}")
-        salt = settings.SECRET_KEY[:16].encode()
-        return "sha256$" + hmac.new(salt, password.encode(), hashlib.sha256).hexdigest()
-
-def verify_password(plain: str, hashed: str) -> bool:
-    if str(hashed).startswith("sha256$"):
-        salt = settings.SECRET_KEY[:16].encode()
-        expected = "sha256$" + hmac.new(salt, plain.encode(), hashlib.sha256).hexdigest()
-        return hmac.compare_digest(expected, str(hashed))
-    try:
-        return pwd_context.verify(plain, hashed)
-    except Exception:
-        salt = settings.SECRET_KEY[:16].encode()
-        expected = "sha256$" + hmac.new(salt, plain.encode(), hashlib.sha256).hexdigest()
-        return hmac.compare_digest(expected, str(hashed))
+def verify_password(plain, hashed): return pwd_context.verify(plain, hashed)
+def get_password_hash(password): return pwd_context.hash(password)
 def create_access_token(data: dict):
     to_encode = data.copy()
     to_encode.update({"exp": datetime.utcnow() + timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)})
@@ -637,344 +556,101 @@ async def get_current_user(token: str = Depends(oauth2_scheme), db: AsyncSession
     if not user: raise HTTPException(status_code=401, detail="User not found")
     return user
 
-async def get_tenant_from_api_key(api_key: Optional[str] = Security(api_key_header_scheme), db: AsyncSession = Depends(get_db)) -> Tenant:
-    if not api_key: raise HTTPException(status_code=401, detail="Missing X-CallGenie-Key header")
-    key_obj = (await db.execute(select(ApiKey).where(ApiKey.key == api_key, ApiKey.is_active == True))).scalar_one_or_none()
-    if not key_obj: raise HTTPException(status_code=401, detail="Invalid API key")
-    tenant = (await db.execute(select(Tenant).where(Tenant.id == key_obj.tenant_id))).scalar_one_or_none()
-    if not tenant: raise HTTPException(status_code=403, detail="Tenant inactive")
-    return tenant
+app = FastAPI(
+    title="Call Genie API (by MyBot Genie)",
+    description="AI Voice Calling & WhatsApp Automation Platform with Groq, Sarvam AI Bulbul, LiveKit and Meta Cloud API.",
+    version="1.3.0"
+)
 
-app = FastAPI(title="Call Genie API (by MyBot Genie)", version="2.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=False,
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 @app.on_event("startup")
 async def on_startup():
+    global engine, AsyncSessionLocal
+    logger.info("Checking Call Genie Database...")
     try:
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
+        logger.info("Primary database connected successfully.")
     except Exception as e:
-        logger.warning(f"Database table sync notice: {str(e)}")
+        logger.warning(f"Primary database connection failed: {e}. Activating zero-failure SQLite fallback in /tmp/call_genie_auth.db")
+        sqlite_url = "sqlite+aiosqlite:////tmp/call_genie_auth.db"
+        engine = create_async_engine(sqlite_url, echo=False)
+        AsyncSessionLocal = async_sessionmaker(bind=engine, class_=AsyncSession, expire_on_commit=False)
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        logger.info("SQLite fallback database initialized successfully.")
 
 @app.get("/")
-async def root(): return {"status": "online", "app": "Call Genie API", "powered_by": "MyBot Genie"}
+async def root(): return {"status": "online", "app": "Call Genie API", "powered_by": "MyBot Genie", "city": "Indore"}
 
 @app.get("/health")
 async def health(): return {"status": "healthy", "app": settings.APP_NAME}
 
 # ==============================================================================
-# 7. LIVE CONVERSATIONAL VOICE ENGINE (GROQ LLM + SARVAM AI NATIVE HINDI VOICE)
+# 7. VOICE CONVERSATIONAL ENGINE (RIYA - ENERGETIC, CHEERFUL, 1-TURN DISCOVERY)
 # ==============================================================================
-def generate_dynamic_hindi_reply(user_msg: str, client_name: str, biz_name: str, biz_type: str) -> str:
-    msg = (user_msg or "").lower().strip()
-    
-    # Robust Caller Name Handling
-    extracted_caller = ""
-    c_lower = (client_name or "").strip().lower()
-    if c_lower and c_lower not in ["ji", "sir", "sar", "business", "client", "general"]:
-        extracted_caller = client_name.strip()
-    
-    # Check if user introduced their name in this message (e.g. "हां मैं सर्वेश बात कर रहा हूं" or "मेरा नाम सर्वेश है")
-    import re
-    m_match = re.search(r'(?:मैं|main|mera naam|मेरा नाम)\s+([A-Za-zऀ-ॿ]{2,15})\s+(?:बात|बोल|हूँ|hoon|hai|है)', user_msg, re.IGNORECASE)
-    if m_match:
-        name_cand = m_match.group(1).strip()
-        if name_cand not in ["बात", "बोल", "और", "यहाँ", "कहाँ", "सर", "जी", "एक"]:
-            extracted_caller = name_cand
-
-    caller = f"{extracted_caller} जी, " if extracted_caller else ""
-    b_name = biz_name.strip() if biz_name and biz_name.strip().lower() not in ["business", "aapke business", "", "general"] else "कंपनी"
-
-    # =========================================================================
-    # A. MID-CALL BUYER / CUSTOMER RESPONSES (Context-Aware Turn Taking)
-    # =========================================================================
-    # 1. Customer answers telecaller with name + location inquiry (e.g. "हां मैं सर्वेश बात कर रहा हूं और कहां-कहां पर आपका प्रॉपर्टी है")
-    if any(w in msg for w in ["कहा", "कहाँ", "location", "लोकेशन"]) and any(w in msg for w in ["प्रॉपर्टी", "फ्लैट", "प्लॉट", "property", "project"]):
-        return f"ओह, थैंक यू सो मच {caller}! अरे वाह, हमारे प्रोजेक्ट्स शहर की मुख्य प्राइम लोकेशन्स—सुपर कॉरिडोर, रिंग रोड और बायपास पर हैं! आप 2BHK या 3BHK में से क्या देखना पसंद करेंगे?"
-
-    # 2. Customer introduces name or confirms identity (e.g. "हां मैं सर्वेश बोल रहा हूं", "हां बोलिए")
-    if any(w in msg for w in ["बात कर रहा", "बोल रहा", "मैं ", "मेरा नाम"]):
-        return f"ओह, थैंक यू सो मच {caller}! बहुत अच्छा लगा आपसे बात करके! आपने हमारे प्रीमियम प्रोजेक्ट्स के लिए इन्क्वायरी की थी। आप रहने के लिए देख रहे हैं या इन्वेस्टमेंट के लिए?"
-
-    # 3. Customer asks about Budget / Rates / Pricing in Real Estate
-    if any(w in msg for w in ["बजट", "रेट", "कीमत", "price", "budget", "cost"]) and any(w in msg for w in ["प्रॉपर्टी", "फ्लैट", "प्लॉट", "2bhk", "3bhk"]):
-        return f"हाँ जी बिल्कुल {caller}! हमारे 2BHK 45 लाख से और 3BHK 65 लाख से शुरू हैं। आपका बजट लगभग क्या रहेगा?"
-
-    # 4. Customer asks for Site Visit / Scheduling
-    if any(w in msg for w in ["देखने", "विजिट", "visit", "साइट", "site visit", "मिलना"]):
-        return f"जी {caller}बिल्कुल! मैं इस शनिवार या रविवार को आपकी फ्री साइट विजिट शेड्यूल कर सकती हूँ। आप सुबह 11 बजे आना पसंद करेंगे या शाम 4 बजे?"
-
-    # 5. Customer asks for Brochure / Details on WhatsApp
-    if any(w in msg for w in ["ब्रोशर", "brochure", "whatsapp", "व्हाट्सएप", "डिटेल", "फोटो"]):
-        return f"जी {caller}मैं आपके इसी मोबाइल नंबर पर प्रोजेक्ट का लेआउट, फ्लोर प्लान और ब्रोशर तुरंत व्हाट्सएप पर भेज रही हूँ। क्या मैं थोड़ी देर बाद फॉलो-अप कॉल कर लूँ?"
-
-    # =========================================================================
-    # B. FIRST-TURN OUTBOUND DEMO STARTERS
-    # =========================================================================
-    # 0. LIVE OUTBOUND DEMO CALL & CUSTOMER DISCOVERY (Real Telecaller Simulation)
-    is_outbound_demo = any(w in msg for w in [
-        "outbound call", "outbound", "outgoing", "आउटबाउंड कॉल", "आउटबाउंड", "आउटगोइंग कॉल", "आउटगोइंग",
-        "कॉल करके बताओ", "कॉल करके दिखाओ", "डेमो कॉल", "demo call",
-        "कॉल लगाओ", "roleplay", "रोलप्ले", "कॉल करो", "pitch karke",
-        "डेमो बताओ", "डेमो दो", "आउटगोइंग कॉल"
-    ])
-
-    if is_outbound_demo:
-        # Agriculture / Seeds / Farming Outbound
-        if any(w in msg for w in ["seed", "kisan", "farming", "krishi", "kheti", "बीज", "किसान", "खेती", "सीड्स"]):
-            return "नमस्ते! क्या मेरी बात सर से हो रही है? मैं बिग सीड्स कंपनी से रिया बात कर रही हूँ। आपने हमारे उन्नत बीजों के लिए जानकारी माँगी थी।"
-        # Hospital / Healthcare Outbound
-        if any(w in msg for w in ["hospital", "clinic", "doctor", "health", "अस्पताल", "क्लिनिक", "डॉक्टर", "इलाज"]):
-            return "नमस्ते! क्या मेरी बात सर से हो रही है? मैं सिटी केयर हॉस्पिटल से रिया बात कर रही हूँ। आपने हमारे यहाँ कंसल्टेशन के लिए इन्क्वायरी की थी।"
-        # Real Estate Outbound
-        if any(w in msg for w in ["real estate", "property", "plot", "flat", "रियल एस्टेट", "प्रॉपर्टी", "फ्लैट", "प्लॉट"]):
-            return "नमस्ते! क्या मेरी बात सर से हो रही है? मैं एपेक्स रियल्टी से रिया बात कर रही हूँ। आपने हमारे नए 2BHK और 3BHK प्रोजेक्ट के लिए इन्क्वायरी की थी।"
-        # E-Commerce Outbound
-        if any(w in msg for w in ["ecommerce", "e-commerce", "order", "cod", "delivery", "ई-कॉमर्स", "ऑर्डर"]):
-            return "नमस्ते! क्या मेरी बात सर से हो रही है? मैं माय स्टोर से रिया बोल रही हूँ। आपका 1,499 रुपये का COD ऑर्डर कन्फर्म करने के लिए कॉल किया है।"
-        # Education Outbound
-        if any(w in msg for w in ["school", "college", "admission", "coaching", "स्कूल", "एडमिशन"]):
-            return "नमस्ते! क्या मेरी बात सर से हो रही है? मैं ग्रीनवुड स्कूल के एडमिशन ऑफिस से रिया बात कर रही हूँ। आपने नए सेशन में एडमिशन के लिए फॉर्म भरा था।"
-        # Gym Outbound
-        if any(w in msg for w in ["gym", "fitness", "workout", "जिम", "फिटनेस"]):
-            return "नमस्ते! क्या मेरी बात सर से हो रही है? मैं गोल्ड्स फिटनेस क्लब से रिया बात कर रही हूँ। आपने जिम मेंबरशिप के लिए इन्क्वायरी की थी।"
-
-        # Universal Bespoke Outbound Opener (Short, Interactive Turn 1)
-        company_spoken = b_name if b_name and b_name != "आपके बिज़नेस" else "कंपनी"
-        return f"नमस्ते! क्या मेरी बात सर से हो रही है? मैं {company_spoken} से रिया बात कर रही हूँ। आपने हाल ही में हमारी सेवाओं के लिए इन्क्वायरी की थी।"
-
-    # 1. E-Commerce & D2C
-    if any(w in msg for w in ["e-commerce", "ecommerce", "online", "order", "delivery", "cod", "d2c", "store", "shopping", "dispatch", "rto", "ई-कॉमर्स", "ऑर्डर"]):
-        return f"जी {caller}ई-कॉमर्स के लिए मैं नए ऑर्डर पर तुरंत COD कन्फर्मेशन कॉल करूँगी ताकि RTO कम हो, डिस्पैच व डिलीवरी का अपडेट दूँगी, रिटर्न सपोर्ट संभालूँगी और ऑफर्स की कॉल्स भी करूँगी।"
-
-    # 2. Real Estate, Builders & Properties
-    if any(w in msg for w in ["plot", "flat", "property", "zameen", "bhk", "location", "realty", "builder", "site visit", "real estate", "प्रॉपर्टी", "प्लॉट", "फ्लैट", "रियल एस्टेट"]):
-        return f"जी {caller}रियल एस्टेट में जैसे ही कोई ग्राहक विज्ञापन देखकर कॉल करेगा, मैं उनका बजट और 2BHK या 3BHK की पसंद पूछ लूँगी, साइट विजिट शेड्यूल कर दूँगी और व्हाट्सएप पर ब्रोशर भेज दूँगी।"
-
-    # 3. Gym, Fitness, Yoga & Crossfit
-    if any(w in msg for w in ["gym", "fitness", "yoga", "workout", "trainer", "जिम", "फिटनेस", "योगा", "कसरत"]):
-        return f"जी {caller}जिम के लिए जैसे ही कोई इंक्वायरी आएगी, मैं उनका फिटनेस गोल पूछकर फ्री ट्रायल स्लॉट बुक कर लूँगी, मेंबरशिप प्लान्स समझाऊँगी और तुरंत व्हाट्सएप पर टाइमिंग्स भेज दूँगी।"
-
-    # 4. Interior Design, Architecture & Furniture
-    if any(w in msg for w in ["interior", "designer", "decor", "architect", "renovation", "furniture", "इंटीरियर", "डिजाइनर", "फर्नीचर"]):
-        return f"जी {caller}इंटीरियर डिजाइनिंग के लिए जैसे ही कोई कॉल करेगा, मैं उनसे कारपेट एरिया और बजट पूछकर आपकी कंसल्टेशन मीटिंग फिक्स कर लूँगी और तुरंत व्हाट्सएप पर आपका पोर्टफोलियो भेज दूँगी।"
-
-    # 5. Hotels, Resorts, Homestays & Banquets
-    if any(w in msg for w in ["hotel", "resort", "room", "booking", "stay", "banquet", "होटल", "रिसॉर्ट", "कमरा"]):
-        return f"जी {caller}होटल के लिए मैं 24 घंटे रूम बुकिंग की इन्क्वायरी लूँगी, चेक-इन टाइम व टैरिफ बताऊँगी, बुकिंग कन्फर्म करूँगी और तुरंत व्हाट्सएप पर लोकेशन व तस्वीरें भेज दूँगी।"
-
-    # 6. CA, Legal, Accounting & Tax Consultants
-    if any(w in msg for w in ["ca", "chartered", "tax", "gst", "itr", "lawyer", "advocate", "legal", "अकाउंटेंट", "वकील", "टैक्स"]):
-        return f"जी {caller}आपकी फर्म के लिए मैं जीएसटी और आईटीआर की डेडलाइन पर ग्राहकों को रिमाइंडर कॉल्स करूँगी, कंसल्टेशन स्लॉट्स बुक करूँगी और जरूरी डॉक्युमेंट्स की लिस्ट व्हाट्सएप पर भेज दूँगी।"
-
-    # 7. Travel, Tours, Visa & Holiday Packages
-    if any(w in msg for w in ["travel", "tour", "package", "holiday", "flight", "visa", "ट्रैवल", "टूर", "यात्रा", "घूमना"]):
-        return f"जी {caller}आपकी ट्रैवल एजेंसी के लिए जब भी कोई कॉल करेगा, मैं डेस्टिनेशन और बजट पूछकर कस्टमाइज्ड पैकेज डिटेल्स समझाऊँगी और तुरंत व्हाट्सएप पर पूरी इटिनरेरी भेज दूँगी।"
-
-    # 8. Restaurants, Cafes & Food Delivery
-    if any(w in msg for w in ["restaurant", "cafe", "food", "table", "dining", "रेस्तरां", "कैफे", "खाना"]):
-        return f"जी {caller}रेस्तरां के लिए मैं ग्राहकों के लिए टेबल रिज़र्वेशन करूँगी, पार्टी व कैटरिंग की बुकिंग लूँगी, मेन्यू व स्पेशल डिशेस बताऊँगी और व्हाट्सएप पर लोकेशन भेज दूँगी।"
-
-    # 9. Salons, Spas & Beauty Parlors
-    if any(w in msg for w in ["salon", "spa", "parlour", "beauty", "hair", "makeup", "सैलून", "पार्लर", "स्पा"]):
-        return f"जी {caller}सैलून के लिए मैं ग्राहकों के लिए अपॉइंटमेंट स्लॉट बुक करूँगी, ब्राइडल व हेयर पैकेजेस के रेट्स बताऊँगी और कन्फर्मेशन मैसेज तुरंत उनके व्हाट्सएप पर भेज दूँगी।"
-
-    # 10. Schools, Colleges, Coaching & Classes
-    if any(w in msg for w in ["school", "college", "education", "coaching", "admission", "fees", "student", "parent", "class", "स्कूल", "कॉलेज", "एडमिशन"]):
-        return f"जी {caller}स्कूल और संस्थान के लिए जब भी पेरेंट्स कॉल करेंगे, मैं नए एडमिशन की जानकारी, फीस स्ट्रक्चर और टाइमिंग बता दूँगी, और तुरंत उनके फोन पर प्रोस्पेक्टस भेज दूँगी।"
-
-    # 11. Hospital, Clinic, Doctors & Healthcare
-    if any(w in msg for w in ["doctor", "clinic", "appointment", "dawai", "ilaj", "timing", "hospital", "patient", "डॉक्टर", "अस्पताल", "इलाज"]):
-        return f"जी {caller}क्लिनिक और हॉस्पिटल के लिए मैं मरीज़ों के अपॉइंटमेंट बुक कर लूँगी, डॉक्टर का उपलब्ध समय बता दूँगी और कन्फर्मेशन मैसेज तुरंत उनके व्हाट्सएप पर भेज दूँगी।"
-
-    # 12. Automobile, Car/Bike Showrooms & Service Centers
-    if any(w in msg for w in ["car", "bike", "vehicle", "automobile", "dealership", "showroom", "service", "test drive", "गाड़ी", "कार"]):
-        return f"जी {caller}ऑटोमोबाइल शोरूम के लिए मैं ग्राहकों के लिए टेस्ट ड्राइव बुक कर लूँगी, गाड़ियों की कीमतें और फीचर्स बता दूँगी और हॉट लीड्स सीधे आपकी सेल्स टीम को दे दूँगी।"
-
-    # 13. Events, Weddings & Photography
-    if any(w in msg for w in ["event", "wedding", "photographer", "photography", "dj", "शादी", "इवेंट", "फोटोग्राफी"]):
-        return f"जी {caller}इवेंट्स और वेडिंग के लिए मैं क्लाइंट्स से डेट और बजट पूछकर आपकी प्लानिंग मीटिंग शेड्यूल कर लूँगी और तुरंत व्हाट्सएप पर आपके पिछले इवेंट्स का पोर्टफोलियो भेज दूँगी।"
-
-    # 14. Astrology, Vastu & Horoscopes
-    if any(w in msg for w in ["astrology", "jyotish", "kundali", "vastu", "pandit", "ज्योतिष", "कुंडली", "वास्तु"]):
-        return f"जी {caller}कंसल्टेशन के लिए मैं क्लाइंट्स से जन्म विवरण लेकर आपका अपॉइंटमेंट स्लॉट बुक कर लूँगी, फीस बता दूँगी और व्हाट्सएप पर स्लॉट कन्फर्मेशन भेज दूँगी।"
-
-    # 15. Logistics, Transport & Packers Movers
-    if any(w in msg for w in ["transport", "packers", "movers", "courier", "logistics", "ट्रांसपोर्ट", "पैकर्स"]):
-        return f"जी {caller}ट्रांसपोर्ट और शिफ्टिंग के लिए मैं पिकअप लोकेशन और सामान का विवरण लेकर तुरंत कोटेशन जनरेट करूँगी और बुकिंग डिटेल्स व्हाट्सएप पर भेज दूँगी।"
-
-    # 16. Solar, Green Energy & Rooftop
-    if any(w in msg for w in ["solar", "rooftop", "panel", "bijli", "सोलर", "बिजली"]):
-        return f"जी {caller}सोलर के लिए मैं ग्राहक का मासिक बिजली बिल पूछकर साइट सर्वे बुक कर लूँगी, सब्सिडी की जानकारी दूँगी और व्हाट्सएप पर अनुमानित बचत का कोटेशन भेज दूँगी।"
-
-    # 17. Security, Pest Control & Cleaning Services
-    if any(w in msg for w in ["pest", "cleaning", "security", "guard", "pest control", "सफाई"]):
-        return f"जी {caller}होम सर्विसेज के लिए मैं ग्राहक की लोकेशन और समस्या समझकर टेक्नीशियन का विजिट शेड्यूल कर लूँगी और तुरंत व्हाट्सएप पर सर्विस चार्ज भेज दूँगी।"
-
-    # 18. Pricing / Rate / Cost
-    if any(w in msg for w in ["kitna paisa", "kitna kharcha", "rate", "cost", "price", "kitna lagega", "charge", "fees", "किराया", "दाम", "खर्चा", "रेट"]):
-        return "कॉल जीनी का रेट बहुत ही पारदर्शी और किफायती है, लगभग सिर्फ पाँच रुपये प्रति मिनट। आप जब चाहें एक छोटे से बैलेंस से अपनी कॉलिंग शुरू कर सकती हैं।"
-
-    # 19. Capabilities / What can you do / Help
-    if any(w in msg for w in ["kya kar sakte", "kya kar sakti", "kya kaam", "kaise kaam", "kya service", "features", "kya karte", "kya karti", "madad", "help", "क्या कर सकते", "क्या कर सकती"]):
-        return f"मैं {b_name} की हर कॉल चौबीस घंटे अटेंड करूँगी, ग्राहकों के सवालों के सटीक जवाब दूँगी और जो भी ग्राहक रुचि दिखाएँ, उनकी पूरी डिटेल और नंबर आपके व्हाट्सएप पर तुरंत भेज दूँगी।"
-
-    # 20. Greetings
-    if any(w in msg for w in ["नमस्ते", "हैलो", "हेलो", "हाय", "namaste", "hello", "hi", "hey", "kaise ho", "kya haal"]):
-        return f"नमस्ते {caller}मायबॉट जीनी के कॉल जीनी में आपका स्वागत है! बताइये, आज {b_name} के लिए मैं आपकी किस तरह मदद करूँ?"
-
-    # 21. Identity / Who are you
-    if any(w in msg for w in ["कौन हो", "kaun ho", "kya naam", "naam kya", "kya ho", "who are you", "tum kaun"]):
-        return "मैं कॉल जीनी एआई बोल रही हूँ मायबॉट जीनी से। मैं एक वॉइस असिस्टेंट हूँ जो आपके ग्राहकों से बिल्कुल एक समझदार रिलेशनशिप मैनेजर की तरह बात करती हूँ।"
-
-    # 22. Thanks / Bye
-    if any(w in msg for w in ["dhanyawad", "shukriya", "bye", "alvida", "theek hai", "ok", "thank"]):
-        return f"बहुत-बहुत धन्यवाद {caller}आपकी सेवा के लिए मैं हमेशा उपलब्ध हूँ। आपका दिन बहुत शुभ हो!"
-
-    # Universal Bespoke Fallback for ANY OTHER Unlisted Business
-    return f"जी {caller}आपके बिज़नेस में जब भी कोई ग्राहक कॉल करेगा, मैं उनकी ज़रूरत व बजट समझकर आपकी अपॉइंटमेंट या बुकिंग फिक्स करूँगी, उनके सवालों के सटीक जवाब दूँगी और तुरंत उनके व्हाट्सएप पर आपकी पूरी प्रोफाइल व रेट्स भेज दूँगी।"
-
 class VoiceChatRequest(BaseModel):
     message: str
     client_name: Optional[str] = "ji"
-    business_name: Optional[str] = "aapke business"
-    business_type: Optional[str] = "Business"
+    business_name: Optional[str] = "MyBot Genie"
+    business_type: Optional[str] = "AI Calling Solution"
     conversation_history: Optional[List[Dict[str, str]]] = None
 
-
-SAMPLE_AUDIO_CACHE: Dict[str, str] = {}
-
-@app.get("/api/voice/sample-audio/{sample_id}")
-async def get_sample_audio(sample_id: str):
+def discover_caller_name(user_text: str) -> Optional[str]:
     """
-    Returns real Sarvam Bulbul audio sample for the landing page audio cards.
-    Cached in-memory to save latency and API credits.
+    Detects if the user introduced themselves, e.g. 'मेरा नाम सर्वेश है', 'I am Sarvesh', 'सर्वेश बात कर रहा हूँ'
     """
-    sample_texts = {
-        "realestate": "नमस्ते! मैं एपेक्स रियल्टी इंदौर से रिया बात कर रही हूँ। आपने सुपर कॉरिडोर पर प्लॉट्स के लिए इन्क्वायरी की थी। हमारे पास 3,200 रुपये प्रति वर्ग फीट पर प्राइम प्लॉट्स उपलब्ध हैं। क्या मैं इस रविवार आपके लिए एक साइट विजिट शेड्यूल कर दूँ?",
-        "clinic": "हेलो! केयर डेंटल क्लिनिक से रिया बात कर रही हूँ। डॉक्टर अमित के पास आज शाम 6:15 का स्लॉट उपलब्ध है। क्या मैं आपका अपॉइंटमेंट टोकन कन्फर्म कर दूँ?",
-        "finance": "हेलो! मैं फिनकॉर्प लोन सर्विसेज से रिया बात कर रही हूँ। आपके 4,500 रुपये की ईएमआई की ड्यू डेट कल है। क्या मैं आपको तुरंत यूपीआई पेमेंट लिंक व्हाट्सएप पर भेज दूँ?"
-    }
+    text = (user_text or "").strip()
+    match = re.search(r'(?:मेरा नाम|mera naam|naam hai|my name is|i am|this is|मैं)\s+([A-Za-z\u0900-\u097F]+)', text, re.IGNORECASE)
+    if match:
+        name = match.group(1).strip()
+        if name.lower() not in ["call", "genie", "bot", "ai", "ji", "sir", "kya", "hai", "haan"]:
+            return name
+    return None
 
-    target_text = sample_texts.get(sample_id.lower().strip(), sample_texts["realestate"])
+def generate_dynamic_hindi_reply(user_msg: str, client_name: str, biz_name: str, biz_type: str) -> str:
+    msg = (user_msg or "").lower().strip()
+    c_name = client_name.strip() if client_name and client_name.strip().lower() not in ["ji", ""] else "सर"
+    b_name = biz_name.strip() if biz_name and biz_name.strip().lower() not in ["business", "aapke business", ""] else "मायबॉट जीनी"
     
-    if sample_id in SAMPLE_AUDIO_CACHE:
-        return {"sample_id": sample_id, "audio_base64": SAMPLE_AUDIO_CACHE[sample_id], "cached": True}
-
-    sarvam_api_key = (os.getenv("SARVAM_API_KEY") or os.getenv("SARVAM_AI_API_KEY") or os.getenv("SARVAM_KEY") or getattr(settings, "SARVAM_API_KEY", "") or "").strip()
-    
-    if sarvam_api_key:
-        try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                res = await client.post(
-                    "https://api.sarvam.ai/text-to-speech",
-                    headers={"api-subscription-key": sarvam_api_key, "Content-Type": "application/json"},
-                    json={
-                        "inputs": [target_text],
-                        "target_language_code": "hi-IN",
-                        "speaker": "suman_hi_companion",
-                        "model": "bulbul:v4-flash",
-                        "pace": 1.08,
-                        "speech_sample_rate": 16000
-                    }
-                )
-                if res.status_code == 200:
-                    audios = res.json().get("audios", [])
-                    if audios:
-                        SAMPLE_AUDIO_CACHE[sample_id] = audios[0]
-                        return {"sample_id": sample_id, "audio_base64": audios[0], "cached": False}
-        except Exception as e:
-            logger.warning(f"Sample audio generation failed: {str(e)}")
-
-    return {"sample_id": sample_id, "audio_base64": None, "error": "TTS unavailable"}
-
-@app.get("/api/voice/status")
-async def voice_status_check():
-    """
-    Diagnostic endpoint to verify API key presence and test live connectivity
-    to Groq and Sarvam AI directly from Render.
-    """
-    groq_api_key = (os.getenv("GROQ_API_KEY") or os.getenv("GROK_API_KEY") or getattr(settings, "GROQ_API_KEY", "") or "").strip()
-    sarvam_api_key = (os.getenv("SARVAM_API_KEY") or os.getenv("SARVAM_AI_API_KEY") or getattr(settings, "SARVAM_API_KEY", "") or "").strip()
-
-    groq_test_result = "not_configured"
-    if groq_api_key:
-        try:
-            async with httpx.AsyncClient(timeout=6.0) as client:
-                res = await client.post(
-                    "https://api.groq.com/openai/v1/chat/completions",
-                    headers={"Authorization": f"Bearer {groq_api_key}", "Content-Type": "application/json"},
-                    json={
-                        "model": "llama-3.1-8b-instant",
-                        "messages": [{"role": "user", "content": "hi"}],
-                        "max_tokens": 5
-                    }
-                )
-                groq_test_result = f"status_{res.status_code}"
-                if res.status_code != 200:
-                    groq_test_result += f" ({res.text[:120]})"
-        except Exception as e:
-            groq_test_result = f"exception: {str(e)}"
-
-    sarvam_test_result = "not_configured"
-    if sarvam_api_key:
-        try:
-            async with httpx.AsyncClient(timeout=6.0) as client:
-                res = await client.post(
-                    "https://api.sarvam.ai/text-to-speech",
-                    headers={"api-subscription-key": sarvam_api_key, "Content-Type": "application/json"},
-                    json={
-                        "inputs": ["नमस्ते"],
-                        "target_language_code": "hi-IN",
-                        "model": "bulbul:v4-flash"
-                    }
-                )
-                sarvam_test_result = f"status_{res.status_code}"
-                if res.status_code != 200:
-                    sarvam_test_result += f" ({res.text[:120]})"
-        except Exception as e:
-            sarvam_test_result = f"exception: {str(e)}"
-
-    return {
-        "status": "online",
-        "groq_configured": bool(groq_api_key),
-        "groq_key_prefix": groq_api_key[:6] + "..." if groq_api_key else None,
-        "groq_test": groq_test_result,
-        "sarvam_configured": bool(sarvam_api_key),
-        "sarvam_key_prefix": sarvam_api_key[:6] + "..." if sarvam_api_key else None,
-        "sarvam_test": sarvam_test_result
-    }
+    if any(w in msg for w in ["नमस्ते", "हैलो", "हेलो", "हाय", "namaste", "hello", "hi", "hey", "kaise ho", "kya haal"]):
+        return f"अरे नमस्ते {c_name} जी! मैं {b_name} से रिया बोल रही हूँ। बताइये, आज मैं आपकी क्या सहायता कर सकती हूँ?"
+    if any(w in msg for w in ["कौन हो", "kaun ho", "kya naam", "naam kya", "kya ho", "who are you", "tum kaun"]):
+        return f"जी! मैं रिया हूँ, {b_name} की एआई कॉलिंग कंसलटेंट! मैं चौबीस घंटे आपके ग्राहकों से बिल्कुल इंसानों की तरह बात कर सकती हूँ।"
+    if any(w in msg for w in ["kya kar sakte", "kya kaam", "kaise kaam", "kya service", "features", "kya karte", "madad"]):
+        return f"अरे वाह! मैं आपके लीड्स को तुरंत कॉल करके फॉलो-अप कर सकती हूँ, अपॉइंटमेंट बुक कर सकती हूँ और सीधे व्हाट्सएप पर मैसेज भी भेज सकती हूँ।"
+    if any(w in msg for w in ["kitna paisa", "kitna kharcha", "rate", "cost", "price", "kitna lagega", "charge", "fees"]):
+        return "कॉल जीनी का रेट बहुत ही किफायती है, सिर्फ पाँच रुपये प्रति मिनट! कोई सेटअप चार्ज नहीं है, आप तुरंत शुरू कर सकते हैं।"
+    if any(w in msg for w in ["demo", "test", "aawaz", "bol ke", "live", "suno", "check"]):
+        return "हाँ जी बिल्कुल! आप इस समय मेरा ही लाइव डेमो सुन रहे हैं। क्या आप अपने बिज़नेस में एआई कॉलिंग शुरू करना चाहेंगे?"
+    if any(w in msg for w in ["dhanyawad", "shukriya", "bye", "alvida", "theek hai", "ok", "thank"]):
+        return f"ओह, थैंक यू सो मच {c_name} जी! आपसे बात करके बहुत अच्छा लगा। मैं व्हाट्सएप पर सारी डिटेल्स भेज रही हूँ!"
+    return f"जी {c_name} जी, मैंने समझ लिया! आपके बिज़नेस के लिए यह कॉलिंग ऑटोमेशन बहुत जबरदस्त काम करेगा। क्या मैं इस पर व्हाट्सएप डिटेल्स भेज दूँ?"
 
 @app.post("/api/voice/chat")
 async def voice_chat_endpoint(chat_in: VoiceChatRequest):
     """
-    Main conversational voice endpoint powering live browser calls and upcoming Exotel lines.
-    Thinks via Groq Llama 3.3 and speaks via Sarvam AI with 100% human Indian emotions.
+    Energetic, cheerful telecaller 'Riya' with 1-turn discovery and Sarvam Bulbul native voice.
     """
+    discovered = discover_caller_name(chat_in.message)
+    active_name = discovered or chat_in.client_name or "सर"
+
     system_prompt = (
-        f"You are Riya (रिया), a cheerful, smiling, enthusiastic female AI telecaller representing '{chat_in.business_name}' ({chat_in.business_type}) by MyBot Genie. "
-        f"You are speaking live on a phone call with {chat_in.client_name}. "
-        "MANDATORY ENERGY, EMOTION & TURN-TAKING RULES: "
-        "1. HIGH ENERGY & GENUINE HAPPINESS (खुश और एनर्जेटिक अंदाज़): "
-        "   - Sound genuinely happy, enthusiastic, and smiling over the phone! "
-        "   - Use lively, polite emotional expressions: 'अरे वाह!', 'ओह, थैंक यू सो मच!', 'हाँ जी, बिल्कुल!', 'अरे बहुत बढ़िया!'. "
-        "   - When asking for their name, be delightfully excited: e.g. 'नमस्ते! अरे वाह, क्या मैं आपका शुभ नाम जान सकती हूँ?... ओह, थैंक यू सो मच!' "
-        "2. INTERACTIVE ONE-TURN DIALOGUE: "
-        "   - Speak strictly ONE short conversational turn (strictly 12 to 20 words maximum). "
-        "   - Always end your turn with ONE clear, enthusiastic question so the caller replies! "
-        "3. ONGOING CALL RESPONSES (कॉल के बीच में ग्राहक के सवालों के जवाब): "
-        "   - When caller tells their name (e.g. 'हाँ मैं सर्वेश बात कर रहा हूँ') and asks about products, location, or rates: "
-        "     DO NOT repeat any introductory pitch or feature explanation! "
-        "     Directly acknowledge their name warmly ('नमस्ते सर्वेश जी! बहुत-बहुत धन्यवाद!'), answer their specific question directly with real options, and ask the next qualification question! "
-        "4. STRICT FEMALE HINDI GRAMMAR: Always use female verb endings: 'बोल रही हूँ', 'कर सकती हूँ', 'पूछ रही हूँ', 'भेज दूँगी'. "
-        "5. PURE DEVANAGARI HINDI: Respond strictly in natural conversational Hindi in Devanagari script (हिंदी). "
-        "6. NATURAL PUNCTUATION: Use exclamation marks (!) to make your voice intonation jump with real joy and energy."
+        f"You are Riya, a cheerful, smiling, energetic female telecaller from Indore representing '{chat_in.business_name}' by MyBot Genie. "
+        f"You are having a live 1-on-1 phone conversation with {active_name}. "
+        "CRITICAL RULES: "
+        "1. Always use strictly feminine Hindi grammar (बोल रही हूँ, करती हूँ, बता सकती हूँ, मदद करूँगी). Never use masculine forms. "
+        "2. Speak in short, snappy, natural 1-turn telecaller responses (strictly 12 to 20 words). Never give long lectures. "
+        "3. Include natural conversational exclamations like 'अरे वाह!', 'हाँ जी बिल्कुल!', 'ओह थैंक यू!', 'अरे ग्रेट!'. "
+        "4. Write ONLY in Devanagari Hindi script (हिंदी). Never write English alphabets or romanized words. "
+        "5. Ask 1 engaging discovery question at a time to keep the customer engaged."
     )
 
     messages = [{"role": "system", "content": system_prompt}]
@@ -984,273 +660,211 @@ async def voice_chat_endpoint(chat_in: VoiceChatRequest):
     messages.append({"role": "user", "content": chat_in.message})
 
     ai_reply = None
-    groq_api_key = (os.getenv("GROQ_API_KEY") or os.getenv("GROK_API_KEY") or os.getenv("GROQ_KEY") or getattr(settings, "GROQ_API_KEY", "") or "").strip().replace('"', '').replace("'", "")
-    brain_used = "dynamic_discovery_engine"
-    groq_debug_info = None
-    
-    if groq_api_key:
+    if settings.GROQ_API_KEY:
         try:
-            async with httpx.AsyncClient(timeout=9.0) as client:
-                # 1. Primary: Llama 3.3 70B Versatile
+            async with httpx.AsyncClient(timeout=6.0) as client:
                 res = await client.post(
                     "https://api.groq.com/openai/v1/chat/completions",
-                    headers={"Authorization": f"Bearer {groq_api_key}", "Content-Type": "application/json"},
+                    headers={"Authorization": f"Bearer {settings.GROQ_API_KEY}", "Content-Type": "application/json"},
                     json={
                         "model": "llama-3.3-70b-versatile",
                         "messages": messages,
                         "temperature": 0.6,
-                        "max_tokens": 150
+                        "max_tokens": 80
                     }
                 )
                 if res.status_code == 200:
                     ai_reply = res.json()["choices"][0]["message"]["content"].strip()
-                    brain_used = "groq_llama_3_3_70b"
-                else:
-                    logger.warning(f"Groq 70B failed {res.status_code}: {res.text[:120]}. Trying 8B...")
-                    groq_debug_info = f"70b_status_{res.status_code}: {res.text[:100]}"
-                    # 2. Secondary: Llama 3.1 8B Instant
-                    res2 = await client.post(
-                        "https://api.groq.com/openai/v1/chat/completions",
-                        headers={"Authorization": f"Bearer {groq_api_key}", "Content-Type": "application/json"},
-                        json={
-                            "model": "llama-3.1-8b-instant",
-                            "messages": messages,
-                            "temperature": 0.6,
-                            "max_tokens": 150
-                        }
-                    )
-                    if res2.status_code == 200:
-                        ai_reply = res2.json()["choices"][0]["message"]["content"].strip()
-                        brain_used = "groq_llama_3_1_8b"
-                    else:
-                        logger.warning(f"Groq 8B failed {res2.status_code}: {res2.text[:120]}")
-                        groq_debug_info += f" | 8b_status_{res2.status_code}"
         except Exception as e:
-            logger.warning(f"Groq conversational exception: {str(e)}")
-            groq_debug_info = str(e)
+            logger.warning(f"Groq error: {str(e)}")
 
     if not ai_reply:
         ai_reply = generate_dynamic_hindi_reply(
             chat_in.message,
-            chat_in.client_name or "",
-            chat_in.business_name or "aapke business",
-            chat_in.business_type or "Business"
+            active_name,
+            chat_in.business_name or "MyBot Genie",
+            chat_in.business_type or "AI Calling Solution"
         )
 
-    # Clean text: remove markdown artifacts
     clean_speech_text = ai_reply.replace("*", "").replace("#", "").replace("_", "").strip()
 
     audio_base64 = None
-    sarvam_debug_info = None
-    sarvam_api_key = (os.getenv("SARVAM_API_KEY") or os.getenv("SARVAM_AI_API_KEY") or os.getenv("SARVAM_KEY") or getattr(settings, "SARVAM_API_KEY", "") or "").strip()
-    
-    voice_engine_used = "browser_tts_fallback"
-    if sarvam_api_key:
+    if settings.SARVAM_API_KEY:
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
-                # 1. Primary: Sarvam Bulbul v4-flash (Latest Model with conversational female persona)
+                # Primary: Sarvam Bulbul v4-flash / v2 / v1
+                payload_sarvam = {
+                    "inputs": [clean_speech_text],
+                    "target_language_code": "hi-IN",
+                    "speaker": "suman_hi_companion",
+                    "model": "bulbul:v4-flash",
+                    "pace": 1.15,
+                    "speech_sample_rate": 16000,
+                    "enable_preprocessing": True
+                }
                 sarvam_res = await client.post(
                     "https://api.sarvam.ai/text-to-speech",
-                    headers={"api-subscription-key": sarvam_api_key, "Content-Type": "application/json"},
-                    json={
-                        "inputs": [clean_speech_text],
-                        "target_language_code": "hi-IN",
-                        "speaker": "suman_hi_companion",
-                        "model": "bulbul:v4-flash",
-                        "pace": 1.05,
-                        "speech_sample_rate": 16000
-                    }
+                    headers={"api-subscription-key": settings.SARVAM_API_KEY, "Content-Type": "application/json"},
+                    json=payload_sarvam
                 )
                 if sarvam_res.status_code == 200:
-                    audios = sarvam_res.json().get("audios", [])
-                    if audios:
-                        audio_base64 = audios[0]
-                        voice_engine_used = "sarvam_bulbul_v4_flash"
-                        logger.info("Sarvam Bulbul v4-flash (suman_hi_companion) generated successfully")
+                    audio_base64 = sarvam_res.json().get("audios", [None])[0]
                 else:
-                    logger.warning(f"Sarvam v4 persona failed {sarvam_res.status_code}: {sarvam_res.text}. Trying v4 default persona...")
-                    sarvam_debug_info = f"v4_status_{sarvam_res.status_code}: {sarvam_res.text[:120]}"
-                    # 2. Secondary: Sarvam Bulbul v4-flash with default persona (omitting speaker parameter)
-                    sarvam_res2 = await client.post(
+                    # Fallback to Bulbul v1 Meera
+                    payload_sarvam["model"] = "bulbul:v1"
+                    payload_sarvam["speaker"] = "meera"
+                    fb_res = await client.post(
                         "https://api.sarvam.ai/text-to-speech",
-                        headers={"api-subscription-key": sarvam_api_key, "Content-Type": "application/json"},
-                        json={
-                            "inputs": [clean_speech_text],
-                            "target_language_code": "hi-IN",
-                            "model": "bulbul:v4-flash",
-                            "pace": 1.05,
-                            "speech_sample_rate": 16000
-                        }
+                        headers={"api-subscription-key": settings.SARVAM_API_KEY, "Content-Type": "application/json"},
+                        json=payload_sarvam
                     )
-                    if sarvam_res2.status_code == 200:
-                        audios2 = sarvam_res2.json().get("audios", [])
-                        if audios2:
-                            audio_base64 = audios2[0]
-                            voice_engine_used = "sarvam_bulbul_v4_flash"
-                            logger.info("Sarvam Bulbul v4-flash (default persona) generated successfully")
-                    else:
-                        # 3. Tertiary: Fallback to Bulbul v3 with ritu
-                        logger.warning(f"Sarvam v4 default failed {sarvam_res2.status_code}. Fallback to Bulbul v3...")
-                        sarvam_res3 = await client.post(
-                            "https://api.sarvam.ai/text-to-speech",
-                            headers={"api-subscription-key": sarvam_api_key, "Content-Type": "application/json"},
-                            json={
-                                "inputs": [clean_speech_text],
-                                "target_language_code": "hi-IN",
-                                "speaker": "ritu",
-                                "model": "bulbul:v3",
-                                "pace": 1.05,
-                                "speech_sample_rate": 16000
-                            }
-                        )
-                        if sarvam_res3.status_code == 200:
-                            audios3 = sarvam_res3.json().get("audios", [])
-                            if audios3:
-                                audio_base64 = audios3[0]
-                                voice_engine_used = "sarvam_bulbul_v3"
-                                logger.info("Sarvam Bulbul v3 (ritu) generated successfully")
+                    if fb_res.status_code == 200:
+                        audio_base64 = fb_res.json().get("audios", [None])[0]
         except Exception as e:
-            logger.warning(f"Sarvam TTS exception: {str(e)}")
-            sarvam_debug_info = str(e)
-
-    # Customer Name Discovery from speech input
-    discovered_name = None
-    import re
-    m_name = re.search(r'(?:मैं|main|mera naam|मेरा नाम|naam|this is|i am)\s+([A-Za-zऀ-ॿ]{2,15})', chat_in.message, re.IGNORECASE)
-    if m_name:
-        cand_name = m_name.group(1).strip()
-        if cand_name not in ["बात", "बोल", "और", "यहाँ", "कहाँ", "सर", "जी", "एक", "काम"]:
-            discovered_name = cand_name
-    elif chat_in.client_name and chat_in.client_name.strip().lower() not in ["ji", "sir", "sar", "business", "client", "general", "there", ""]:
-        discovered_name = chat_in.client_name.strip()
+            logger.warning(f"Sarvam TTS error: {str(e)}")
 
     return {
         "reply": ai_reply,
-        "audio_base64": audio_base64,
-        "voice_engine": voice_engine_used,
-        "brain_engine": brain_used,
-        "discovered_name": discovered_name,
-        "groq_debug": groq_debug_info,
-        "sarvam_debug": sarvam_debug_info
+        "discovered_name": discovered,
+        "active_name": active_name,
+        "audio_base64": audio_base64
     }
 
 # ==============================================================================
-# 8. GENERAL APIS (AUTH, AGENTS, WALLET, LOGS, API KEYS)
+# 8. AUDIO SAMPLES & DIAGNOSTIC APIS
+# ==============================================================================
+SAMPLE_SCRIPTS = {
+    "automotive": {
+        "text": "नमस्ते! ऑटोकेयर वर्कशॉप इंदौर से रोहन बात कर रहा हूँ। आपकी हुंडई क्रेटा की सर्विस और वाशिंग पूरी हो चुकी है। जॉब कार्ड नंबर 4092 का कुल बिल 4,850 रुपये है। क्या मैं आपके इसी नंबर पर पिकअप गेटपास और ऑनलाइन बिल व्हाट्सएप कर दूँ?",
+        "speaker": "shubh_enhi_ads",
+        "fallback_speaker": "arvind"
+    },
+    "clinic": {
+        "text": "हेलो! केयर डेंटल क्लिनिक से रिया बोल रही हूँ। डॉक्टर अमित के पास आज शाम 6:15 का स्लॉट खाली है। क्या मैं आपका अपॉइंटमेंट टोकन कन्फर्म कर दूँ?",
+        "speaker": "suman_hi_companion",
+        "fallback_speaker": "meera"
+    },
+    "realestate": {
+        "text": "नमस्ते! मैं एपेक्स रियल्टी इंदौर से रिया बोल रही हूँ। आपने सुपर कॉरिडोर पर प्लॉट्स के लिए इन्क्वायरी की थी। हमारे पास 3,200 रुपये प्रति वर्ग फीट पर प्राइम प्लॉट्स उपलब्ध हैं। क्या मैं इस रविवार आपके लिए एक साइट विजिट शेड्यूल कर दूँ?",
+        "speaker": "suman_hi_companion",
+        "fallback_speaker": "meera"
+    },
+    "finance": {
+        "text": "हेलो! मैं फिनकॉर्प लोन सर्विसेज से आर्यन बात कर रहा हूँ। आपके 4,500 रुपये की ईएमआई की ड्यू डेट कल है। क्या मैं आपको तुरंत सिक्योर यूपीआई पेमेंट लिंक व्हाट्सएप पर भेज दूँ?",
+        "speaker": "shubh_enhi_ads",
+        "fallback_speaker": "arvind"
+    }
+}
+
+@app.get("/api/voice/sample-audio/{sample_id}")
+async def get_sample_audio(sample_id: str):
+    """Generates and serves real Sarvam Bulbul audio with distinct Indian Male and Female personas."""
+    sample_key = sample_id.lower().strip()
+    profile = SAMPLE_SCRIPTS.get(sample_key, SAMPLE_SCRIPTS["automotive" if "auto" in sample_key else "realestate"])
+    
+    audio_base64 = None
+    if settings.SARVAM_API_KEY:
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                res = await client.post(
+                    "https://api.sarvam.ai/text-to-speech",
+                    headers={"api-subscription-key": settings.SARVAM_API_KEY, "Content-Type": "application/json"},
+                    json={
+                        "inputs": [profile["text"]],
+                        "target_language_code": "hi-IN",
+                        "speaker": profile["speaker"],
+                        "model": "bulbul:v4-flash",
+                        "pace": 1.15,
+                        "speech_sample_rate": 16000,
+                        "enable_preprocessing": True
+                    }
+                )
+                if res.status_code == 200:
+                    audio_base64 = res.json().get("audios", [None])[0]
+                else:
+                    res_fb = await client.post(
+                        "https://api.sarvam.ai/text-to-speech",
+                        headers={"api-subscription-key": settings.SARVAM_API_KEY, "Content-Type": "application/json"},
+                        json={
+                            "inputs": [profile["text"]],
+                            "target_language_code": "hi-IN",
+                            "speaker": profile["fallback_speaker"],
+                            "model": "bulbul:v1",
+                            "pace": 1.15,
+                            "speech_sample_rate": 16000,
+                            "enable_preprocessing": True
+                        }
+                    )
+                    if res_fb.status_code == 200:
+                        audio_base64 = res_fb.json().get("audios", [None])[0]
+        except Exception as e:
+            logger.warning(f"Sarvam sample audio error: {str(e)}")
+            
+    return {
+        "sample_id": sample_id,
+        "audio_base64": audio_base64,
+        "text": profile["text"],
+        "speaker": profile["speaker"],
+        "status": "ready"
+    }
+
+@app.get("/api/voice/status")
+async def voice_status():
+    return {
+        "groq": bool(settings.GROQ_API_KEY),
+        "sarvam": bool(settings.SARVAM_API_KEY),
+        "livekit": bool(settings.LIVEKIT_API_KEY),
+        "whatsapp": bool(settings.WHATSAPP_TOKEN and settings.WHATSAPP_PHONE_NUMBER_ID),
+        "template": settings.WHATSAPP_TEMPLATE_NAME,
+        "lang": settings.WHATSAPP_TEMPLATE_LANG
+    }
+
+# ==============================================================================
+# 9. 1-CLICK WHATSAPP LIVE TESTING ENDPOINT
+# ==============================================================================
+@app.get("/api/whatsapp/test/{phone_number}")
+@app.post("/api/whatsapp/test/{phone_number}")
+async def test_whatsapp_delivery(phone_number: str, name: Optional[str] = "Sarvesh"):
+    """1-Click browser test endpoint for verifying Meta WhatsApp Cloud API / WhatAPI proxy."""
+    result = await WhatsAppService.send_post_call_message(
+        phone_number=phone_number,
+        customer_name=name
+    )
+    return {
+        "requested_phone": phone_number,
+        "cleaned_phone": WhatsAppService._clean_phone_number(phone_number),
+        "test_name": name,
+        "result": result,
+        "config": {
+            "gateway": settings.WHATSAPP_API_URL,
+            "phone_number_id": settings.WHATSAPP_PHONE_NUMBER_ID,
+            "template": settings.WHATSAPP_TEMPLATE_NAME,
+            "lang": settings.WHATSAPP_TEMPLATE_LANG,
+            "banner_url": settings.WHATSAPP_BANNER_IMAGE_URL
+        }
+    }
+
+# ==============================================================================
+# 10. AUTH, AGENTS, WALLET & DEMO APIS
 # ==============================================================================
 @app.post("/api/auth/register", response_model=TokenResponse)
 async def register(user_in: UserRegister, db: AsyncSession = Depends(get_db)):
-    # Try PostgreSQL first
-    pg_success = False
-    try:
-        existing = await db.execute(select(User).where(User.email == user_in.email))
-        if existing.scalar_one_or_none():
-            raise HTTPException(status_code=400, detail="Email already registered. Kripya login karein.")
-        
-        tenant = Tenant(name=user_in.company_name)
-        db.add(tenant)
-        await db.flush()
-        
-        hashed_pwd = get_password_hash(user_in.password)
-        new_user = User(
-            tenant_id=tenant.id,
-            email=user_in.email,
-            hashed_password=hashed_pwd,
-            full_name=user_in.full_name
-        )
-        db.add(new_user)
-        db.add(Wallet(tenant_id=tenant.id, balance_inr=100.0))
-        await db.commit()
-        await db.refresh(new_user)
-
-        token = create_access_token({"sub": new_user.id, "tenant_id": tenant.id})
-        return {
-            "access_token": token,
-            "token_type": "bearer",
-            "tenant_id": tenant.id,
-            "email": new_user.email,
-            "company_name": tenant.name
-        }
-    except HTTPException:
-        raise
-    except Exception as pg_err:
-        logger.warning(f"PostgreSQL unavailable ({str(pg_err)[:60]}), seamless fallback to local SQLite auth...")
-    
-    # Seamless Fallback: Local SQLite Auth (100% Zero-Failure Guarantee)
-    try:
-        conn = sqlite3.connect(LOCAL_DB_PATH)
-        c = conn.cursor()
-        c.execute("SELECT id FROM users WHERE email = ?", (user_in.email,))
-        if c.fetchone():
-            conn.close()
-            raise HTTPException(status_code=400, detail="Email already registered. Kripya login karein.")
-        
-        t_id = str(uuid.uuid4())
-        u_id = str(uuid.uuid4())
-        w_id = str(uuid.uuid4())
-        now_str = datetime.utcnow().isoformat()
-        hashed_pwd = get_password_hash(user_in.password)
-
-        c.execute("INSERT INTO tenants (id, name, created_at) VALUES (?, ?, ?)", (t_id, user_in.company_name, now_str))
-        c.execute("INSERT INTO users (id, tenant_id, email, hashed_password, full_name, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-                  (u_id, t_id, user_in.email, hashed_pwd, user_in.full_name, now_str))
-        c.execute("INSERT INTO wallets (id, tenant_id, balance_inr, updated_at) VALUES (?, ?, ?, ?)", (w_id, t_id, 100.0, now_str))
-        conn.commit()
-        conn.close()
-
-        token = create_access_token({"sub": u_id, "tenant_id": t_id})
-        return {
-            "access_token": token,
-            "token_type": "bearer",
-            "tenant_id": t_id,
-            "email": user_in.email,
-            "company_name": user_in.company_name
-        }
-    except HTTPException:
-        raise
-    except Exception as sql_err:
-        logger.error(f"Fallback SQLite registration error: {str(sql_err)}")
-        raise HTTPException(status_code=500, detail="Registration service error. Please try again.")
+    if (await db.execute(select(User).where(User.email == user_in.email))).scalar_one_or_none():
+        raise HTTPException(status_code=400, detail="Email already registered")
+    tenant = Tenant(name=user_in.company_name)
+    db.add(tenant); await db.flush()
+    new_user = User(tenant_id=tenant.id, email=user_in.email, hashed_password=get_password_hash(user_in.password), full_name=user_in.full_name)
+    db.add(new_user); db.add(Wallet(tenant_id=tenant.id, balance_inr=100.0))
+    await db.commit(); await db.refresh(new_user)
+    return {"access_token": create_access_token({"sub": new_user.id, "tenant_id": tenant.id}), "token_type": "bearer", "tenant_id": tenant.id, "email": new_user.email, "company_name": tenant.name}
 
 @app.post("/api/auth/login", response_model=TokenResponse)
 async def login(user_in: UserLogin, db: AsyncSession = Depends(get_db)):
-    # Try PostgreSQL first
-    try:
-        user = (await db.execute(select(User).where(User.email == user_in.email))).scalar_one_or_none()
-        if user and verify_password(user_in.password, user.hashed_password):
-            tenant = (await db.execute(select(Tenant).where(Tenant.id == user.tenant_id))).scalar_one_or_none()
-            return {"access_token": create_access_token({"sub": user.id, "tenant_id": user.tenant_id}), "token_type": "bearer", "tenant_id": user.tenant_id, "email": user.email, "company_name": tenant.name if tenant else "Client"}
-        elif user:
-            raise HTTPException(status_code=400, detail="Invalid password")
-    except HTTPException:
-        raise
-    except Exception as pg_err:
-        logger.warning(f"PostgreSQL login check failed ({str(pg_err)[:60]}), fallback to SQLite...")
-    
-    # Fallback to local SQLite
-    try:
-        conn = sqlite3.connect(LOCAL_DB_PATH)
-        c = conn.cursor()
-        c.execute("SELECT id, tenant_id, hashed_password, email FROM users WHERE email = ?", (user_in.email,))
-        row = c.fetchone()
-        if not row:
-            conn.close()
-            raise HTTPException(status_code=400, detail="Invalid credentials")
-        u_id, t_id, hashed_pwd, email = row
-        if not verify_password(user_in.password, hashed_pwd):
-            conn.close()
-            raise HTTPException(status_code=400, detail="Invalid credentials")
-        
-        c.execute("SELECT name FROM tenants WHERE id = ?", (t_id,))
-        t_row = c.fetchone()
-        company_name = t_row[0] if t_row else "Client"
-        conn.close()
-
-        return {"access_token": create_access_token({"sub": u_id, "tenant_id": t_id}), "token_type": "bearer", "tenant_id": t_id, "email": email, "company_name": company_name}
-    except HTTPException:
-        raise
-    except Exception as sql_err:
-        logger.error(f"Fallback SQLite login error: {str(sql_err)}")
+    user = (await db.execute(select(User).where(User.email == user_in.email))).scalar_one_or_none()
+    if not user or not verify_password(user_in.password, user.hashed_password):
         raise HTTPException(status_code=400, detail="Invalid credentials")
+    tenant = (await db.execute(select(Tenant).where(Tenant.id == user.tenant_id))).scalar_one_or_none()
+    return {"access_token": create_access_token({"sub": user.id, "tenant_id": user.tenant_id}), "token_type": "bearer", "tenant_id": user.tenant_id, "email": user.email, "company_name": tenant.name if tenant else "Client"}
 
 @app.post("/api/agents", response_model=AgentOut)
 async def create_agent(agent_in: AgentCreate, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
@@ -1283,51 +897,11 @@ class PersonalizedDemoRequest(BaseModel):
     phone_number: str
     language: Optional[str] = "hi-IN"
 
-
-class WhatsAppTestRequest(BaseModel):
-    phone_number: str
-    message: Optional[str] = None
-
-@app.get("/api/whatsapp/test/{phone_number}")
-async def test_whatsapp_get(phone_number: str):
-    """
-    1-Click GET endpoint to test WhatsApp template delivery directly from any browser URL bar.
-    """
-    res = await WhatsAppService.send_post_call_message(
-        phone_number=phone_number,
-        client_name="Sarvesh",
-        business_name="MyBot Genie"
-    )
-    return res
-
-@app.post("/api/whatsapp/test")
-async def test_whatsapp(req: WhatsAppTestRequest):
-    """
-    Test endpoint to send a live test message to any WhatsApp number.
-    """
-    res = await WhatsAppService.send_post_call_message(req.phone_number, req.message, client_name="Sarvesh", business_name="MyBot Genie")
-    return res
-
 @app.post("/api/demo/personalized-call")
 async def personalized_demo(demo_in: PersonalizedDemoRequest, bg: BackgroundTasks):
     clean_phone = demo_in.phone_number.strip().replace(" ", "").replace("-", "")
     bg.add_task(LiveKitService.create_outbound_call, clean_phone, "demo", "demo_tenant", {"system_prompt": "Speak warm Hindi."})
-    
-    # Auto WhatsApp Follow-up Delivery
-    wa_msg = (
-        f"नमस्ते {demo_in.client_name} जी! 🙏\n\n"
-        f"MyBot Genie की तरफ से Call Genie AI से जुड़ने के लिए बहुत-बहुत धन्यवाद।\n\n"
-        f"✨ आपके बिज़नेस '{demo_in.business_name}' ({demo_in.business_type}) के लिए हमारा AI वॉयस कॉलिंग सॉल्यूशन 24/7 तैयार है:\n"
-        "📞 100% नेचुरल ह्यूमन वॉइस (हिंदी / हिंग्लिश)\n"
-        "🚀 हर इनबाउंड व आउटबाउंड कॉल पर ऑटोमैटिक बातचीत\n"
-        "📊 तुरंत लीड क्वालिफिकेशन और अपॉइंटमेंट शेड्यूलिंग\n"
-        "💬 कॉल के तुरंत बाद व्हाट्सएप पर ब्रोशर व अपडेट्स\n\n"
-        "👉 लाइव डेमो व डिटेल्स देखें: https://call.mybotgenie.in\n\n"
-        "— टीम MyBot Genie (Indore)"
-    )
-    bg.add_task(WhatsAppService.send_post_call_message, clean_phone, wa_msg, client_name=demo_in.client_name, business_name=demo_in.business_name)
-    
-    return {"status": "initiated", "message": f"Demo call and WhatsApp queued for {clean_phone}"}
+    return {"status": "initiated", "message": f"Demo call queued for {clean_phone}"}
 
 @app.post("/api/campaigns/single-call")
 async def place_single_call(call_req: SingleCallRequest, user: User = Depends(get_current_user), bg: BackgroundTasks = None, db: AsyncSession = Depends(get_db)):
