@@ -1,3 +1,6 @@
+from dotenv import load_dotenv
+load_dotenv()
+
 import os
 import sys
 import uuid
@@ -568,6 +571,63 @@ class VoiceChatRequest(BaseModel):
     business_name: Optional[str] = "aapke business"
     business_type: Optional[str] = "Business"
     conversation_history: Optional[List[Dict[str, str]]] = None
+
+@app.get("/api/voice/status")
+async def voice_status_check():
+    """
+    Diagnostic endpoint to verify API key presence and test live connectivity
+    to Groq and Sarvam AI directly from Render.
+    """
+    groq_api_key = (os.getenv("GROQ_API_KEY") or os.getenv("GROK_API_KEY") or getattr(settings, "GROQ_API_KEY", "") or "").strip()
+    sarvam_api_key = (os.getenv("SARVAM_API_KEY") or os.getenv("SARVAM_AI_API_KEY") or getattr(settings, "SARVAM_API_KEY", "") or "").strip()
+
+    groq_test_result = "not_configured"
+    if groq_api_key:
+        try:
+            async with httpx.AsyncClient(timeout=6.0) as client:
+                res = await client.post(
+                    "https://api.groq.com/openai/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {groq_api_key}", "Content-Type": "application/json"},
+                    json={
+                        "model": "llama-3.1-8b-instant",
+                        "messages": [{"role": "user", "content": "hi"}],
+                        "max_tokens": 5
+                    }
+                )
+                groq_test_result = f"status_{res.status_code}"
+                if res.status_code != 200:
+                    groq_test_result += f" ({res.text[:120]})"
+        except Exception as e:
+            groq_test_result = f"exception: {str(e)}"
+
+    sarvam_test_result = "not_configured"
+    if sarvam_api_key:
+        try:
+            async with httpx.AsyncClient(timeout=6.0) as client:
+                res = await client.post(
+                    "https://api.sarvam.ai/text-to-speech",
+                    headers={"api-subscription-key": sarvam_api_key, "Content-Type": "application/json"},
+                    json={
+                        "inputs": ["नमस्ते"],
+                        "target_language_code": "hi-IN",
+                        "model": "bulbul:v3"
+                    }
+                )
+                sarvam_test_result = f"status_{res.status_code}"
+                if res.status_code != 200:
+                    sarvam_test_result += f" ({res.text[:120]})"
+        except Exception as e:
+            sarvam_test_result = f"exception: {str(e)}"
+
+    return {
+        "status": "online",
+        "groq_configured": bool(groq_api_key),
+        "groq_key_prefix": groq_api_key[:6] + "..." if groq_api_key else None,
+        "groq_test": groq_test_result,
+        "sarvam_configured": bool(sarvam_api_key),
+        "sarvam_key_prefix": sarvam_api_key[:6] + "..." if sarvam_api_key else None,
+        "sarvam_test": sarvam_test_result
+    }
 
 @app.post("/api/voice/chat")
 async def voice_chat_endpoint(chat_in: VoiceChatRequest):
