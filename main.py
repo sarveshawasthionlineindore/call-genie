@@ -515,28 +515,52 @@ async def health(): return {"status": "healthy", "app": settings.APP_NAME}
 # ==============================================================================
 def generate_dynamic_hindi_reply(user_msg: str, client_name: str, biz_name: str, biz_type: str) -> str:
     msg = (user_msg or "").lower().strip()
-    c_name = client_name.strip() if client_name and client_name.strip().lower() not in ["ji", ""] else "सर"
-    b_name = biz_name.strip() if biz_name and biz_name.strip().lower() not in ["business", "aapke business", ""] else "आपके बिज़नेस"
     
+    # Clean caller name: Never use informal "सर जी"
+    caller = ""
+    if client_name and client_name.strip().lower() not in ["ji", "sir", "sar", "", "business", "client"]:
+        caller = f"{client_name.strip()} जी, "
+
+    b_name = biz_name.strip() if biz_name and biz_name.strip().lower() not in ["business", "aapke business", "", "general"] else "आपके बिज़नेस"
+
+    # 1. School / College / Education / Coaching / Admission
+    if any(w in msg for w in ["school", "college", "education", "coaching", "admission", "fees", "student", "parent", "vidyalaya", "padhai", "class", "स्कूल", "कॉलेज", "एडमिशन"]):
+        return f"जी {caller}स्कूल और शिक्षण संस्थान के लिए मैं नए एडमिशन की सभी इन्क्वायरी संभाल सकता हूँ, अभिभावकों को फीस व टाइमिंग बता सकता हूँ और तुरंत व्हाट्सएप पर प्रोस्पेक्टस भेज सकता हूँ।"
+
+    # 2. Real Estate / Property / Plots / Flats
+    if any(w in msg for w in ["plot", "flat", "property", "zameen", "bhk", "location", "realty", "builder", "site visit", "प्रॉपर्टी", "प्लॉट", "फ्लैट"]):
+        return f"जी {caller}रियल एस्टेट के लिए मैं नए खरीदारों की कॉल्स 24 घंटे अटेंड कर सकता हूँ, प्रोजेक्ट की लोकेशन और रेट्स बता सकता हूँ, और तुरंत साइट विजिट शेड्यूल कर सकता हूँ।"
+
+    # 3. Hospital / Clinic / Doctor / Healthcare
+    if any(w in msg for w in ["doctor", "clinic", "appointment", "dawai", "ilaj", "timing", "hospital", "patient", "डॉक्टर", "अस्पताल", "इलाज"]):
+        return f"जी {caller}क्लिनिक और हॉस्पिटल के लिए मैं मरीजों के अपॉइंटमेंट तुरंत बुक कर सकता हूँ, डॉक्टर की उपलब्धता बता सकता हूँ और व्हाट्सएप पर कन्फर्मेशन भेज सकता हूँ।"
+
+    # 4. Automobile / Car Dealership / Service
+    if any(w in msg for w in ["car", "bike", "vehicle", "automobile", "dealership", "showroom", "service", "test drive", "गाड़ी", "कार"]):
+        return f"जी {caller}ऑटोमोबाइल शोरूम के लिए मैं ग्राहकों के लिए टेस्ट ड्राइव बुक कर सकता हूँ, गाड़ियों के मॉडल्स और ऑन-रोड प्राइस बता सकता हूँ।"
+
+    # 5. Pricing / Rate / Cost
+    if any(w in msg for w in ["kitna paisa", "kitna kharcha", "rate", "cost", "price", "kitna lagega", "charge", "fees", "किराया", "दाम", "खर्चा", "रेट"]):
+        return f"कॉल जीनी का रेट बहुत ही पारदर्शी और किफायती है, लगभग सिर्फ पाँच रुपये प्रति मिनट। आप न्यूनतम रिचार्ज से भी अपनी कॉलिंग शुरू कर सकते हैं।"
+
+    # 6. Capabilities / What can you do / Help
+    if any(w in msg for w in ["kya kar sakte", "kya kaam", "kaise kaam", "kya service", "features", "kya karte", "madad", "help", "क्या कर सकते"]):
+        return f"मैं {b_name} के लिए हर इनबाउंड और आउटबाउंड कॉल बिना रुके अटेंड कर सकता हूँ, ग्राहकों के सवालों के सटीक जवाब दे सकता हूँ और तुरंत व्हाट्सएप पर डिटेल्स भेज सकता हूँ।"
+
+    # 7. Greetings
     if any(w in msg for w in ["नमस्ते", "हैलो", "हेलो", "हाय", "namaste", "hello", "hi", "hey", "kaise ho", "kya haal"]):
-        return f"नमस्ते {c_name} जी! मैं {b_name} का एआई असिस्टेंट बोल रहा हूँ। बताइये, आज मैं आपकी क्या सहायता करूँ?"
+        return f"नमस्ते {caller}मायबॉट जीनी के कॉल जीनी एआई में आपका स्वागत है। बताइये, आज {b_name} के लिए मैं आपकी क्या सहायता कर सकता हूँ?"
+
+    # 8. Identity / Who are you
     if any(w in msg for w in ["कौन हो", "kaun ho", "kya naam", "naam kya", "kya ho", "who are you", "tum kaun"]):
-        return f"जी, मैं कॉल जीनी एआई बोल रहा हूँ। मैं {b_name} के लिए चौबीस घंटे ग्राहकों की हर कॉल अटेंड करता हूँ।"
-    if any(w in msg for w in ["kya kar sakte", "kya kaam", "kaise kaam", "kya service", "features", "kya karte", "madad"]):
-        return f"मैं {b_name} के लिए हर आने वाली कॉल उठा सकता हूँ, सवालों के जवाब दे सकता हूँ और तुरंत व्हाट्सएप पर डिटेल्स भेज सकता हूँ।"
-    if any(w in msg for w in ["kitna paisa", "kitna kharcha", "rate", "cost", "price", "kitna lagega", "charge", "fees"]):
-        return "कॉल जीनी का रेट बहुत किफायती है, लगभग सिर्फ पाँच रुपये प्रति मिनट। आप जब चाहें छोटे से रिचार्ज से शुरू कर सकते हैं।"
-    if any(w in msg for w in ["demo", "test", "aawaz", "bol ke", "live", "suno", "check"]):
-        return "जी हाँ, आप इस समय मेरा लाइव डेमो ही सुन रहे हैं! मैं बिना रुके बिल्कुल इंसानों की तरह बात कर सकता हूँ।"
-    if any(w in msg for w in ["doctor", "clinic", "appointment", "dawai", "ilaj", "timing", "hospital"]):
-        return f"जी {c_name} जी, {b_name} में डॉक्टर से परामर्श के लिए मैं आपका अपॉइंटमेंट अभी बुक कर सकता हूँ। आप किस समय आना चाहेंगे?"
-    if any(w in msg for w in ["plot", "flat", "property", "zameen", "bhk", "location", "realty"]):
-        return f"जी {c_name} जी, {b_name} में बेहतरीन प्लॉट्स और फ्लैट्स उपलब्ध हैं। क्या मैं आपकी साइट विजिट बुक कर दूँ?"
-    if any(w in msg for w in ["contact", "sarvesh", "mybot genie", "number", "kahan", "office"]):
-        return "आप मायबॉट जीनी की टीम से कभी भी संपर्क कर सकते हैं। हमारी टीम आपको पूरा लाइव सेटअप करके देगी।"
+        return f"मैं कॉल जीनी एआई हूँ, मायबॉट जीनी का एडवांस्ड वॉयस कॉलिंग सॉल्यूशन। मैं आपके बिज़नेस के लिए इंसानों की तरह फ्लूएंट हिंदी में बात करता हूँ।"
+
+    # 9. Thanks / Bye
     if any(w in msg for w in ["dhanyawad", "shukriya", "bye", "alvida", "theek hai", "ok", "thank"]):
-        return f"बहुत-बहुत धन्यवाद {c_name} जी! {b_name} की सेवा के लिए मैं हमेशा हाज़िर हूँ। आपका दिन शुभ हो!"
-    return f"जी {c_name} जी, मैंने आपकी बात समझ ली है। {b_name} के लिए यह काम मैं तुरंत और बिना किसी देरी के संभाल सकता हूँ।"
+        return f"बहुत-बहुत धन्यवाद {caller}कॉल जीनी की सेवा के लिए हम हमेशा उपलब्ध हैं। आपका दिन शुभ हो!"
+
+    # Default Professional B2B Hindi Response (Zero 'सर जी', 100% corporate)
+    return f"जी {caller}मैंने आपकी आवश्यकता समझ ली है। {b_name} के लिए यह पूरी प्रक्रिया मैं बिना किसी देरी के 24 घंटे ऑटोमेट कर सकता हूँ।"
 
 class VoiceChatRequest(BaseModel):
     message: str
@@ -569,12 +593,14 @@ async def voice_chat_endpoint(chat_in: VoiceChatRequest):
     messages.append({"role": "user", "content": chat_in.message})
 
     ai_reply = None
-    if settings.GROQ_API_KEY:
+    groq_api_key = os.getenv("GROQ_API_KEY") or os.getenv("GROK_API_KEY") or os.getenv("GROQ_KEY") or getattr(settings, "GROQ_API_KEY", "")
+    
+    if groq_api_key:
         try:
             async with httpx.AsyncClient(timeout=7.0) as client:
                 res = await client.post(
                     "https://api.groq.com/openai/v1/chat/completions",
-                    headers={"Authorization": f"Bearer {settings.GROQ_API_KEY}", "Content-Type": "application/json"},
+                    headers={"Authorization": f"Bearer {groq_api_key}", "Content-Type": "application/json"},
                     json={
                         "model": "llama-3.3-70b-versatile",
                         "messages": messages,
@@ -588,7 +614,7 @@ async def voice_chat_endpoint(chat_in: VoiceChatRequest):
                     logger.warning(f"Groq API returned status {res.status_code}: {res.text}. Trying fallback model...")
                     res2 = await client.post(
                         "https://api.groq.com/openai/v1/chat/completions",
-                        headers={"Authorization": f"Bearer {settings.GROQ_API_KEY}", "Content-Type": "application/json"},
+                        headers={"Authorization": f"Bearer {groq_api_key}", "Content-Type": "application/json"},
                         json={
                             "model": "llama-3.1-8b-instant",
                             "messages": messages,
@@ -606,7 +632,7 @@ async def voice_chat_endpoint(chat_in: VoiceChatRequest):
     if not ai_reply:
         ai_reply = generate_dynamic_hindi_reply(
             chat_in.message,
-            chat_in.client_name or "ji",
+            chat_in.client_name or "",
             chat_in.business_name or "aapke business",
             chat_in.business_type or "Business"
         )
@@ -615,24 +641,29 @@ async def voice_chat_endpoint(chat_in: VoiceChatRequest):
     clean_speech_text = ai_reply.replace("*", "").replace("#", "").replace("_", "").strip()
 
     audio_base64 = None
-    if settings.SARVAM_API_KEY:
+    sarvam_api_key = os.getenv("SARVAM_API_KEY") or os.getenv("SARVAM_AI_API_KEY") or os.getenv("SARVAM_KEY") or getattr(settings, "SARVAM_API_KEY", "")
+    
+    if sarvam_api_key:
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
                 sarvam_res = await client.post(
                     "https://api.sarvam.ai/text-to-speech",
-                    headers={"api-subscription-key": settings.SARVAM_API_KEY, "Content-Type": "application/json"},
+                    headers={"api-subscription-key": sarvam_api_key, "Content-Type": "application/json"},
                     json={
                         "inputs": [clean_speech_text],
                         "target_language_code": "hi-IN",
                         "speaker": "meera",
-                        "model": "bulbul:v1",
+                        "pitch": 0,
                         "pace": 1.15,
+                        "loudness": 1.5,
                         "speech_sample_rate": 16000,
-                        "enable_preprocessing": True
+                        "enable_preprocessing": True,
+                        "model": "bulbul:v1"
                     }
                 )
                 if sarvam_res.status_code == 200:
                     audio_base64 = sarvam_res.json().get("audios", [None])[0]
+                    logger.info("Sarvam studio audio generated successfully")
                 else:
                     logger.warning(f"Sarvam TTS returned status {sarvam_res.status_code}: {sarvam_res.text}")
         except Exception as e:
