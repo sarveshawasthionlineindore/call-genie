@@ -418,18 +418,108 @@ class WhatsAppService:
         return f"91{digits}" if len(digits) == 10 else digits
 
     @staticmethod
-    async def send_post_call_message(phone_number: str, message_text: Optional[str] = None) -> bool:
-        if not settings.WHATSAPP_TOKEN or not settings.WHATSAPP_PHONE_NUMBER_ID: return False
+    async def send_post_call_message(phone_number: str, message_text: Optional[str] = None, **kwargs) -> Dict[str, Any]:
+        token = (os.getenv("WHATSAPP_TOKEN") or getattr(settings, "WHATSAPP_TOKEN", "") or "").strip().replace('"', '').replace("'", "")
+        phone_id = (os.getenv("WHATSAPP_PHONE_NUMBER_ID") or getattr(settings, "WHATSAPP_PHONE_NUMBER_ID", "") or "").strip().replace('"', '').replace("'", "")
+        base_url = (os.getenv("WHATSAPP_API_URL") or "https://graph.facebook.com").strip().rstrip('/')
+        version = (os.getenv("WHATSAPP_API_VERSION") or "v20.0").strip().lstrip('/')
+
+        if not token or not phone_id:
+            logger.warning("WhatsApp credentials missing in environment.")
+            return {"success": False, "error": "WHATSAPP_TOKEN or WHATSAPP_PHONE_NUMBER_ID missing in environment variables"}
+
         clean_number = WhatsAppService._clean_phone_number(phone_number)
-        url = f"https://graph.facebook.com/v20.0/{settings.WHATSAPP_PHONE_NUMBER_ID}/messages"
-        headers = {"Authorization": f"Bearer {settings.WHATSAPP_TOKEN}", "Content-Type": "application/json"}
-        payload = {"messaging_product": "whatsapp", "recipient_type": "individual", "to": clean_number, "type": "text", "text": {"preview_url": True, "body": message_text or "Thank you for speaking with Call Genie AI!"}}
+        
+        # Smart candidate URLs for WhatAPI proxy & official Meta API
+        urls_to_try = []
+        if version:
+            urls_to_try.append(f"{base_url}/{version}/{phone_id}/messages")
+        urls_to_try.append(f"{base_url}/{phone_id}/messages")
+
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json"
+        }
+        # Check if template mode is configured (Default to WhatAPI approved template)
+        template_name = (os.getenv("WHATSAPP_TEMPLATE_NAME") or "newmsg 4578000").strip()
+        template_lang = (os.getenv("WHATSAPP_TEMPLATE_LANG") or "nl").strip()
+        header_img = (os.getenv("WHATSAPP_HEADER_IMAGE_URL") or "https://call.mybotgenie.in/assets/banner.png").strip()
+        
+        # Build 9 exact variables for template newmsg 4578000
+        c_name = kwargs.get("client_name") or ""
+        clean_name = str(c_name).strip()
+        
+        # If customer name is discovered, use it; otherwise fallback to "Sir"
+        if not clean_name or clean_name.lower() in ["ji", "sir", "sar", "there", "client", "customer", "unknown", "aap", "none", "aapke business"]:
+            greeting_name = "Sir"
+        else:
+            greeting_name = clean_name[0].upper() + clean_name[1:] if clean_name[0].isascii() else clean_name
+
+        var_1 = f"👋 Hi {greeting_name}, thank you for your interest in MyBot Genie AI Calling Solution! 🤖"
+        var_2 = "📞 Automated AI Calls — Handle customer calls 24/7."
+        var_3 = "⚡ Instant Lead Follow-ups — Connect with leads faster."
+        var_4 = "🎙️ Human-Like Conversations — Engage customers naturally with AI."
+        var_5 = "📈 More Conversions — Never miss an opportunity to follow up."
+        var_6 = "⏱️ Save Time & Costs — Reduce manual calling efforts."
+        var_7 = "🔄 Smart Lead Management — Streamline your calling workflow."
+        var_8 = "🚀 Scale Your Business with intelligent AI-powered calling!"
+        var_9 = "Team MyBot Genie, Indore 💜"
+
+        payload = {
+            "messaging_product": "whatsapp",
+            "recipient_type": "individual",
+            "to": clean_number,
+            "type": "template",
+            "template": {
+                "name": template_name,
+                "language": {"code": template_lang},
+                "components": [
+                    {
+                        "type": "header",
+                        "parameters": [
+                            {"type": "image", "image": {"link": header_img}}
+                        ]
+                    },
+                    {
+                        "type": "body",
+                        "parameters": [
+                            {"type": "text", "text": var_1},
+                            {"type": "text", "text": var_2},
+                            {"type": "text", "text": var_3},
+                            {"type": "text", "text": var_4},
+                            {"type": "text", "text": var_5},
+                            {"type": "text", "text": var_6},
+                            {"type": "text", "text": var_7},
+                            {"type": "text", "text": var_8},
+                            {"type": "text", "text": var_9}
+                        ]
+                    }
+                ]
+            }
+        }
+        
+        last_error = ""
+        last_status = 500
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
-                res = await client.post(url, headers=headers, json=payload)
-                return res.status_code in [200, 201]
-        except Exception:
-            return False
+                for target_url in urls_to_try:
+                    res = await client.post(target_url, headers=headers, json=payload)
+                    if res.status_code in [200, 201]:
+                        logger.info(f"WhatsApp sent successfully to {clean_number} via {target_url}")
+                        return {"success": True, "status_code": res.status_code, "data": res.json(), "url_used": target_url}
+                    elif res.status_code == 404 and len(urls_to_try) > 1:
+                        logger.warning(f"URL {target_url} returned 404, trying fallback URL...")
+                        last_error = res.text
+                        last_status = res.status_code
+                        continue
+                    else:
+                        logger.error(f"WhatsApp API failed on {target_url}: {res.status_code} - {res.text}")
+                        return {"success": False, "status_code": res.status_code, "error": res.text, "url_used": target_url}
+                
+                return {"success": False, "status_code": last_status, "error": last_error}
+        except Exception as e:
+            logger.error(f"WhatsApp exception: {str(e)}")
+            return {"success": False, "error": str(e)}
 
 class LiveKitService:
     @staticmethod
@@ -872,9 +962,13 @@ async def voice_chat_endpoint(chat_in: VoiceChatRequest):
         "2. INTERACTIVE ONE-TURN DIALOGUE: "
         "   - Speak strictly ONE short conversational turn (strictly 12 to 20 words maximum). "
         "   - Always end your turn with ONE clear, enthusiastic question so the caller replies! "
-        "3. STRICT FEMALE HINDI GRAMMAR: Always use female verb endings: 'बोल रही हूँ', 'कर सकती हूँ', 'पूछ रही हूँ', 'भेज दूँगी'. "
-        "4. PURE DEVANAGARI HINDI: Respond strictly in natural conversational Hindi in Devanagari script (हिंदी). "
-        "5. NATURAL PUNCTUATION: Use exclamation marks (!) to make your voice intonation jump with real joy and energy."
+        "3. ONGOING CALL RESPONSES (कॉल के बीच में ग्राहक के सवालों के जवाब): "
+        "   - When caller tells their name (e.g. 'हाँ मैं सर्वेश बात कर रहा हूँ') and asks about products, location, or rates: "
+        "     DO NOT repeat any introductory pitch or feature explanation! "
+        "     Directly acknowledge their name warmly ('नमस्ते सर्वेश जी! बहुत-बहुत धन्यवाद!'), answer their specific question directly with real options, and ask the next qualification question! "
+        "4. STRICT FEMALE HINDI GRAMMAR: Always use female verb endings: 'बोल रही हूँ', 'कर सकती हूँ', 'पूछ रही हूँ', 'भेज दूँगी'. "
+        "5. PURE DEVANAGARI HINDI: Respond strictly in natural conversational Hindi in Devanagari script (हिंदी). "
+        "6. NATURAL PUNCTUATION: Use exclamation marks (!) to make your voice intonation jump with real joy and energy."
     )
 
     messages = [{"role": "system", "content": system_prompt}]
@@ -1013,11 +1107,23 @@ async def voice_chat_endpoint(chat_in: VoiceChatRequest):
             logger.warning(f"Sarvam TTS exception: {str(e)}")
             sarvam_debug_info = str(e)
 
+    # Customer Name Discovery from speech input
+    discovered_name = None
+    import re
+    m_name = re.search(r'(?:मैं|main|mera naam|मेरा नाम|naam|this is|i am)\s+([A-Za-zऀ-ॿ]{2,15})', chat_in.message, re.IGNORECASE)
+    if m_name:
+        cand_name = m_name.group(1).strip()
+        if cand_name not in ["बात", "बोल", "और", "यहाँ", "कहाँ", "सर", "जी", "एक", "काम"]:
+            discovered_name = cand_name
+    elif chat_in.client_name and chat_in.client_name.strip().lower() not in ["ji", "sir", "sar", "business", "client", "general", "there", ""]:
+        discovered_name = chat_in.client_name.strip()
+
     return {
         "reply": ai_reply,
         "audio_base64": audio_base64,
         "voice_engine": voice_engine_used,
         "brain_engine": brain_used,
+        "discovered_name": discovered_name,
         "groq_debug": groq_debug_info,
         "sarvam_debug": sarvam_debug_info
     }
@@ -1171,11 +1277,39 @@ class PersonalizedDemoRequest(BaseModel):
     phone_number: str
     language: Optional[str] = "hi-IN"
 
+
+class WhatsAppTestRequest(BaseModel):
+    phone_number: str
+    message: Optional[str] = None
+
+@app.post("/api/whatsapp/test")
+async def test_whatsapp(req: WhatsAppTestRequest):
+    """
+    Test endpoint to send a live test message to any WhatsApp number.
+    """
+    res = await WhatsAppService.send_post_call_message(req.phone_number, req.message, client_name="Sarvesh", business_name="MyBot Genie")
+    return res
+
 @app.post("/api/demo/personalized-call")
 async def personalized_demo(demo_in: PersonalizedDemoRequest, bg: BackgroundTasks):
     clean_phone = demo_in.phone_number.strip().replace(" ", "").replace("-", "")
     bg.add_task(LiveKitService.create_outbound_call, clean_phone, "demo", "demo_tenant", {"system_prompt": "Speak warm Hindi."})
-    return {"status": "initiated", "message": f"Demo call queued for {clean_phone}"}
+    
+    # Auto WhatsApp Follow-up Delivery
+    wa_msg = (
+        f"नमस्ते {demo_in.client_name} जी! 🙏\n\n"
+        f"MyBot Genie की तरफ से Call Genie AI से जुड़ने के लिए बहुत-बहुत धन्यवाद।\n\n"
+        f"✨ आपके बिज़नेस '{demo_in.business_name}' ({demo_in.business_type}) के लिए हमारा AI वॉयस कॉलिंग सॉल्यूशन 24/7 तैयार है:\n"
+        "📞 100% नेचुरल ह्यूमन वॉइस (हिंदी / हिंग्लिश)\n"
+        "🚀 हर इनबाउंड व आउटबाउंड कॉल पर ऑटोमैटिक बातचीत\n"
+        "📊 तुरंत लीड क्वालिफिकेशन और अपॉइंटमेंट शेड्यूलिंग\n"
+        "💬 कॉल के तुरंत बाद व्हाट्सएप पर ब्रोशर व अपडेट्स\n\n"
+        "👉 लाइव डेमो व डिटेल्स देखें: https://call.mybotgenie.in\n\n"
+        "— टीम MyBot Genie (Indore)"
+    )
+    bg.add_task(WhatsAppService.send_post_call_message, clean_phone, wa_msg, client_name=demo_in.client_name, business_name=demo_in.business_name)
+    
+    return {"status": "initiated", "message": f"Demo call and WhatsApp queued for {clean_phone}"}
 
 @app.post("/api/campaigns/single-call")
 async def place_single_call(call_req: SingleCallRequest, user: User = Depends(get_current_user), bg: BackgroundTasks = None, db: AsyncSession = Depends(get_db)):
