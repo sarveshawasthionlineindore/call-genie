@@ -34,7 +34,9 @@ from livekit import api
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("call_genie")
 
+# ==============================================================================
 # 1. CONFIGURATION (CLEAN ARCHITECTURE - ZERO TWILIO)
+# ==============================================================================
 class Settings(BaseSettings):
     APP_NAME: str = "Call Genie"
     ENVIRONMENT: str = "production"
@@ -71,7 +73,9 @@ class Settings(BaseSettings):
 
 settings = Settings()
 
+# ==============================================================================
 # 2. DATABASE & ASYNC ENGINE
+# ==============================================================================
 db_url = settings.DATABASE_URL
 if db_url.startswith("postgres://"):
     db_url = db_url.replace("postgres://", "postgresql+asyncpg://", 1)
@@ -106,7 +110,9 @@ async def get_db():
 def generate_uuid():
     return str(uuid.uuid4())
 
+# ==============================================================================
 # 3. MODELS
+# ==============================================================================
 class Tenant(Base):
     __tablename__ = "tenants"
     id = Column(String(36), primary_key=True, default=generate_uuid)
@@ -271,7 +277,9 @@ class CallLog(Base):
     tenant = relationship("Tenant", back_populates="call_logs")
     agent = relationship("Agent", back_populates="call_logs")
 
+# ==============================================================================
 # 4. SCHEMAS
+# ==============================================================================
 class UserRegister(BaseModel):
     email: str
     password: str
@@ -353,7 +361,9 @@ class CallLogOut(BaseModel):
     class Config:
         from_attributes = True
 
+# ==============================================================================
 # 5. CORE SERVICES (BILLING, WHATSAPP & LIVEKIT ENGINE)
+# ==============================================================================
 class BillingService:
     @staticmethod
     def calculate_billable_units(duration_seconds: int, pulse_seconds: int = 60) -> float:
@@ -445,7 +455,9 @@ class WebhookDispatcherService:
                     try: await client.post(ep.target_url, json={"event": event_type, "data": payload}, headers={"Content-Type": "application/json"})
                     except Exception: pass
 
+# ==============================================================================
 # 6. FASTAPI SETUP & AUTH
+# ==============================================================================
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
 api_key_header_scheme = APIKeyHeader(name="X-CallGenie-Key", auto_error=False)
@@ -501,6 +513,31 @@ async def health(): return {"status": "healthy", "app": settings.APP_NAME}
 # ==============================================================================
 # 7. LIVE CONVERSATIONAL VOICE ENGINE (GROQ LLM + SARVAM AI NATIVE HINDI VOICE)
 # ==============================================================================
+def generate_dynamic_hindi_reply(user_msg: str, client_name: str, biz_name: str, biz_type: str) -> str:
+    msg = (user_msg or "").lower().strip()
+    c_name = client_name.strip() if client_name and client_name.strip().lower() not in ["ji", ""] else "सर"
+    b_name = biz_name.strip() if biz_name and biz_name.strip().lower() not in ["business", "aapke business", ""] else "आपके बिज़नेस"
+    
+    if any(w in msg for w in ["नमस्ते", "हैलो", "हेलो", "हाय", "namaste", "hello", "hi", "hey", "kaise ho", "kya haal"]):
+        return f"नमस्ते {c_name} जी! मैं {b_name} का एआई असिस्टेंट बोल रहा हूँ। बताइये, आज मैं आपकी क्या सहायता करूँ?"
+    if any(w in msg for w in ["कौन हो", "kaun ho", "kya naam", "naam kya", "kya ho", "who are you", "tum kaun"]):
+        return f"जी, मैं कॉल जीनी एआई बोल रहा हूँ। मैं {b_name} के लिए चौबीस घंटे ग्राहकों की हर कॉल अटेंड करता हूँ।"
+    if any(w in msg for w in ["kya kar sakte", "kya kaam", "kaise kaam", "kya service", "features", "kya karte", "madad"]):
+        return f"मैं {b_name} के लिए हर आने वाली कॉल उठा सकता हूँ, सवालों के जवाब दे सकता हूँ और तुरंत व्हाट्सएप पर डिटेल्स भेज सकता हूँ।"
+    if any(w in msg for w in ["kitna paisa", "kitna kharcha", "rate", "cost", "price", "kitna lagega", "charge", "fees"]):
+        return "कॉल जीनी का रेट बहुत किफायती है, लगभग सिर्फ पाँच रुपये प्रति मिनट। आप जब चाहें छोटे से रिचार्ज से शुरू कर सकते हैं।"
+    if any(w in msg for w in ["demo", "test", "aawaz", "bol ke", "live", "suno", "check"]):
+        return "जी हाँ, आप इस समय मेरा लाइव डेमो ही सुन रहे हैं! मैं बिना रुके बिल्कुल इंसानों की तरह बात कर सकता हूँ।"
+    if any(w in msg for w in ["doctor", "clinic", "appointment", "dawai", "ilaj", "timing", "hospital"]):
+        return f"जी {c_name} जी, {b_name} में डॉक्टर से परामर्श के लिए मैं आपका अपॉइंटमेंट अभी बुक कर सकता हूँ। आप किस समय आना चाहेंगे?"
+    if any(w in msg for w in ["plot", "flat", "property", "zameen", "bhk", "location", "realty"]):
+        return f"जी {c_name} जी, {b_name} में बेहतरीन प्लॉट्स और फ्लैट्स उपलब्ध हैं। क्या मैं आपकी साइट विजिट बुक कर दूँ?"
+    if any(w in msg for w in ["contact", "sarvesh", "mybot genie", "number", "kahan", "office"]):
+        return "आप मायबॉट जीनी की टीम से कभी भी संपर्क कर सकते हैं। हमारी टीम आपको पूरा लाइव सेटअप करके देगी।"
+    if any(w in msg for w in ["dhanyawad", "shukriya", "bye", "alvida", "theek hai", "ok", "thank"]):
+        return f"बहुत-बहुत धन्यवाद {c_name} जी! {b_name} की सेवा के लिए मैं हमेशा हाज़िर हूँ। आपका दिन शुभ हो!"
+    return f"जी {c_name} जी, मैंने आपकी बात समझ ली है। {b_name} के लिए यह काम मैं तुरंत और बिना किसी देरी के संभाल सकता हूँ।"
+
 class VoiceChatRequest(BaseModel):
     message: str
     client_name: Optional[str] = "ji"
@@ -515,12 +552,14 @@ async def voice_chat_endpoint(chat_in: VoiceChatRequest):
     Thinks via Groq Llama 3.3 and speaks via Sarvam AI with 100% human Indian emotions.
     """
     system_prompt = (
-        f"You are Call Genie, a helpful, polite Indian conversational AI assistant for '{chat_in.business_name}' ({chat_in.business_type}) by MyBot Genie. "
-        f"You are speaking live with {chat_in.client_name}. "
-        "CRITICAL RULE: Respond ONLY in natural, fluent Hindi written in Devanagari script (हिंदी). Never write English/Roman letters. "
-        "For example, write 'के लिए' (never 'ke liye'), write 'चौबीस घंटे' (never '24 ghante'). "
-        "Keep your response concise (strictly under 25 words). "
-        "If they ask questions, answer warmly and mention you can answer customer queries 24/7 and send WhatsApp brochures instantly."
+        f"You are Call Genie, an intelligent, polite, warm Indian conversational AI assistant for '{chat_in.business_name}' ({chat_in.business_type}) by MyBot Genie. "
+        f"You are speaking live on a phone call with {chat_in.client_name}. "
+        "CRITICAL RULES: "
+        "1. Respond directly and specifically to what the caller just said or asked. Do NOT repeat introductions or default greetings unless the caller greeted you. "
+        "2. Respond ONLY in natural, fluent Hindi written in Devanagari script (हिंदी). Never write English/Roman letters. "
+        "For example, write 'के लिए' (never 'ke liye'), write 'चौबीस घंटे' (never '24 ghante'), write 'कॉल' (never 'call'). "
+        "3. Keep your response concise (strictly under 25 words) because this is a fast live spoken phone call. "
+        "4. Tone must be warm, respectful, and energetic like a helpful Indian professional."
     )
 
     messages = [{"role": "system", "content": system_prompt}]
@@ -529,23 +568,51 @@ async def voice_chat_endpoint(chat_in: VoiceChatRequest):
             messages.append({"role": msg.get("role", "user"), "content": msg.get("content", "")})
     messages.append({"role": "user", "content": chat_in.message})
 
-    ai_reply = "नमस्ते! मैं कॉल जीनी एआई बोल रहा हूँ मायबॉट जीनी से। मैं आपके बिज़नेस के लिए हर कॉल पर बात कर सकता हूँ।"
+    ai_reply = None
     if settings.GROQ_API_KEY:
         try:
-            async with httpx.AsyncClient(timeout=8.0) as client:
+            async with httpx.AsyncClient(timeout=7.0) as client:
                 res = await client.post(
                     "https://api.groq.com/openai/v1/chat/completions",
                     headers={"Authorization": f"Bearer {settings.GROQ_API_KEY}", "Content-Type": "application/json"},
                     json={
-                        "model": "llama-3.1-8b-instant",
+                        "model": "llama-3.3-70b-versatile",
                         "messages": messages,
-                        "temperature": 0.4
+                        "temperature": 0.5,
+                        "max_tokens": 120
                     }
                 )
                 if res.status_code == 200:
-                    ai_reply = res.json()["choices"][0]["message"]["content"]
+                    ai_reply = res.json()["choices"][0]["message"]["content"].strip()
+                else:
+                    logger.warning(f"Groq API returned status {res.status_code}: {res.text}. Trying fallback model...")
+                    res2 = await client.post(
+                        "https://api.groq.com/openai/v1/chat/completions",
+                        headers={"Authorization": f"Bearer {settings.GROQ_API_KEY}", "Content-Type": "application/json"},
+                        json={
+                            "model": "llama-3.1-8b-instant",
+                            "messages": messages,
+                            "temperature": 0.5,
+                            "max_tokens": 120
+                        }
+                    )
+                    if res2.status_code == 200:
+                        ai_reply = res2.json()["choices"][0]["message"]["content"].strip()
+                    else:
+                        logger.warning(f"Groq fallback model also returned status {res2.status_code}")
         except Exception as e:
             logger.warning(f"Groq conversational error: {str(e)}")
+
+    if not ai_reply:
+        ai_reply = generate_dynamic_hindi_reply(
+            chat_in.message,
+            chat_in.client_name or "ji",
+            chat_in.business_name or "aapke business",
+            chat_in.business_type or "Business"
+        )
+
+    # Clean text: remove markdown artifacts
+    clean_speech_text = ai_reply.replace("*", "").replace("#", "").replace("_", "").strip()
 
     audio_base64 = None
     if settings.SARVAM_API_KEY:
@@ -555,16 +622,19 @@ async def voice_chat_endpoint(chat_in: VoiceChatRequest):
                     "https://api.sarvam.ai/text-to-speech",
                     headers={"api-subscription-key": settings.SARVAM_API_KEY, "Content-Type": "application/json"},
                     json={
-                        "inputs": [ai_reply],
+                        "inputs": [clean_speech_text],
                         "target_language_code": "hi-IN",
-                        "speaker": "bulbul:v1",
+                        "speaker": "meera",
                         "model": "bulbul:v1",
-                        "pace": 1.02,
+                        "pace": 1.15,
+                        "speech_sample_rate": 16000,
                         "enable_preprocessing": True
                     }
                 )
                 if sarvam_res.status_code == 200:
                     audio_base64 = sarvam_res.json().get("audios", [None])[0]
+                else:
+                    logger.warning(f"Sarvam TTS returned status {sarvam_res.status_code}: {sarvam_res.text}")
         except Exception as e:
             logger.warning(f"Sarvam TTS error: {str(e)}")
 
