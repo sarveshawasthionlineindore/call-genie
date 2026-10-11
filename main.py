@@ -465,8 +465,27 @@ pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
 api_key_header_scheme = APIKeyHeader(name="X-CallGenie-Key", auto_error=False)
 
-def verify_password(plain, hashed): return pwd_context.verify(plain, hashed)
-def get_password_hash(password): return pwd_context.hash(password)
+import hashlib, hmac
+
+def get_password_hash(password: str) -> str:
+    try:
+        return pwd_context.hash(password)
+    except Exception as err:
+        logger.warning(f"passlib fallback to hmac-sha256: {str(err)}")
+        salt = settings.SECRET_KEY[:16].encode()
+        return "sha256$" + hmac.new(salt, password.encode(), hashlib.sha256).hexdigest()
+
+def verify_password(plain: str, hashed: str) -> bool:
+    if str(hashed).startswith("sha256$"):
+        salt = settings.SECRET_KEY[:16].encode()
+        expected = "sha256$" + hmac.new(salt, plain.encode(), hashlib.sha256).hexdigest()
+        return hmac.compare_digest(expected, str(hashed))
+    try:
+        return pwd_context.verify(plain, hashed)
+    except Exception:
+        salt = settings.SECRET_KEY[:16].encode()
+        expected = "sha256$" + hmac.new(salt, plain.encode(), hashlib.sha256).hexdigest()
+        return hmac.compare_digest(expected, str(hashed))
 def create_access_token(data: dict):
     to_encode = data.copy()
     to_encode.update({"exp": datetime.utcnow() + timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)})
@@ -661,7 +680,7 @@ async def voice_status_check():
                     json={
                         "inputs": ["नमस्ते"],
                         "target_language_code": "hi-IN",
-                        "model": "bulbul:v3"
+                        "model": "bulbul:v4-flash"
                     }
                 )
                 sarvam_test_result = f"status_{res.status_code}"
@@ -758,18 +777,19 @@ async def voice_chat_endpoint(chat_in: VoiceChatRequest):
     sarvam_debug_info = None
     sarvam_api_key = (os.getenv("SARVAM_API_KEY") or os.getenv("SARVAM_AI_API_KEY") or os.getenv("SARVAM_KEY") or getattr(settings, "SARVAM_API_KEY", "") or "").strip()
     
+    voice_engine_used = "browser_tts_fallback"
     if sarvam_api_key:
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
-                # Sarvam Bulbul v3 Official REST Specification
+                # 1. Primary: Sarvam Bulbul v4-flash (Latest Model with conversational female persona)
                 sarvam_res = await client.post(
                     "https://api.sarvam.ai/text-to-speech",
                     headers={"api-subscription-key": sarvam_api_key, "Content-Type": "application/json"},
                     json={
                         "inputs": [clean_speech_text],
                         "target_language_code": "hi-IN",
-                        "speaker": "ritu",
-                        "model": "bulbul:v3",
+                        "speaker": "suman_hi_companion",
+                        "model": "bulbul:v4-flash",
                         "pace": 1.05,
                         "speech_sample_rate": 16000
                     }
@@ -778,26 +798,50 @@ async def voice_chat_endpoint(chat_in: VoiceChatRequest):
                     audios = sarvam_res.json().get("audios", [])
                     if audios:
                         audio_base64 = audios[0]
-                        logger.info("Sarvam Bulbul v3 (ritu) audio generated successfully")
+                        voice_engine_used = "sarvam_bulbul_v4_flash"
+                        logger.info("Sarvam Bulbul v4-flash (suman_hi_companion) generated successfully")
                 else:
-                    logger.warning(f"Sarvam TTS ritu failed {sarvam_res.status_code}: {sarvam_res.text}")
-                    sarvam_debug_info = f"Status {sarvam_res.status_code}: {sarvam_res.text}"
-                    # Fallback to default voice without speaker
+                    logger.warning(f"Sarvam v4 persona failed {sarvam_res.status_code}: {sarvam_res.text}. Trying v4 default persona...")
+                    sarvam_debug_info = f"v4_status_{sarvam_res.status_code}: {sarvam_res.text[:120]}"
+                    # 2. Secondary: Sarvam Bulbul v4-flash with default persona (omitting speaker parameter)
                     sarvam_res2 = await client.post(
                         "https://api.sarvam.ai/text-to-speech",
                         headers={"api-subscription-key": sarvam_api_key, "Content-Type": "application/json"},
                         json={
                             "inputs": [clean_speech_text],
                             "target_language_code": "hi-IN",
-                            "model": "bulbul:v3",
-                            "pace": 1.05
+                            "model": "bulbul:v4-flash",
+                            "pace": 1.05,
+                            "speech_sample_rate": 16000
                         }
                     )
                     if sarvam_res2.status_code == 200:
                         audios2 = sarvam_res2.json().get("audios", [])
                         if audios2:
                             audio_base64 = audios2[0]
-                            logger.info("Sarvam Bulbul v3 default voice generated successfully")
+                            voice_engine_used = "sarvam_bulbul_v4_flash"
+                            logger.info("Sarvam Bulbul v4-flash (default persona) generated successfully")
+                    else:
+                        # 3. Tertiary: Fallback to Bulbul v3 with ritu
+                        logger.warning(f"Sarvam v4 default failed {sarvam_res2.status_code}. Fallback to Bulbul v3...")
+                        sarvam_res3 = await client.post(
+                            "https://api.sarvam.ai/text-to-speech",
+                            headers={"api-subscription-key": sarvam_api_key, "Content-Type": "application/json"},
+                            json={
+                                "inputs": [clean_speech_text],
+                                "target_language_code": "hi-IN",
+                                "speaker": "ritu",
+                                "model": "bulbul:v3",
+                                "pace": 1.05,
+                                "speech_sample_rate": 16000
+                            }
+                        )
+                        if sarvam_res3.status_code == 200:
+                            audios3 = sarvam_res3.json().get("audios", [])
+                            if audios3:
+                                audio_base64 = audios3[0]
+                                voice_engine_used = "sarvam_bulbul_v3"
+                                logger.info("Sarvam Bulbul v3 (ritu) generated successfully")
         except Exception as e:
             logger.warning(f"Sarvam TTS exception: {str(e)}")
             sarvam_debug_info = str(e)
@@ -805,7 +849,7 @@ async def voice_chat_endpoint(chat_in: VoiceChatRequest):
     return {
         "reply": ai_reply,
         "audio_base64": audio_base64,
-        "voice_engine": "sarvam_bulbul_v3" if audio_base64 else "browser_tts_fallback",
+        "voice_engine": voice_engine_used,
         "sarvam_debug": sarvam_debug_info
     }
 
@@ -814,14 +858,50 @@ async def voice_chat_endpoint(chat_in: VoiceChatRequest):
 # ==============================================================================
 @app.post("/api/auth/register", response_model=TokenResponse)
 async def register(user_in: UserRegister, db: AsyncSession = Depends(get_db)):
-    if (await db.execute(select(User).where(User.email == user_in.email))).scalar_one_or_none():
-        raise HTTPException(status_code=400, detail="Email already registered")
-    tenant = Tenant(name=user_in.company_name)
-    db.add(tenant); await db.flush()
-    new_user = User(tenant_id=tenant.id, email=user_in.email, hashed_password=get_password_hash(user_in.password), full_name=user_in.full_name)
-    db.add(new_user); db.add(Wallet(tenant_id=tenant.id, balance_inr=100.0))
-    await db.commit(); await db.refresh(new_user)
-    return {"access_token": create_access_token({"sub": new_user.id, "tenant_id": tenant.id}), "token_type": "bearer", "tenant_id": tenant.id, "email": new_user.email, "company_name": tenant.name}
+    try:
+        existing = await db.execute(select(User).where(User.email == user_in.email))
+        if existing.scalar_one_or_none():
+            raise HTTPException(status_code=400, detail="Email already registered. Kripya login karein.")
+    except HTTPException:
+        raise
+    except Exception as db_err:
+        logger.warning(f"DB check failed, attempting auto table sync: {str(db_err)}")
+        try:
+            async with engine.begin() as conn:
+                await conn.run_sync(Base.metadata.create_all)
+        except Exception as sync_err:
+            logger.error(f"Table sync failed: {str(sync_err)}")
+            raise HTTPException(status_code=500, detail=f"Database table sync error: {str(sync_err)[:100]}")
+
+    try:
+        tenant = Tenant(name=user_in.company_name)
+        db.add(tenant)
+        await db.flush()
+        
+        hashed_pwd = get_password_hash(user_in.password)
+        new_user = User(
+            tenant_id=tenant.id,
+            email=user_in.email,
+            hashed_password=hashed_pwd,
+            full_name=user_in.full_name
+        )
+        db.add(new_user)
+        db.add(Wallet(tenant_id=tenant.id, balance_inr=100.0))
+        await db.commit()
+        await db.refresh(new_user)
+
+        token = create_access_token({"sub": new_user.id, "tenant_id": tenant.id})
+        return {
+            "access_token": token,
+            "token_type": "bearer",
+            "tenant_id": tenant.id,
+            "email": new_user.email,
+            "company_name": tenant.name
+        }
+    except Exception as e:
+        await db.rollback()
+        logger.error(f"Registration error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Registration failed: {str(e)[:120]}")
 
 @app.post("/api/auth/login", response_model=TokenResponse)
 async def login(user_in: UserLogin, db: AsyncSession = Depends(get_db)):
