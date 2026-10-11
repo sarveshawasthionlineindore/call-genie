@@ -525,44 +525,96 @@ def generate_dynamic_hindi_reply(user_msg: str, client_name: str, biz_name: str,
 
     b_name = biz_name.strip() if biz_name and biz_name.strip().lower() not in ["business", "aapke business", "", "general"] else "आपके बिज़नेस"
 
-    # 1. Real Estate / Property / Plots / Flats (Realistic Solution)
+    # 1. E-Commerce & D2C
+    if any(w in msg for w in ["e-commerce", "ecommerce", "online", "order", "delivery", "cod", "d2c", "store", "shopping", "dispatch", "rto", "ई-कॉमर्स", "ऑर्डर"]):
+        return f"जी {caller}ई-कॉमर्स के लिए मैं नए ऑर्डर पर तुरंत COD कन्फर्मेशन कॉल करूँगी ताकि RTO कम हो, डिस्पैच व डिलीवरी का अपडेट दूँगी, रिटर्न सपोर्ट संभालूँगी और ऑफर्स की कॉल्स भी करूँगी।"
+
+    # 2. Real Estate, Builders & Properties
     if any(w in msg for w in ["plot", "flat", "property", "zameen", "bhk", "location", "realty", "builder", "site visit", "real estate", "प्रॉपर्टी", "प्लॉट", "फ्लैट", "रियल एस्टेट"]):
-        return f"जी {caller}रियल एस्टेट में जैसे ही कोई ग्राहक आपके विज्ञापन देखकर कॉल करेगा, मैं उनसे उनका बजट और 2BHK या 3BHK की पसंद पूछ लूँगी, उनकी साइट विजिट शेड्यूल कर दूँगी और व्हाट्सएप पर पूरी डिटेल भेज दूँगी।"
+        return f"जी {caller}रियल एस्टेट में जैसे ही कोई ग्राहक विज्ञापन देखकर कॉल करेगा, मैं उनका बजट और 2BHK या 3BHK की पसंद पूछ लूँगी, साइट विजिट शेड्यूल कर दूँगी और व्हाट्सएप पर ब्रोशर भेज दूँगी।"
 
-    # 2. School / College / Education / Coaching / Admission (Realistic Solution)
-    if any(w in msg for w in ["school", "college", "education", "coaching", "admission", "fees", "student", "parent", "vidyalaya", "padhai", "class", "स्कूल", "कॉलेज", "एडमिशन"]):
-        return f"जी {caller}स्कूल और संस्थान के लिए जब भी पेरेंट्स कॉल करेंगे, मैं नए एडमिशन की जानकारी, फीस स्ट्रक्चर और टाइमिंग बता दूँगी, और तुरंत उनके फोन पर स्कूल का प्रोस्पेक्टस भेज दूँगी।"
+    # 3. Gym, Fitness, Yoga & Crossfit
+    if any(w in msg for w in ["gym", "fitness", "yoga", "workout", "trainer", "जिम", "फिटनेस", "योगा", "कसरत"]):
+        return f"जी {caller}जिम के लिए जैसे ही कोई इंक्वायरी आएगी, मैं उनका फिटनेस गोल पूछकर फ्री ट्रायल स्लॉट बुक कर लूँगी, मेंबरशिप प्लान्स समझाऊँगी और तुरंत व्हाट्सएप पर टाइमिंग्स भेज दूँगी।"
 
-    # 3. Hospital / Clinic / Doctor / Healthcare (Realistic Solution)
+    # 4. Interior Design, Architecture & Furniture
+    if any(w in msg for w in ["interior", "designer", "decor", "architect", "renovation", "furniture", "इंटीरियर", "डिजाइनर", "फर्नीचर"]):
+        return f"जी {caller}इंटीरियर डिजाइनिंग के लिए जैसे ही कोई कॉल करेगा, मैं उनसे कारपेट एरिया और बजट पूछकर आपकी कंसल्टेशन मीटिंग फिक्स कर लूँगी और तुरंत व्हाट्सएप पर आपका पोर्टफोलियो भेज दूँगी।"
+
+    # 5. Hotels, Resorts, Homestays & Banquets
+    if any(w in msg for w in ["hotel", "resort", "room", "booking", "stay", "banquet", "होटल", "रिसॉर्ट", "कमरा"]):
+        return f"जी {caller}होटल के लिए मैं 24 घंटे रूम बुकिंग की इन्क्वायरी लूँगी, चेक-इन टाइम व टैरिफ बताऊँगी, बुकिंग कन्फर्म करूँगी और तुरंत व्हाट्सएप पर लोकेशन व तस्वीरें भेज दूँगी।"
+
+    # 6. CA, Legal, Accounting & Tax Consultants
+    if any(w in msg for w in ["ca", "chartered", "tax", "gst", "itr", "lawyer", "advocate", "legal", "अकाउंटेंट", "वकील", "टैक्स"]):
+        return f"जी {caller}आपकी फर्म के लिए मैं जीएसटी और आईटीआर की डेडलाइन पर ग्राहकों को रिमाइंडर कॉल्स करूँगी, कंसल्टेशन स्लॉट्स बुक करूँगी और जरूरी डॉक्युमेंट्स की लिस्ट व्हाट्सएप पर भेज दूँगी।"
+
+    # 7. Travel, Tours, Visa & Holiday Packages
+    if any(w in msg for w in ["travel", "tour", "package", "holiday", "flight", "visa", "ट्रैवल", "टूर", "यात्रा", "घूमना"]):
+        return f"जी {caller}आपकी ट्रैवल एजेंसी के लिए जब भी कोई कॉल करेगा, मैं डेस्टिनेशन और बजट पूछकर कस्टमाइज्ड पैकेज डिटेल्स समझाऊँगी और तुरंत व्हाट्सएप पर पूरी इटिनरेरी भेज दूँगी।"
+
+    # 8. Restaurants, Cafes & Food Delivery
+    if any(w in msg for w in ["restaurant", "cafe", "food", "table", "dining", "रेस्तरां", "कैफे", "खाना"]):
+        return f"जी {caller}रेस्तरां के लिए मैं ग्राहकों के लिए टेबल रिज़र्वेशन करूँगी, पार्टी व कैटरिंग की बुकिंग लूँगी, मेन्यू व स्पेशल डिशेस बताऊँगी और व्हाट्सएप पर लोकेशन भेज दूँगी।"
+
+    # 9. Salons, Spas & Beauty Parlors
+    if any(w in msg for w in ["salon", "spa", "parlour", "beauty", "hair", "makeup", "सैलून", "पार्लर", "स्पा"]):
+        return f"जी {caller}सैलून के लिए मैं ग्राहकों के लिए अपॉइंटमेंट स्लॉट बुक करूँगी, ब्राइडल व हेयर पैकेजेस के रेट्स बताऊँगी और कन्फर्मेशन मैसेज तुरंत उनके व्हाट्सएप पर भेज दूँगी।"
+
+    # 10. Schools, Colleges, Coaching & Classes
+    if any(w in msg for w in ["school", "college", "education", "coaching", "admission", "fees", "student", "parent", "class", "स्कूल", "कॉलेज", "एडमिशन"]):
+        return f"जी {caller}स्कूल और संस्थान के लिए जब भी पेरेंट्स कॉल करेंगे, मैं नए एडमिशन की जानकारी, फीस स्ट्रक्चर और टाइमिंग बता दूँगी, और तुरंत उनके फोन पर प्रोस्पेक्टस भेज दूँगी।"
+
+    # 11. Hospital, Clinic, Doctors & Healthcare
     if any(w in msg for w in ["doctor", "clinic", "appointment", "dawai", "ilaj", "timing", "hospital", "patient", "डॉक्टर", "अस्पताल", "इलाज"]):
         return f"जी {caller}क्लिनिक और हॉस्पिटल के लिए मैं मरीज़ों के अपॉइंटमेंट बुक कर लूँगी, डॉक्टर का उपलब्ध समय बता दूँगी और कन्फर्मेशन मैसेज तुरंत उनके व्हाट्सएप पर भेज दूँगी।"
 
-    # 4. Automobile / Car Dealership / Service (Realistic Solution)
+    # 12. Automobile, Car/Bike Showrooms & Service Centers
     if any(w in msg for w in ["car", "bike", "vehicle", "automobile", "dealership", "showroom", "service", "test drive", "गाड़ी", "कार"]):
         return f"जी {caller}ऑटोमोबाइल शोरूम के लिए मैं ग्राहकों के लिए टेस्ट ड्राइव बुक कर लूँगी, गाड़ियों की कीमतें और फीचर्स बता दूँगी और हॉट लीड्स सीधे आपकी सेल्स टीम को दे दूँगी।"
 
-    # 5. Pricing / Rate / Cost
+    # 13. Events, Weddings & Photography
+    if any(w in msg for w in ["event", "wedding", "photographer", "photography", "dj", "शादी", "इवेंट", "फोटोग्राफी"]):
+        return f"जी {caller}इवेंट्स और वेडिंग के लिए मैं क्लाइंट्स से डेट और बजट पूछकर आपकी प्लानिंग मीटिंग शेड्यूल कर लूँगी और तुरंत व्हाट्सएप पर आपके पिछले इवेंट्स का पोर्टफोलियो भेज दूँगी।"
+
+    # 14. Astrology, Vastu & Horoscopes
+    if any(w in msg for w in ["astrology", "jyotish", "kundali", "vastu", "pandit", "ज्योतिष", "कुंडली", "वास्तु"]):
+        return f"जी {caller}कंसल्टेशन के लिए मैं क्लाइंट्स से जन्म विवरण लेकर आपका अपॉइंटमेंट स्लॉट बुक कर लूँगी, फीस बता दूँगी और व्हाट्सएप पर स्लॉट कन्फर्मेशन भेज दूँगी।"
+
+    # 15. Logistics, Transport & Packers Movers
+    if any(w in msg for w in ["transport", "packers", "movers", "courier", "logistics", "ट्रांसपोर्ट", "पैकर्स"]):
+        return f"जी {caller}ट्रांसपोर्ट और शिफ्टिंग के लिए मैं पिकअप लोकेशन और सामान का विवरण लेकर तुरंत कोटेशन जनरेट करूँगी और बुकिंग डिटेल्स व्हाट्सएप पर भेज दूँगी।"
+
+    # 16. Solar, Green Energy & Rooftop
+    if any(w in msg for w in ["solar", "rooftop", "panel", "bijli", "सोलर", "बिजली"]):
+        return f"जी {caller}सोलर के लिए मैं ग्राहक का मासिक बिजली बिल पूछकर साइट सर्वे बुक कर लूँगी, सब्सिडी की जानकारी दूँगी और व्हाट्सएप पर अनुमानित बचत का कोटेशन भेज दूँगी।"
+
+    # 17. Security, Pest Control & Cleaning Services
+    if any(w in msg for w in ["pest", "cleaning", "security", "guard", "pest control", "सफाई"]):
+        return f"जी {caller}होम सर्विसेज के लिए मैं ग्राहक की लोकेशन और समस्या समझकर टेक्नीशियन का विजिट शेड्यूल कर लूँगी और तुरंत व्हाट्सएप पर सर्विस चार्ज भेज दूँगी।"
+
+    # 18. Pricing / Rate / Cost
     if any(w in msg for w in ["kitna paisa", "kitna kharcha", "rate", "cost", "price", "kitna lagega", "charge", "fees", "किराया", "दाम", "खर्चा", "रेट"]):
         return "कॉल जीनी का रेट बहुत ही पारदर्शी और किफायती है, लगभग सिर्फ पाँच रुपये प्रति मिनट। आप जब चाहें एक छोटे से बैलेंस से अपनी कॉलिंग शुरू कर सकती हैं।"
 
-    # 6. Capabilities / What can you do / Help (Realistic, Consultative, No Clichés)
+    # 19. Capabilities / What can you do / Help
     if any(w in msg for w in ["kya kar sakte", "kya kar sakti", "kya kaam", "kaise kaam", "kya service", "features", "kya karte", "kya karti", "madad", "help", "क्या कर सकते", "क्या कर सकती"]):
         return f"मैं {b_name} की हर कॉल चौबीस घंटे अटेंड करूँगी, ग्राहकों के सवालों के सटीक जवाब दूँगी और जो भी ग्राहक रुचि दिखाएँ, उनकी पूरी डिटेल और नंबर आपके व्हाट्सएप पर तुरंत भेज दूँगी।"
 
-    # 7. Greetings
+    # 20. Greetings
     if any(w in msg for w in ["नमस्ते", "हैलो", "हेलो", "हाय", "namaste", "hello", "hi", "hey", "kaise ho", "kya haal"]):
         return f"नमस्ते {caller}मायबॉट जीनी के कॉल जीनी में आपका स्वागत है! बताइये, आज {b_name} के लिए मैं आपकी किस तरह मदद करूँ?"
 
-    # 8. Identity / Who are you
+    # 21. Identity / Who are you
     if any(w in msg for w in ["कौन हो", "kaun ho", "kya naam", "naam kya", "kya ho", "who are you", "tum kaun"]):
         return "मैं कॉल जीनी एआई बोल रही हूँ मायबॉट जीनी से। मैं एक वॉइस असिस्टेंट हूँ जो आपके ग्राहकों से बिल्कुल एक समझदार रिलेशनशिप मैनेजर की तरह बात करती हूँ।"
 
-    # 9. Thanks / Bye
+    # 22. Thanks / Bye
     if any(w in msg for w in ["dhanyawad", "shukriya", "bye", "alvida", "theek hai", "ok", "thank"]):
         return f"बहुत-बहुत धन्यवाद {caller}आपकी सेवा के लिए मैं हमेशा उपलब्ध हूँ। आपका दिन बहुत शुभ हो!"
 
-    # Default Realistic Solution (Strictly Feminine Grammar, No Clichés)
-    return f"जी {caller}मैंने आपकी ज़रूरत समझ ली है। ग्राहकों की कॉल्स अटेंड करके उनके सवालों के जवाब देना और आपको रेडी लीड्स लाकर देना—यह सब मैं बहुत अच्छे से संभाल लूँगी।"
+    # Universal Bespoke Fallback for ANY OTHER Unlisted Business
+    return f"जी {caller}आपके बिज़नेस में जब भी कोई ग्राहक कॉल करेगा, मैं उनकी ज़रूरत व बजट समझकर आपकी अपॉइंटमेंट या बुकिंग फिक्स करूँगी, उनके सवालों के सटीक जवाब दूँगी और तुरंत उनके व्हाट्सएप पर आपकी पूरी प्रोफाइल व रेट्स भेज दूँगी।"
 
 class VoiceChatRequest(BaseModel):
     message: str
@@ -640,6 +692,7 @@ async def voice_chat_endpoint(chat_in: VoiceChatRequest):
         "CRITICAL RULES FOR SPEECH & PERSONA: "
         "1. STRICT FEMALE GRAMMAR (स्त्रीलिंग क्रिया रूप अनिवार्य): You are a female executive speaking with Sarvam's Bulbul female voice. You MUST ALWAYS speak using female Hindi verb endings: say 'कर सकती हूँ' (NEVER 'कर सकता हूँ'), 'बोल रही हूँ' (NEVER 'बोल रहा हूँ'), 'बताऊँगी', 'पूछ लूँगी', 'करूँगी', 'भेज दूँगी'. "
         "2. NO ROBOTIC CLICHES (घिसी-पिटी बातें मना हैं): NEVER say 'मैं आपके प्रोसेस को ऑटोमेट कर सकती हूँ' or robotic automation lines. Give real, practical business solutions. "
+        "   - If they ask about E-Commerce / D2C: Explain handling COD order confirmation calls to reduce RTO, sending dispatch/delivery updates, managing 24/7 customer support for returns/tracking, and making promotional/festive offer calls. "
         "   - If they ask about Real Estate: Explain how you answer property calls, ask buyer budget/BHK, book site visits, and send details on WhatsApp. "
         "   - If they ask about Schools: Explain managing parent admission queries, fee structures, school timings, and sending prospectus on WhatsApp. "
         "   - If they ask about Clinics: Explain booking appointments and doctor availability. "
