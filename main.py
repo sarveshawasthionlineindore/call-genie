@@ -584,22 +584,41 @@ def generate_dynamic_hindi_reply(user_msg: str, client_name: str, biz_name: str,
 
     b_name = biz_name.strip() if biz_name and biz_name.strip().lower() not in ["business", "aapke business", "", "general"] else "आपके बिज़नेस"
 
-    # 0. LIVE OUTBOUND DEMO CALL & ROLEPLAY (Immediate Simulation)
+    # 0. LIVE OUTBOUND DEMO CALL & CUSTOMER DISCOVERY (Real Telecaller Simulation)
     is_outbound_demo = any(w in msg for w in [
-        "outbound call", "outbound", "आउटबाउंड कॉल", "आउटबाउंड", "आउटबॉउंड",
+        "outbound call", "outbound", "outgoing", "आउटबाउंड कॉल", "आउटबाउंड", "आउटगोइंग कॉल", "आउटगोइंग",
         "कॉल करके बताओ", "कॉल करके दिखाओ", "डेमो कॉल", "demo call",
         "कॉल लगाओ", "roleplay", "रोलप्ले", "कॉल करो", "pitch karke",
-        "डेमो बताओ", "डेमो दो"
+        "डेमो बताओ", "डेमो दो", "आउटगोइंग कॉल"
     ])
 
     if is_outbound_demo:
+        # Hospital / Healthcare Outbound Discovery
+        if any(w in msg for w in ["hospital", "clinic", "doctor", "health", "अस्पताल", "क्लिनिक", "डॉक्टर", "इलाज", "दवा"]):
+            return "नमस्ते! मैं सिटी केयर सुपरस्पेशलिटी हॉस्पिटल से रिया बात कर रही हूँ। क्या मेरी बात सर से हो रही है? दरअसल आपने हाल ही में हमारे यहाँ हेल्थ चेकअप और कंसल्टेशन के लिए इन्क्वायरी की थी। क्या आप किसी विशेष डिपार्टमेंट—जैसे कार्डियोलॉजी, ऑर्थो या जनरल चेकअप के लिए डॉक्टर से परामर्श लेना चाहते हैं? हमारे यहाँ सभी सुपरस्पेशलिटी डॉक्टर्स और 24 घंटे इमरजेंसी उपलब्ध है। क्या मैं आपके लिए सीनियर डॉक्टर का अपॉइंटमेंट स्लॉट चेक कर दूँ?"
+        
+        # Real Estate Outbound Discovery
         if any(w in msg for w in ["real estate", "property", "plot", "flat", "रियल एस्टेट", "प्रॉपर्टी", "फ्लैट", "प्लॉट", "मकान"]):
-            return "नमस्ते! मैं एपेक्स रियल्टी से रिया बात कर रही हूँ। क्या मेरी बात सर से हो रही है? दरअसल आपने हाल ही में हमारे नए 2BHK और 3BHK प्रोजेक्ट के लिए इन्क्वायरी की थी। क्या आप अपने रहने के लिए प्रॉपर्टी देख रहे हैं या इन्वेस्टमेंट के लिए?"
+            return "नमस्ते! मैं एपेक्स रियल्टी से रिया बात कर रही हूँ। क्या मेरी बात सर से हो रही है? दरअसल आपने हाल ही में हमारे नए प्राइम प्रोजेक्ट के लिए इन्क्वायरी की थी। मैं जानना चाह रही थी कि आप 2BHK या 3BHK प्रॉपर्टी देख रहे हैं, और आपका बजट लगभग क्या रहेगा? हमारे पास रेडी-टू-मूव और अंडर-कंस्ट्रक्शन दोनों ऑप्शंस हैं। क्या मैं आपके लिए इस वीकेंड पर एक फ्री साइट विजिट शेड्यूल कर दूँ?"
+        
+        # E-Commerce Outbound Discovery
         if any(w in msg for w in ["ecommerce", "e-commerce", "order", "cod", "delivery", "ई-कॉमर्स", "ऑर्डर"]):
-            return "नमस्ते! मैं माय स्टोर से बात कर रही हूँ। आपका 1,499 रुपये का कैश ऑन डिलीवरी ऑर्डर हमारे पास रिसीव हुआ है। क्या मैं आपका यह ऑर्डर शिपिंग के लिए कन्फर्म कर दूँ?"
+            return "नमस्ते! मैं माय स्टोर से रिया बात कर रही हूँ। क्या मेरी बात सर से हो रही है? आपका 1,499 रुपये का कैश ऑन डिलीवरी ऑर्डर हमारे पास रिसीव हुआ है। क्या मैं आपका डिलीवरी एड्रेस कन्फर्म करके यह पार्सल आज ही डिस्पैच करवा दूँ? और क्या ट्रैकिंग लिंक आपके व्हाट्सएप पर भेज दूँ?"
+        
+        # School / Education Outbound Discovery
         if any(w in msg for w in ["school", "college", "admission", "coaching", "स्कूल", "एडमिशन"]):
-            return "नमस्ते! मैं ग्रीनवुड स्कूल के एडमिशन ऑफिस से बात कर रही हूँ। आपने नए सेशन में एडमिशन के लिए इन्क्वायरी फॉर्म भरा था। क्या मैं आपका प्रोस्पेक्टस व्हाट्सएप पर भेज दूँ?"
-        return f"नमस्ते! मैं {b_name} से आपकी पर्सनल एग्जीक्यूटिव बात कर रही हूँ। क्या मेरी बात सर से हो रही है? आपने हमारी सेवाओं के बारे में जानकारी माँगी थी। क्या मैं आपको 2 मिनट में इसकी पूरी डिटेल्स समझा सकती हूँ?"
+            return "नमस्ते! मैं ग्रीनवुड इंटरनेशनल स्कूल के एडमिशन ऑफिस से रिया बात कर रही हूँ। क्या मेरी बात सर से हो रही है? आपने नए सेशन में बच्चे के एडमिशन के लिए फॉर्म भरा था। क्या आप प्राइमरी विंग के लिए देख रहे हैं या सीनियर विंग के लिए? हमारे यहाँ सीबीएसई एफिलिएशन और स्पोर्ट्स सुविधाएं हैं। क्या मैं कल आपके लिए प्रिंसिपल सर के साथ एक काउंसलिंग सेशन रख दूँ?"
+        
+        # Gym / Fitness Outbound Discovery
+        if any(w in msg for w in ["gym", "fitness", "workout", "जिम", "फिटनेस"]):
+            return "नमस्ते! मैं गोल्ड्स फिटनेस क्लब से रिया बात कर रही हूँ। क्या मेरी बात सर से हो रही है? आपने हमारी जिम मेंबरशिप और पर्सनल ट्रेनिंग के लिए इन्क्वायरी की थी। आपका मुख्य फिटनेस गोल क्या है—वेट लॉस, मसल बिल्डिंग या जनरल फिटनेस? हमारे यहाँ सर्टिफाइड न्यूट्रिशनिस्ट और स्टीम-बाथ उपलब्ध है। क्या मैं कल शाम 6 बजे आपका एक फ्री ट्रायल स्लॉट बुक कर दूँ?"
+        
+        # Interior Design Outbound Discovery
+        if any(w in msg for w in ["interior", "designer", "decor", "इंटीरियर"]):
+            return "नमस्ते! मैं एलिगेंट इंटीरियर्स से रिया बात कर रही हूँ। क्या मेरी बात सर से हो रही है? आपने होम इंटीरियर डिजाइनिंग के लिए इन्क्वायरी की थी। क्या आप नए 2BHK/3BHK फ्लैट के लिए इंटीरियर कराना चाहते हैं या रिनोवेशन के लिए? हमारा 3D डिजाइनिंग और 10 साल की वारंटी का ऑफर चल रहा है। क्या मैं कल आपके साथ आर्किटेक्ट की फ्री कंसल्टेशन मीटिंग रख दूँ?"
+
+        # Universal Bespoke Outbound Discovery for Any Other Business
+        return f"नमस्ते! मैं {b_name} से रिया बात कर रही हूँ। क्या मेरी बात सर से हो रही है? आपने हाल ही में हमारी सेवाओं के लिए इन्क्वायरी की थी। मैं जानना चाह रही थी कि आपकी मुख्य आवश्यकता किस चीज़ के लिए है, ताकि मैं आपको सबसे सटीक समाधान बता सकूँ? हमारे पास कस्टमाइज्ड पैकेजेस और स्पेशल ऑफर्स उपलब्ध हैं। क्या मैं 2 मिनट में आपको पूरी डिटेल्स समझा सकती हूँ?"
 
     # 1. E-Commerce & D2C
     if any(w in msg for w in ["e-commerce", "ecommerce", "online", "order", "delivery", "cod", "d2c", "store", "shopping", "dispatch", "rto", "ई-कॉमर्स", "ऑर्डर"]):
@@ -789,41 +808,50 @@ async def voice_chat_endpoint(chat_in: VoiceChatRequest):
     messages.append({"role": "user", "content": chat_in.message})
 
     ai_reply = None
-    groq_api_key = os.getenv("GROQ_API_KEY") or os.getenv("GROK_API_KEY") or os.getenv("GROQ_KEY") or getattr(settings, "GROQ_API_KEY", "")
+    groq_api_key = (os.getenv("GROQ_API_KEY") or os.getenv("GROK_API_KEY") or os.getenv("GROQ_KEY") or getattr(settings, "GROQ_API_KEY", "") or "").strip().replace('"', '').replace("'", "")
+    brain_used = "dynamic_discovery_engine"
+    groq_debug_info = None
     
     if groq_api_key:
         try:
-            async with httpx.AsyncClient(timeout=7.0) as client:
+            async with httpx.AsyncClient(timeout=9.0) as client:
+                # 1. Primary: Llama 3.3 70B Versatile
                 res = await client.post(
                     "https://api.groq.com/openai/v1/chat/completions",
                     headers={"Authorization": f"Bearer {groq_api_key}", "Content-Type": "application/json"},
                     json={
                         "model": "llama-3.3-70b-versatile",
                         "messages": messages,
-                        "temperature": 0.5,
-                        "max_tokens": 120
+                        "temperature": 0.6,
+                        "max_tokens": 150
                     }
                 )
                 if res.status_code == 200:
                     ai_reply = res.json()["choices"][0]["message"]["content"].strip()
+                    brain_used = "groq_llama_3_3_70b"
                 else:
-                    logger.warning(f"Groq API returned status {res.status_code}: {res.text}. Trying fallback model...")
+                    logger.warning(f"Groq 70B failed {res.status_code}: {res.text[:120]}. Trying 8B...")
+                    groq_debug_info = f"70b_status_{res.status_code}: {res.text[:100]}"
+                    # 2. Secondary: Llama 3.1 8B Instant
                     res2 = await client.post(
                         "https://api.groq.com/openai/v1/chat/completions",
                         headers={"Authorization": f"Bearer {groq_api_key}", "Content-Type": "application/json"},
                         json={
                             "model": "llama-3.1-8b-instant",
                             "messages": messages,
-                            "temperature": 0.5,
-                            "max_tokens": 120
+                            "temperature": 0.6,
+                            "max_tokens": 150
                         }
                     )
                     if res2.status_code == 200:
                         ai_reply = res2.json()["choices"][0]["message"]["content"].strip()
+                        brain_used = "groq_llama_3_1_8b"
                     else:
-                        logger.warning(f"Groq fallback model also returned status {res2.status_code}")
+                        logger.warning(f"Groq 8B failed {res2.status_code}: {res2.text[:120]}")
+                        groq_debug_info += f" | 8b_status_{res2.status_code}"
         except Exception as e:
-            logger.warning(f"Groq conversational error: {str(e)}")
+            logger.warning(f"Groq conversational exception: {str(e)}")
+            groq_debug_info = str(e)
 
     if not ai_reply:
         ai_reply = generate_dynamic_hindi_reply(
@@ -913,6 +941,8 @@ async def voice_chat_endpoint(chat_in: VoiceChatRequest):
         "reply": ai_reply,
         "audio_base64": audio_base64,
         "voice_engine": voice_engine_used,
+        "brain_engine": brain_used,
+        "groq_debug": groq_debug_info,
         "sarvam_debug": sarvam_debug_info
     }
 
