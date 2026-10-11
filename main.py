@@ -641,37 +641,58 @@ async def voice_chat_endpoint(chat_in: VoiceChatRequest):
     clean_speech_text = ai_reply.replace("*", "").replace("#", "").replace("_", "").strip()
 
     audio_base64 = None
-    sarvam_api_key = os.getenv("SARVAM_API_KEY") or os.getenv("SARVAM_AI_API_KEY") or os.getenv("SARVAM_KEY") or getattr(settings, "SARVAM_API_KEY", "")
+    sarvam_debug_info = None
+    sarvam_api_key = (os.getenv("SARVAM_API_KEY") or os.getenv("SARVAM_AI_API_KEY") or os.getenv("SARVAM_KEY") or getattr(settings, "SARVAM_API_KEY", "") or "").strip()
     
     if sarvam_api_key:
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
+                # Sarvam Bulbul v3 Official REST Specification
                 sarvam_res = await client.post(
                     "https://api.sarvam.ai/text-to-speech",
                     headers={"api-subscription-key": sarvam_api_key, "Content-Type": "application/json"},
                     json={
                         "inputs": [clean_speech_text],
                         "target_language_code": "hi-IN",
-                        "speaker": "meera",
-                        "pitch": 0,
-                        "pace": 1.15,
-                        "loudness": 1.5,
-                        "speech_sample_rate": 16000,
-                        "enable_preprocessing": True,
-                        "model": "bulbul:v1"
+                        "speaker": "ritu",
+                        "model": "bulbul:v3",
+                        "pace": 1.05,
+                        "speech_sample_rate": 16000
                     }
                 )
                 if sarvam_res.status_code == 200:
-                    audio_base64 = sarvam_res.json().get("audios", [None])[0]
-                    logger.info("Sarvam studio audio generated successfully")
+                    audios = sarvam_res.json().get("audios", [])
+                    if audios:
+                        audio_base64 = audios[0]
+                        logger.info("Sarvam Bulbul v3 (ritu) audio generated successfully")
                 else:
-                    logger.warning(f"Sarvam TTS returned status {sarvam_res.status_code}: {sarvam_res.text}")
+                    logger.warning(f"Sarvam TTS ritu failed {sarvam_res.status_code}: {sarvam_res.text}")
+                    sarvam_debug_info = f"Status {sarvam_res.status_code}: {sarvam_res.text}"
+                    # Fallback to default voice without speaker
+                    sarvam_res2 = await client.post(
+                        "https://api.sarvam.ai/text-to-speech",
+                        headers={"api-subscription-key": sarvam_api_key, "Content-Type": "application/json"},
+                        json={
+                            "inputs": [clean_speech_text],
+                            "target_language_code": "hi-IN",
+                            "model": "bulbul:v3",
+                            "pace": 1.05
+                        }
+                    )
+                    if sarvam_res2.status_code == 200:
+                        audios2 = sarvam_res2.json().get("audios", [])
+                        if audios2:
+                            audio_base64 = audios2[0]
+                            logger.info("Sarvam Bulbul v3 default voice generated successfully")
         except Exception as e:
-            logger.warning(f"Sarvam TTS error: {str(e)}")
+            logger.warning(f"Sarvam TTS exception: {str(e)}")
+            sarvam_debug_info = str(e)
 
     return {
         "reply": ai_reply,
-        "audio_base64": audio_base64
+        "audio_base64": audio_base64,
+        "voice_engine": "sarvam_bulbul_v3" if audio_base64 else "browser_tts_fallback",
+        "sarvam_debug": sarvam_debug_info
     }
 
 # ==============================================================================
