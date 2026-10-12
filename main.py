@@ -7,11 +7,16 @@ import logging
 import asyncio
 import httpx
 import json
+import smtplib
+import ssl
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 import re
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
 
 from fastapi import (
+    Query,
     FastAPI, APIRouter, Depends, HTTPException, status,
     UploadFile, File, Form, BackgroundTasks, Request, Security, Response
 )
@@ -26,6 +31,7 @@ from passlib.context import CryptContext
 import pandas as pd
 
 from sqlalchemy import (
+    func,
     Column, String, Boolean, DateTime, ForeignKey, Text, Float, Integer, JSON, select, desc
 )
 from sqlalchemy.orm import declarative_base, relationship
@@ -69,6 +75,13 @@ class Settings(BaseSettings):
     WHATSAPP_TEMPLATE_NAME: str = os.getenv("WHATSAPP_TEMPLATE_NAME", "newmsg_4578000")
     WHATSAPP_TEMPLATE_LANG: str = os.getenv("WHATSAPP_TEMPLATE_LANG", "nl")
     WHATSAPP_BANNER_IMAGE_URL: str = os.getenv("WHATSAPP_BANNER_IMAGE_URL", "https://call.mybotgenie.in/assets/banner.png")
+
+    # Hostinger Business Email SMTP (bot@mybotgenie.in)
+    SMTP_HOST: str = os.getenv("SMTP_HOST", "smtp.hostinger.com")
+    SMTP_PORT: int = int(os.getenv("SMTP_PORT", "465"))
+    SMTP_USER: str = os.getenv("SMTP_USER", "bot@mybotgenie.in")
+    SMTP_PASSWORD: str = os.getenv("SMTP_PASSWORD", "#Grow@2025")
+    SMTP_FROM_NAME: str = "Call Genie by MyBot Genie"
 
     DEFAULT_RETAIL_RATE_PER_MIN_INR: float = 5.00
     BILLING_PULSE_SECONDS: int = 60
@@ -166,6 +179,8 @@ class User(Base):
     hashed_password = Column(String(255), nullable=False)
     full_name = Column(String(255), nullable=True)
     role = Column(String(50), default="tenant_admin")
+    is_verified = Column(Boolean, default=False)
+    reset_token = Column(String(100), nullable=True)
     is_active = Column(Boolean, default=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
@@ -314,6 +329,36 @@ class ClientWebhookEndpoint(Base):
     is_active = Column(Boolean, default=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
+
+class RechargeRequest(Base):
+    __tablename__ = "recharge_requests"
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    tenant_id = Column(String(36), ForeignKey("tenants.id"), index=True, nullable=False)
+    user_id = Column(String(36), ForeignKey("users.id"), index=True, nullable=False)
+    amount_inr = Column(Float, nullable=False)
+    utr_number = Column(String(64), nullable=False, index=True)
+    payment_method = Column(String(32), default="UPI_QR")
+    status = Column(String(32), default="PENDING") # PENDING, APPROVED, REJECTED
+    admin_notes = Column(String(255), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+class Invoice(Base):
+    __tablename__ = "invoices"
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    invoice_number = Column(String(64), unique=True, index=True, nullable=False) # e.g. INV-2026-1001
+    tenant_id = Column(String(36), ForeignKey("tenants.id"), index=True, nullable=False)
+    user_id = Column(String(36), ForeignKey("users.id"), index=True, nullable=False)
+    recharge_request_id = Column(String(36), nullable=True)
+    amount_inr = Column(Float, nullable=False)
+    gst_rate = Column(Float, default=0.0) # 0.0% GST Exempt
+    gst_amount_inr = Column(Float, default=0.0)
+    total_amount_inr = Column(Float, nullable=False)
+    payment_method = Column(String(32), default="UPI")
+    utr_number = Column(String(64), nullable=True)
+    status = Column(String(32), default="PAID")
+    created_at = Column(DateTime, default=datetime.utcnow)
+
 # ==============================================================================
 # 4. SCHEMAS
 # ==============================================================================
@@ -331,14 +376,42 @@ class CRMLookupTestRequest(BaseModel):
     query_type: str = "phone" # phone, bill_id, patient_id
     query_value: str
 
+class UpiRechargeSubmitRequest(BaseModel):
+    amount_inr: float
+    utr_number: str
+    notes: Optional[str] = None
+
+class RechargeApprovalRequest(BaseModel):
+    notes: Optional[str] = None
+
+class RechargeRejectRequest(BaseModel):
+    reason: Optional[str] = "Invalid or unverified UTR"
+
+
+class VerifyOTPOpRequest(BaseModel):
+    email: str
+    otp: str
+
+class ResendOTPRequest(BaseModel):
+    email: str
+    purpose: Optional[str] = "signup"
+
+class ForgotPasswordRequest(BaseModel):
+    email: str
+
+class ResetPasswordRequest(BaseModel):
+    email: str
+    otp: str
+    new_password: str
+
 class UserRegister(BaseModel):
-    email: EmailStr
+    email: str
     password: str
     company_name: str
     full_name: Optional[str] = None
 
 class UserLogin(BaseModel):
-    email: EmailStr
+    email: str
     password: str
 
 class TokenResponse(BaseModel):
@@ -404,6 +477,120 @@ class SingleCallRequest(BaseModel):
 # ==============================================================================
 # 5. CORE SERVICES (WHATSAPP, LIVEKIT, BILLING)
 # ==============================================================================
+# ==============================================================================
+# 5. EMAIL SERVICE (HOSTINGER SMTP - bot@mybotgenie.in)
+# ==============================================================================
+OTP_STORE: Dict[str, Dict[str, Any]] = {}
+
+def is_valid_email(email: str) -> bool:
+    if not email or "@" not in email:
+        return False
+    clean = email.strip().lower()
+    pattern = r"^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$"
+    if not re.match(pattern, clean):
+        return False
+    domain = clean.split("@")[-1]
+    parts = domain.split(".")
+    return len(parts) >= 2 and len(parts[-1]) >= 2
+
+def generate_6digit_otp() -> str:
+    import random
+    return f"{random.randint(100000, 999999)}"
+
+class EmailService:
+    @staticmethod
+    def _send_smtp_sync(to_email: str, subject: str, html_content: str, text_content: str) -> bool:
+        if not settings.SMTP_USER or not settings.SMTP_PASSWORD:
+            logger.warning("SMTP credentials not configured. Skipping email send.")
+            return False
+
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = subject
+        msg["From"] = f"{settings.SMTP_FROM_NAME} <{settings.SMTP_USER}>"
+        msg["To"] = to_email
+
+        msg.attach(MIMEText(text_content, "plain", "utf-8"))
+        msg.attach(MIMEText(html_content, "html", "utf-8"))
+
+        try:
+            # 1. Primary Port 465 (SSL)
+            context = ssl.create_default_context()
+            with smtplib.SMTP_SSL(settings.SMTP_HOST, settings.SMTP_PORT, context=context, timeout=12.0) as server:
+                server.login(settings.SMTP_USER, settings.SMTP_PASSWORD)
+                server.sendmail(settings.SMTP_USER, [to_email], msg.as_string())
+            logger.info(f"Verification email delivered successfully to {to_email} via Port {settings.SMTP_PORT}")
+            return True
+        except Exception as e:
+            logger.error(f"Primary SMTP (Port {settings.SMTP_PORT}) error to {to_email}: {e}. Retrying Port 587 TLS...")
+            try:
+                # 2. Fallback Port 587 (STARTTLS)
+                with smtplib.SMTP(settings.SMTP_HOST, 587, timeout=12.0) as server:
+                    server.ehlo()
+                    server.starttls()
+                    server.ehlo()
+                    server.login(settings.SMTP_USER, settings.SMTP_PASSWORD)
+                    server.sendmail(settings.SMTP_USER, [to_email], msg.as_string())
+                logger.info(f"Fallback SMTP (Port 587) delivered successfully to {to_email}")
+                return True
+            except Exception as e2:
+                logger.error(f"Fallback SMTP also failed to {to_email}: {e2}")
+                return False
+
+    @staticmethod
+    async def send_otp_email(to_email: str, otp: str, purpose: str = "signup") -> bool:
+        if purpose == "signup":
+            subject = f"Verify your Call Genie Account: {otp}"
+            headline = "Welcome to Call Genie by MyBot Genie!"
+            subheadline = "Please verify your email address to activate your account and claim your ₹100 Free Test Credits."
+        else:
+            subject = f"Your Call Genie Password Reset Code: {otp}"
+            headline = "Password Reset Request"
+            subheadline = "We received a request to reset your password. Use the 6-digit verification code below to proceed."
+
+        html_content = f"""<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <style>
+    body {{ font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif; background-color: #0b0f19; margin: 0; padding: 20px; }}
+    .container {{ max-width: 520px; margin: 0 auto; background: #111827; border-radius: 16px; border: 1px solid #1f2937; overflow: hidden; color: #f9fafb; }}
+    .header {{ padding: 32px 24px 20px; text-align: center; border-bottom: 1px solid #1f2937; background: #0f172a; }}
+    .logo-text {{ font-size: 24px; font-weight: 800; color: #ffffff; letter-spacing: -0.5px; margin: 0; }}
+    .logo-sub {{ font-size: 11px; color: #818cf8; text-transform: uppercase; font-weight: 700; letter-spacing: 1px; margin-top: 4px; }}
+    .content {{ padding: 32px 24px; text-align: center; }}
+    .headline {{ font-size: 20px; font-weight: 700; color: #ffffff; margin-bottom: 8px; }}
+    .subhead {{ font-size: 14px; color: #9ca3af; line-height: 1.5; margin-bottom: 24px; }}
+    .otp-card {{ background: #1e1b4b; border: 1px solid #4338ca; border-radius: 12px; padding: 18px 24px; margin: 16px auto; display: inline-block; min-width: 220px; }}
+    .otp-code {{ font-size: 34px; font-weight: 800; color: #a5b4fc; letter-spacing: 8px; margin: 0; font-family: monospace; }}
+    .expiry {{ font-size: 12px; color: #9ca3af; margin-top: 20px; }}
+    .footer {{ padding: 20px; text-align: center; font-size: 11px; color: #6b7280; border-top: 1px solid #1f2937; background: #0b0f19; }}
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <div class="logo-text">Call Genie</div>
+      <div class="logo-sub">by MyBot Genie • Indore</div>
+    </div>
+    <div class="content">
+      <div class="headline">{headline}</div>
+      <div class="subhead">{subheadline}</div>
+      <div class="otp-card">
+        <div class="otp-code">{otp}</div>
+      </div>
+      <div class="expiry">This verification code is valid for <strong>10 minutes</strong>. Never share this code with anyone.</div>
+    </div>
+    <div class="footer">
+      © 2026 MyBot Genie, Indore (M.P.), India. All rights reserved.<br>
+      Automated Voice AI & WhatsApp Calling Solutions • call.mybotgenie.in
+    </div>
+  </div>
+</body>
+</html>"""
+        text_content = f"{headline}\n\nYour 6-digit verification code is: {otp}\n\nValid for 10 minutes.\nTeam MyBot Genie, Indore"
+
+        return await asyncio.to_thread(EmailService._send_smtp_sync, to_email, subject, html_content, text_content)
+
 class WhatsAppService:
     @staticmethod
     def _clean_phone_number(phone: str) -> str:
@@ -617,6 +804,137 @@ class LiveKitService:
         except Exception as e:
             logger.warning(f"LiveKit room creation note: {str(e)}")
         return room_name
+
+
+def generate_bill_of_supply_pdf(invoice: Invoice, user: User, tenant: Optional[Tenant] = None) -> bytes:
+    """
+    Generates a legally compliant Bill of Supply & Payment Receipt for Indian Non-GST suppliers
+    under Section 31(3)(c) and Section 22 of the CGST Act, 2017.
+    """
+    import io
+    from reportlab.lib.pagesizes import A4
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, HRFlowable
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib import colors
+
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=36, rightMargin=36, topMargin=36, bottomMargin=36)
+    styles = getSampleStyleSheet()
+
+    legal_notice_style = ParagraphStyle('LegalNotice', parent=styles['Normal'], fontSize=8, leading=11, textColor=colors.HexColor('#475569'), fontName='Helvetica-Oblique')
+    cell_bold = ParagraphStyle('CellBold', parent=styles['Normal'], fontSize=9, leading=12, fontName='Helvetica-Bold', textColor=colors.HexColor('#0f172a'))
+    cell_norm = ParagraphStyle('CellNorm', parent=styles['Normal'], fontSize=9, leading=12, textColor=colors.HexColor('#334155'))
+    cell_center = ParagraphStyle('CellCenter', parent=cell_norm, alignment=1)
+    cell_right = ParagraphStyle('CellRight', parent=cell_norm, alignment=2)
+    cell_bold_right = ParagraphStyle('CellBoldRight', parent=cell_bold, alignment=2)
+
+    elements = []
+
+    supplier_html = (
+        '<b>MYBOT GENIE</b><br/>'
+        'Indore, Madhya Pradesh - 452010, India<br/>'
+        '<b>Helpline:</b> +91 94795 80001<br/>'
+        '<b>Email:</b> hello@mybotgenie.in<br/>'
+        '<b>UPI ID:</b> real.sarvesh@ybl | <b>UPI No:</b> 9425329851'
+    )
+    supplier_p = Paragraph(supplier_html, cell_norm)
+
+    date_str = invoice.created_at.strftime('%d-%b-%Y') if invoice.created_at else datetime.utcnow().strftime('%d-%b-%Y')
+    invoice_meta_html = (
+        f"<font size='14' color='#1e1b4b'><b>BILL OF SUPPLY</b></font><br/>"
+        f"<b>Invoice No:</b> {invoice.invoice_number}<br/>"
+        f"<b>Date:</b> {date_str}<br/>"
+        f"<b>Payment Mode:</b> UPI Transfer<br/>"
+        f"<b>UTR / Ref:</b> {invoice.utr_number or 'Direct'}<br/>"
+        f"<font color='#059669'><b>Status: PAID & VERIFIED</b></font>"
+    )
+    meta_p = Paragraph(invoice_meta_html, cell_right)
+
+    header_table = Table([[supplier_p, meta_p]], colWidths=[280, 240])
+    header_table.setStyle(TableStyle([
+        ('VALIGN', (0,0), (-1,-1), 'TOP'),
+        ('LEFTPADDING', (0,0), (-1,-1), 0),
+        ('RIGHTPADDING', (0,0), (-1,-1), 0),
+        ('BOTTOMPADDING', (0,0), (-1,-1), 10),
+    ]))
+    elements.append(header_table)
+    elements.append(HRFlowable(width='100%', thickness=1.5, color=colors.HexColor('#4338ca'), spaceAfter=8))
+
+    exempt_text = (
+        '<b>Statutory Exemption Notice:</b> Composition / Non-GST Supply. Issued in accordance with Section 31(3)(c) of CGST Act, 2017. '
+        'Turnover is below the registration threshold under Section 22 of the CGST Act, 2017. No tax is payable on a reverse charge basis.'
+    )
+    exempt_table = Table([[Paragraph(exempt_text, legal_notice_style)]], colWidths=[520])
+    exempt_table.setStyle(TableStyle([
+        ('BACKGROUND', (0,0), (-1,-1), colors.HexColor('#f8fafc')),
+        ('BOX', (0,0), (-1,-1), 0.5, colors.HexColor('#cbd5e1')),
+        ('LEFTPADDING', (0,0), (-1,-1), 10),
+        ('RIGHTPADDING', (0,0), (-1,-1), 10),
+        ('TOPPADDING', (0,0), (-1,-1), 6),
+        ('BOTTOMPADDING', (0,0), (-1,-1), 6),
+    ]))
+    elements.append(exempt_table)
+    elements.append(Spacer(1, 14))
+
+    cust_name = user.full_name or 'Valued Client'
+    comp_name = tenant.name if tenant else 'Client Workspace'
+    bill_to_html = (
+        f"<b>Billed To:</b><br/>"
+        f"<b>Name:</b> {cust_name}<br/>"
+        f"<b>Organization / Business:</b> {comp_name}<br/>"
+        f"<b>Email:</b> {user.email}<br/>"
+        f"<b>Account ID:</b> {user.id[:8]}..."
+    )
+    elements.append(Paragraph(bill_to_html, cell_norm))
+    elements.append(Spacer(1, 14))
+
+    amt = invoice.amount_inr
+    items_data = [
+        [Paragraph('<b>Sr.</b>', cell_center), Paragraph('<b>Description of Services</b>', cell_bold), Paragraph('<b>HSN/SAC</b>', cell_center), Paragraph('<b>Tax Rate</b>', cell_center), Paragraph('<b>Amount (INR)</b>', cell_bold_right)],
+        [Paragraph('1', cell_center), Paragraph(f"<b>Call Genie AI Voice Minutes & Wallet Recharge</b><br/><font color='#64748b' size='8'>Prepaid calling minutes balance credited. UPI UTR: {invoice.utr_number or 'Direct'}</font>", cell_norm), Paragraph('998313', cell_center), Paragraph('0% (Exempt)', cell_center), Paragraph(f'INR {amt:,.2f}', cell_right)],
+        ['', '', '', Paragraph('<b>Subtotal:</b>', cell_bold_right), Paragraph(f'INR {amt:,.2f}', cell_right)],
+        ['', '', '', Paragraph('<b>CGST (0%):</b>', cell_bold_right), Paragraph('INR 0.00', cell_right)],
+        ['', '', '', Paragraph('<b>SGST (0%):</b>', cell_bold_right), Paragraph('INR 0.00', cell_right)],
+        ['', '', '', Paragraph('<b>Total Amount Paid:</b>', cell_bold_right), Paragraph(f'<b>INR {amt:,.2f}</b>', cell_bold_right)],
+    ]
+    item_table = Table(items_data, colWidths=[30, 240, 70, 80, 100], style=[
+        ('BACKGROUND', (0,0), (-1,0), colors.HexColor('#f1f5f9')),
+        ('GRID', (0,0), (-1,1), 0.5, colors.HexColor('#cbd5e1')),
+        ('LINEBELOW', (0,1), (-1,1), 1, colors.HexColor('#94a3b8')),
+        ('TOPPADDING', (0,0), (-1,-1), 6),
+        ('BOTTOMPADDING', (0,0), (-1,-1), 6),
+        ('BACKGROUND', (3,5), (4,5), colors.HexColor('#e0e7ff')),
+        ('BOX', (3,5), (4,5), 1, colors.HexColor('#6366f1')),
+    ])
+    elements.append(item_table)
+    elements.append(Spacer(1, 18))
+
+    stamp_html = (
+        "<font color='#059669'><b>✔ VERIFIED & DIGITALLY RECORDED</b></font><br/>"
+        f"Credited to Call Genie Wallet: INR {amt:,.2f}<br/>"
+        f"Reference UTR: {invoice.utr_number or 'N/A'}<br/>"
+        "Issued by MyBot Genie, Indore (MP)"
+    )
+    terms_html = (
+        "<b>Terms & Conditions:</b><br/>"
+        "1. This is a computer-generated Bill of Supply and requires no physical signature.<br/>"
+        "2. Calling minutes are non-transferable and valid across all configured AI campaigns.<br/>"
+        "3. For billing support, write to <b>hello@mybotgenie.in</b> or call <b>+91 94795 80001</b>."
+    )
+    bottom_table = Table([[Paragraph(terms_html, legal_notice_style), Paragraph(stamp_html, cell_norm)]], colWidths=[320, 200])
+    bottom_table.setStyle(TableStyle([
+        ('VALIGN', (0,0), (-1,-1), 'TOP'),
+        ('BACKGROUND', (1,0), (1,0), colors.HexColor('#ecfdf5')),
+        ('BOX', (1,0), (1,0), 1, colors.HexColor('#10b981')),
+        ('LEFTPADDING', (1,0), (1,0), 10),
+        ('RIGHTPADDING', (1,0), (1,0), 10),
+        ('TOPPADDING', (1,0), (1,0), 8),
+        ('BOTTOMPADDING', (1,0), (1,0), 8),
+    ]))
+    elements.append(bottom_table)
+
+    doc.build(elements)
+    return buf.getvalue()
 
 class BillingService:
     @staticmethod
@@ -1031,39 +1349,154 @@ async def test_whatsapp_delivery(phone_number: str, name: Optional[str] = "Sarve
 # ==============================================================================
 # 10. AUTH, AGENTS, WALLET & DEMO APIS
 # ==============================================================================
-@app.post("/api/auth/register", response_model=TokenResponse)
-async def register(user_in: UserRegister, db: AsyncSession = Depends(get_db)):
-    try:
-        existing = (await db.execute(select(User).where(User.email == user_in.email))).scalar_one_or_none()
-        if existing:
-            raise HTTPException(status_code=400, detail="Email already registered")
-        tenant = Tenant(name=user_in.company_name)
+# --- 10. AUTH & EMAIL VERIFICATION WORKFLOW ---
+@app.post("/api/auth/register")
+async def register(user_in: UserRegister, bg: BackgroundTasks, db: AsyncSession = Depends(get_db)):
+    clean_email = user_in.email.strip().lower()
+    if not is_valid_email(clean_email):
+        raise HTTPException(status_code=400, detail="Please enter a valid email address with a domain (e.g. name@gmail.com). UPI handles are not allowed.")
+    if len(user_in.password) < 6:
+        raise HTTPException(status_code=400, detail="Password must be at least 6 characters long.")
+
+    existing = (await db.execute(select(User).where(User.email == clean_email))).scalar_one_or_none()
+    if existing and existing.is_verified:
+        raise HTTPException(status_code=400, detail="This email is already registered and verified. Please go to Login.")
+
+    # Generate 6-digit OTP
+    otp = generate_6digit_otp()
+    OTP_STORE[clean_email] = {
+        "otp": otp,
+        "purpose": "signup",
+        "expires_at": datetime.utcnow() + timedelta(minutes=10),
+        "data": {
+            "company_name": user_in.company_name.strip(),
+            "full_name": (user_in.full_name or "").strip(),
+            "password": user_in.password
+        }
+    }
+    
+    # Send verification email asynchronously
+    bg.add_task(EmailService.send_otp_email, clean_email, otp, "signup")
+    return {"status": "otp_sent", "email": clean_email, "message": f"A 6-digit verification code has been sent to {clean_email} from bot@mybotgenie.in."}
+
+@app.post("/api/auth/verify-signup-otp", response_model=TokenResponse)
+async def verify_signup_otp(req: VerifyOTPOpRequest, db: AsyncSession = Depends(get_db)):
+    clean_email = req.email.strip().lower()
+    entry = OTP_STORE.get(clean_email)
+    if not entry or entry.get("purpose") != "signup":
+        raise HTTPException(status_code=400, detail="No pending signup found for this email. Please click Sign Up again.")
+    if datetime.utcnow() > entry["expires_at"]:
+        del OTP_STORE[clean_email]
+        raise HTTPException(status_code=400, detail="Verification code has expired. Please request a new one.")
+    if entry["otp"] != req.otp.strip():
+        raise HTTPException(status_code=400, detail="Incorrect verification code. Please check your email and enter the 6-digit code.")
+
+    temp_data = entry["data"]
+    existing = (await db.execute(select(User).where(User.email == clean_email))).scalar_one_or_none()
+    if existing:
+        existing.hashed_password = get_password_hash(temp_data["password"])
+        existing.full_name = temp_data["full_name"]
+        existing.is_verified = True
+        user = existing
+        tenant = (await db.execute(select(Tenant).where(Tenant.id == user.tenant_id))).scalar_one_or_none()
+    else:
+        tenant = Tenant(name=temp_data["company_name"])
         db.add(tenant); await db.flush()
-        new_user = User(tenant_id=tenant.id, email=user_in.email, hashed_password=get_password_hash(user_in.password), full_name=user_in.full_name)
-        db.add(new_user); db.add(Wallet(tenant_id=tenant.id, balance_inr=100.0))
-        await db.commit(); await db.refresh(new_user)
-        return {"access_token": create_access_token({"sub": new_user.id, "tenant_id": tenant.id}), "token_type": "bearer", "tenant_id": tenant.id, "email": new_user.email, "company_name": tenant.name}
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Database registration exception ({e}). Issuing resilient token...")
-        mock_u = str(uuid.uuid4())
-        mock_t = str(uuid.uuid4())
-        return {"access_token": create_access_token({"sub": mock_u, "tenant_id": mock_t}), "token_type": "bearer", "tenant_id": mock_t, "email": user_in.email, "company_name": user_in.company_name}
+        user = User(tenant_id=tenant.id, email=clean_email, hashed_password=get_password_hash(temp_data["password"]), full_name=temp_data["full_name"], is_verified=True)
+        db.add(user); db.add(Wallet(tenant_id=tenant.id, balance_inr=100.0))
+        await db.commit(); await db.refresh(user)
+
+    if clean_email in OTP_STORE:
+        del OTP_STORE[clean_email]
+
+    return {
+        "access_token": create_access_token({"sub": user.id, "tenant_id": user.tenant_id}),
+        "token_type": "bearer",
+        "tenant_id": user.tenant_id,
+        "email": user.email,
+        "company_name": tenant.name if tenant else temp_data["company_name"]
+    }
+
+@app.post("/api/auth/resend-otp")
+async def resend_otp(req: ResendOTPRequest, bg: BackgroundTasks):
+    clean_email = req.email.strip().lower()
+    if not is_valid_email(clean_email):
+        raise HTTPException(status_code=400, detail="Invalid email address.")
+    otp = generate_6digit_otp()
+    if clean_email in OTP_STORE:
+        OTP_STORE[clean_email]["otp"] = otp
+        OTP_STORE[clean_email]["expires_at"] = datetime.utcnow() + timedelta(minutes=10)
+    else:
+        OTP_STORE[clean_email] = {
+            "otp": otp,
+            "purpose": req.purpose or "signup",
+            "expires_at": datetime.utcnow() + timedelta(minutes=10),
+            "data": {}
+        }
+    bg.add_task(EmailService.send_otp_email, clean_email, otp, req.purpose or "signup")
+    return {"status": "otp_resent", "message": f"A new verification code has been dispatched to {clean_email}."}
 
 @app.post("/api/auth/login", response_model=TokenResponse)
 async def login(user_in: UserLogin, db: AsyncSession = Depends(get_db)):
-    try:
-        user = (await db.execute(select(User).where(User.email == user_in.email))).scalar_one_or_none()
-        if not user or not verify_password(user_in.password, user.hashed_password):
-            raise HTTPException(status_code=400, detail="Invalid email or password")
-        tenant = (await db.execute(select(Tenant).where(Tenant.id == user.tenant_id))).scalar_one_or_none()
-        return {"access_token": create_access_token({"sub": user.id, "tenant_id": user.tenant_id}), "token_type": "bearer", "tenant_id": user.tenant_id, "email": user.email, "company_name": tenant.name if tenant else "Client"}
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Database login exception ({e}).")
-        raise HTTPException(status_code=400, detail="Invalid email or password")
+    clean_email = user_in.email.strip().lower()
+    if not is_valid_email(clean_email):
+        raise HTTPException(status_code=400, detail="Please enter a valid email address.")
+
+    user = (await db.execute(select(User).where(User.email == clean_email))).scalar_one_or_none()
+    if not user or not verify_password(user_in.password, user.hashed_password):
+        raise HTTPException(status_code=400, detail="Invalid email or password. Please check your credentials.")
+    
+    tenant = (await db.execute(select(Tenant).where(Tenant.id == user.tenant_id))).scalar_one_or_none()
+    return {
+        "access_token": create_access_token({"sub": user.id, "tenant_id": user.tenant_id}),
+        "token_type": "bearer",
+        "tenant_id": user.tenant_id,
+        "email": user.email,
+        "company_name": tenant.name if tenant else "Client"
+    }
+
+@app.post("/api/auth/forgot-password")
+async def forgot_password(req: ForgotPasswordRequest, bg: BackgroundTasks, db: AsyncSession = Depends(get_db)):
+    clean_email = req.email.strip().lower()
+    if not is_valid_email(clean_email):
+        raise HTTPException(status_code=400, detail="Please enter a valid email address.")
+    user = (await db.execute(select(User).where(User.email == clean_email))).scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=404, detail="No Call Genie account found with this email address.")
+
+    otp = generate_6digit_otp()
+    OTP_STORE[clean_email] = {
+        "otp": otp,
+        "purpose": "reset_password",
+        "expires_at": datetime.utcnow() + timedelta(minutes=10),
+        "data": {"user_id": user.id}
+    }
+    bg.add_task(EmailService.send_otp_email, clean_email, otp, "reset_password")
+    return {"status": "reset_otp_sent", "email": clean_email, "message": f"Password reset code has been sent to {clean_email}."}
+
+@app.post("/api/auth/reset-password")
+async def reset_password(req: ResetPasswordRequest, db: AsyncSession = Depends(get_db)):
+    clean_email = req.email.strip().lower()
+    entry = OTP_STORE.get(clean_email)
+    if not entry or entry.get("purpose") != "reset_password":
+        raise HTTPException(status_code=400, detail="No active password reset request found. Please request a new code.")
+    if datetime.utcnow() > entry["expires_at"]:
+        del OTP_STORE[clean_email]
+        raise HTTPException(status_code=400, detail="Password reset code has expired. Please request a new one.")
+    if entry["otp"] != req.otp.strip():
+        raise HTTPException(status_code=400, detail="Incorrect verification code. Please check your email.")
+    if len(req.new_password) < 6:
+        raise HTTPException(status_code=400, detail="New password must be at least 6 characters long.")
+
+    user = (await db.execute(select(User).where(User.email == clean_email))).scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found.")
+    user.hashed_password = get_password_hash(req.new_password)
+    await db.commit()
+
+    if clean_email in OTP_STORE:
+        del OTP_STORE[clean_email]
+    return {"status": "password_reset_success", "message": "Password updated successfully! Please log in with your new password."}
 
 @app.post("/api/agents", response_model=AgentOut)
 async def create_agent(agent_in: AgentCreate, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
@@ -1147,3 +1580,301 @@ async def make_key(user: User = Depends(get_current_user), db: AsyncSession = De
     key_obj = ApiKey(tenant_id=user.tenant_id, key=raw)
     db.add(key_obj); await db.commit(); await db.refresh(key_obj)
     return {"key": raw}
+
+# ==============================================================================
+# 11. SAAS OWNER / MASTER SUPER ADMIN CONTROL PANEL
+# ==============================================================================
+ADMIN_EMAILS = [
+    "admin@mybotgenie.in", "sarvesh@mybotgenie.in", "bot@mybotgenie.in",
+    "sarveshawasthi@gmail.com", "ne.sarvesh@gmail.com"
+]
+
+async def get_super_admin_user(current_user: User = Depends(get_current_user)) -> User:
+    if current_user.role == "super_admin" or current_user.email.lower() in ADMIN_EMAILS:
+        return current_user
+    raise HTTPException(status_code=403, detail="Access denied. Super Admin privileges required.")
+
+@app.get("/api/admin/metrics")
+async def get_admin_metrics(admin: User = Depends(get_super_admin_user), db: AsyncSession = Depends(get_db)):
+    total_tenants = len((await db.execute(select(Tenant))).scalars().all())
+    total_users = len((await db.execute(select(User))).scalars().all())
+    calls = (await db.execute(select(CallLog))).scalars().all()
+    total_calls = len(calls)
+    total_billed_mins = sum(c.billed_minutes or 0 for c in calls)
+    total_revenue_inr = sum(c.cost_inr or 0 for c in calls)
+    wallets = (await db.execute(select(Wallet))).scalars().all()
+    total_wallet_balances = sum(w.balance_inr or 0 for w in wallets)
+
+    estimated_cogs_inr = total_billed_mins * 1.00
+    estimated_profit_inr = max(0.0, total_revenue_inr - estimated_cogs_inr)
+
+    return {
+        "total_tenants": total_tenants,
+        "total_users": total_users,
+        "total_calls": total_calls,
+        "total_billed_minutes": total_billed_mins,
+        "total_revenue_inr": round(total_revenue_inr, 2),
+        "total_cogs_inr": round(estimated_cogs_inr, 2),
+        "net_profit_inr": round(estimated_profit_inr, 2),
+        "total_wallet_pool_inr": round(total_wallet_balances, 2),
+        "smtp_status": bool(settings.SMTP_USER and settings.SMTP_PASSWORD),
+        "whatsapp_status": bool(settings.WHATSAPP_TOKEN and settings.WHATSAPP_PHONE_NUMBER_ID),
+        "groq_status": bool(settings.GROQ_API_KEY),
+        "sarvam_status": bool(settings.SARVAM_API_KEY)
+    }
+
+@app.get("/api/admin/tenants")
+async def get_admin_tenants(admin: User = Depends(get_super_admin_user), db: AsyncSession = Depends(get_db)):
+    tenants = (await db.execute(select(Tenant).order_by(desc(Tenant.created_at)))).scalars().all()
+    results = []
+    for t in tenants:
+        u = (await db.execute(select(User).where(User.tenant_id == t.id))).scalar_one_or_none()
+        w = (await db.execute(select(Wallet).where(Wallet.tenant_id == t.id))).scalar_one_or_none()
+        c_count = len((await db.execute(select(CallLog).where(CallLog.tenant_id == t.id))).scalars().all())
+        results.append({
+            "id": t.id,
+            "name": t.name,
+            "email": u.email if u else "N/A",
+            "owner_name": u.full_name if u else "N/A",
+            "rate_per_min_inr": t.rate_per_min_inr,
+            "wallet_balance_inr": round(w.balance_inr, 2) if w else 0.0,
+            "total_calls": c_count,
+            "is_active": t.is_active,
+            "created_at": t.created_at
+        })
+    return results
+
+class AdminWalletActionRequest(BaseModel):
+    amount_inr: float
+    action_type: str = "CREDIT"
+    reference: Optional[str] = "Manual SaaS Owner Adjustment"
+
+@app.post("/api/admin/tenants/{tenant_id}/wallet")
+async def admin_adjust_wallet(tenant_id: str, req: AdminWalletActionRequest, admin: User = Depends(get_super_admin_user), db: AsyncSession = Depends(get_db)):
+    w = (await db.execute(select(Wallet).where(Wallet.tenant_id == tenant_id))).scalar_one_or_none()
+    if not w:
+        w = Wallet(tenant_id=tenant_id, balance_inr=0.0)
+        db.add(w)
+
+    if req.action_type == "CREDIT":
+        w.balance_inr += req.amount_inr
+        w.total_recharged_inr += req.amount_inr
+    else:
+        w.balance_inr = max(0.0, w.balance_inr - req.amount_inr)
+
+    tx = WalletTransaction(
+        wallet_id=w.id,
+        transaction_type=f"ADMIN_{req.action_type}",
+        amount_inr=req.amount_inr,
+        balance_after_inr=w.balance_inr,
+        reference=req.reference
+    )
+    db.add(tx)
+    await db.commit()
+    return {"new_balance_inr": round(w.balance_inr, 2)}
+
+class AdminRateChangeRequest(BaseModel):
+    rate_per_min_inr: float
+
+@app.put("/api/admin/tenants/{tenant_id}/rate")
+async def admin_change_rate(tenant_id: str, req: AdminRateChangeRequest, admin: User = Depends(get_super_admin_user), db: AsyncSession = Depends(get_db)):
+    t = (await db.execute(select(Tenant).where(Tenant.id == tenant_id))).scalar_one_or_none()
+    if not t:
+        raise HTTPException(status_code=404, detail="Tenant not found")
+    t.rate_per_min_inr = req.rate_per_min_inr
+    await db.commit()
+    return {"rate_per_min_inr": t.rate_per_min_inr}
+
+
+@app.post("/api/wallet/upi-recharge")
+async def submit_upi_recharge(
+    req: UpiRechargeSubmitRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    utr = req.utr_number.strip().replace(" ", "")
+    if len(utr) < 6:
+        raise HTTPException(status_code=400, detail="कृपया मान्य 12-अंकों का UPI UTR / Reference नंबर दर्ज करें।")
+    if req.amount_inr < 50:
+        raise HTTPException(status_code=400, detail="न्यूनतम रीचार्ज राशि ₹50 है।")
+
+    existing = (await db.execute(select(RechargeRequest).where(RechargeRequest.utr_number == utr))).scalar_one_or_none()
+    if existing:
+        raise HTTPException(status_code=400, detail=f"यह UTR नंबर ({utr}) पहले ही सबमिट किया जा चुका है (स्थिति: {existing.status})।")
+
+    rec = RechargeRequest(
+        tenant_id=user.tenant_id,
+        user_id=user.id,
+        amount_inr=float(req.amount_inr),
+        utr_number=utr,
+        payment_method="UPI_QR",
+        status="PENDING",
+        admin_notes=req.notes
+    )
+    db.add(rec)
+    await db.commit()
+    await db.refresh(rec)
+    return {
+        "status": "success",
+        "message": "UPI रीचार्ज अनुरोध सफलतापूर्वक सबमिट किया गया। एडमिन द्वारा UTR सत्यापन के बाद राशि वॉलेट में जुड़ जाएगी।",
+        "request_id": rec.id,
+        "amount_inr": rec.amount_inr,
+        "utr_number": rec.utr_number
+    }
+
+@app.get("/api/wallet/invoices")
+async def list_user_invoices(
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    invoices = (await db.execute(
+        select(Invoice).where(Invoice.tenant_id == user.tenant_id).order_by(desc(Invoice.created_at))
+    )).scalars().all()
+    return [
+        {
+            "id": inv.id,
+            "invoice_number": inv.invoice_number,
+            "amount_inr": inv.amount_inr,
+            "total_amount_inr": inv.total_amount_inr,
+            "payment_method": inv.payment_method,
+            "utr_number": inv.utr_number,
+            "status": inv.status,
+            "created_at": inv.created_at.strftime("%Y-%m-%d %H:%M") if inv.created_at else "",
+            "download_url": f"/api/wallet/invoices/{inv.id}/download"
+        }
+        for inv in invoices
+    ]
+
+@app.get("/api/wallet/invoices/{invoice_id}/download")
+async def download_invoice_pdf(
+    invoice_id: str,
+    token: Optional[str] = Query(None),
+    authorization: Optional[str] = Header(None),
+    db: AsyncSession = Depends(get_db)
+):
+    user_email = None
+    # Check Bearer token in header
+    if authorization and authorization.startswith("Bearer "):
+        auth_token = authorization.split(" ")[1]
+    else:
+        auth_token = token
+
+    if auth_token:
+        try:
+            payload = jwt.decode(auth_token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
+            user_email = payload.get("sub")
+        except Exception:
+            pass
+
+    if not user_email:
+        raise HTTPException(status_code=401, detail="Authentication required to download invoice.")
+
+    current_user = (await db.execute(select(User).where(User.email == user_email))).scalar_one_or_none()
+    if not current_user:
+        raise HTTPException(status_code=401, detail="User not found.")
+
+    inv = (await db.execute(select(Invoice).where(Invoice.id == invoice_id))).scalar_one_or_none()
+    if not inv:
+        raise HTTPException(status_code=404, detail="Invoice not found.")
+
+    if inv.tenant_id != current_user.tenant_id and current_user.role != "super_admin":
+        raise HTTPException(status_code=403, detail="Not authorized to access this invoice.")
+
+    inv_user = (await db.execute(select(User).where(User.id == inv.user_id))).scalar_one_or_none() or current_user
+    inv_tenant = (await db.execute(select(Tenant).where(Tenant.id == inv.tenant_id))).scalar_one_or_none()
+
+    pdf_bytes = generate_bill_of_supply_pdf(inv, inv_user, inv_tenant)
+    filename = f"{inv.invoice_number}.pdf"
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+    )
+
+@app.get("/api/admin/recharges")
+async def admin_list_recharges(
+    admin: User = Depends(get_super_admin_user),
+    db: AsyncSession = Depends(get_db)
+):
+    recharges = (await db.execute(select(RechargeRequest).order_by(desc(RechargeRequest.created_at)))).scalars().all()
+    out = []
+    for r in recharges:
+        u = (await db.execute(select(User).where(User.id == r.user_id))).scalar_one_or_none()
+        t = (await db.execute(select(Tenant).where(Tenant.id == r.tenant_id))).scalar_one_or_none()
+        out.append({
+            "id": r.id,
+            "tenant_id": r.tenant_id,
+            "company_name": t.name if t else "Unknown",
+            "user_name": u.full_name if u else "Unknown",
+            "user_email": u.email if u else "Unknown",
+            "amount_inr": r.amount_inr,
+            "utr_number": r.utr_number,
+            "payment_method": r.payment_method,
+            "status": r.status,
+            "admin_notes": r.admin_notes,
+            "created_at": r.created_at.strftime("%Y-%m-%d %H:%M") if r.created_at else ""
+        })
+    return out
+
+@app.post("/api/admin/recharges/{request_id}/approve")
+async def admin_approve_recharge(
+    request_id: str,
+    req: Optional[RechargeApprovalRequest] = None,
+    admin: User = Depends(get_super_admin_user),
+    db: AsyncSession = Depends(get_db)
+):
+    r = (await db.execute(select(RechargeRequest).where(RechargeRequest.id == request_id))).scalar_one_or_none()
+    if not r:
+        raise HTTPException(status_code=404, detail="Recharge request not found")
+    if r.status == "APPROVED":
+        return {"status": "already_approved", "message": "Request already approved"}
+
+    r.status = "APPROVED"
+    if req and req.notes:
+        r.admin_notes = req.notes
+
+    new_bal = await BillingService.credit_wallet(db, r.tenant_id, r.amount_inr, f"UPI Recharge Verified (UTR: {r.utr_number})")
+
+    count_inv = (await db.execute(select(func.count(Invoice.id)))).scalar_one() or 0
+    inv_number = f"INV-2026-{1001 + count_inv}"
+
+    inv = Invoice(
+        invoice_number=inv_number,
+        tenant_id=r.tenant_id,
+        user_id=r.user_id,
+        recharge_request_id=r.id,
+        amount_inr=r.amount_inr,
+        gst_rate=0.0,
+        gst_amount_inr=0.0,
+        total_amount_inr=r.amount_inr,
+        payment_method="UPI_QR",
+        utr_number=r.utr_number,
+        status="PAID"
+    )
+    db.add(inv)
+    await db.commit()
+    await db.refresh(inv)
+
+    return {
+        "status": "approved",
+        "new_balance_inr": round(new_bal, 2),
+        "invoice_id": inv.id,
+        "invoice_number": inv.invoice_number,
+        "amount_inr": inv.amount_inr
+    }
+
+@app.post("/api/admin/recharges/{request_id}/reject")
+async def admin_reject_recharge(
+    request_id: str,
+    req: Optional[RechargeRejectRequest] = None,
+    admin: User = Depends(get_super_admin_user),
+    db: AsyncSession = Depends(get_db)
+):
+    r = (await db.execute(select(RechargeRequest).where(RechargeRequest.id == request_id))).scalar_one_or_none()
+    if not r:
+        raise HTTPException(status_code=404, detail="Recharge request not found")
+    r.status = "REJECTED"
+    if req and req.reason:
+        r.admin_notes = req.reason
+    await db.commit()
+    return {"status": "rejected", "message": "Recharge request rejected"}
