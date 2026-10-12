@@ -16,6 +16,7 @@ from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
 
 from fastapi import (
+    Header,
     Query,
     FastAPI, APIRouter, Depends, HTTPException, status,
     UploadFile, File, Form, BackgroundTasks, Request, Security, Response
