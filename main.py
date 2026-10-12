@@ -1005,13 +1005,29 @@ async def add_cors_headers(request: Request, call_next):
 
 @app.on_event("startup")
 async def on_startup():
+    global engine, AsyncSessionLocal
     logger.info("Checking Call Genie Database...")
     try:
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
         logger.info("Primary database connected and tables verified.")
     except Exception as e:
-        logger.warning(f"Database table verification notice ({e}). Continuing startup in resilient mode.")
+        logger.warning(f"Primary database connection failed ({e}). Switching to local SQLite database fallback...")
+        try:
+            sqlite_url = "sqlite+aiosqlite:///./call_genie.db"
+            engine = create_async_engine(sqlite_url, echo=False)
+            AsyncSessionLocal = async_sessionmaker(
+                bind=engine,
+                class_=AsyncSession,
+                expire_on_commit=False,
+                autocommit=False,
+                autoflush=False
+            )
+            async with engine.begin() as conn:
+                await conn.run_sync(Base.metadata.create_all)
+            logger.info("Successfully initialized and switched to SQLite fallback in resilient mode.")
+        except Exception as sq_err:
+            logger.error(f"Failed to initialize SQLite fallback: {sq_err}")
 
 @app.get("/")
 async def root(): return {"status": "online", "app": "Call Genie API", "powered_by": "MyBot Genie", "city": "Indore"}
