@@ -31,6 +31,22 @@ from fastapi.security.api_key import APIKeyHeader
 from pydantic import BaseModel
 from pydantic_settings import BaseSettings
 from jose import JWTError, jwt
+# ==============================================================================
+# BCRYPT 72-BYTE COMPATIBILITY PATCH FOR PASSLIB
+# ==============================================================================
+try:
+    import bcrypt
+    _orig_hashpw = bcrypt.hashpw
+    def _safe_hashpw(password, salt):
+        if isinstance(password, str):
+            password = password.encode('utf-8')
+        if len(password) > 71:
+            password = password[:71]
+        return _orig_hashpw(password, salt)
+    bcrypt.hashpw = _safe_hashpw
+except Exception:
+    pass
+
 from passlib.context import CryptContext
 
 from sqlalchemy import (
