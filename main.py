@@ -313,6 +313,7 @@ class TokenResponse(BaseModel):
     tenant_id: str
     email: str
     company_name: str
+    role: Optional[str] = "tenant_admin"
 
 class AgentCreate(BaseModel):
     name: str
@@ -928,6 +929,42 @@ async def on_startup():
             await conn.run_sync(Base.metadata.create_all)
         logger.info("SQLite fallback database initialized successfully.")
 
+    # Automatically Seed Founder & Super Admin Credentials
+    try:
+        async with AsyncSessionLocal() as session:
+            admin_emails = ["hello@mybotgenie.in", "ne.sarvesh@gmail.com"]
+            for adm_email in admin_emails:
+                existing_admin = (await session.execute(
+                    select(User).where(func.lower(User.email) == adm_email.lower())
+                )).scalar_one_or_none()
+                if not existing_admin:
+                    hq_tenant = (await session.execute(
+                        select(Tenant).where(Tenant.name == "MyBot Genie HQ")
+                    )).scalar_one_or_none()
+                    if not hq_tenant:
+                        hq_tenant = Tenant(name="MyBot Genie HQ", rate_per_min_inr=5.0)
+                        session.add(hq_tenant)
+                        await session.flush()
+
+                    new_admin = User(
+                        tenant_id=hq_tenant.id,
+                        email=adm_email.lower(),
+                        hashed_password=get_password_hash("#Grow@2025"),
+                        full_name="Sarvesh Awasthi (Founder & Super Admin)",
+                        role="super_admin"
+                    )
+                    session.add(new_admin)
+                    session.add(Wallet(tenant_id=hq_tenant.id, balance_inr=10000.0, total_recharged_inr=10000.0))
+                    await session.commit()
+                    logger.info(f"Super Admin seeded: {adm_email} (#Grow@2025)")
+                else:
+                    if existing_admin.role != "super_admin":
+                        existing_admin.role = "super_admin"
+                        await session.commit()
+                        logger.info(f"Updated role to super_admin for: {adm_email}")
+    except Exception as seed_err:
+        logger.warning(f"Super admin auto-seed notice: {seed_err}")
+
 @app.get("/")
 async def root(): return {"status": "online", "app": "Call Genie API", "powered_by": "MyBot Genie", "city": "Indore"}
 
@@ -1142,11 +1179,20 @@ async def register(user_in: UserRegister, db: AsyncSession = Depends(get_db)):
 
 @app.post("/api/auth/login", response_model=TokenResponse)
 async def login(user_in: UserLogin, db: AsyncSession = Depends(get_db)):
-    user = (await db.execute(select(User).where(User.email == user_in.email))).scalar_one_or_none()
+    clean_email = user_in.email.strip().lower()
+    user = (await db.execute(select(User).where(func.lower(User.email) == clean_email))).scalar_one_or_none()
     if not user or not verify_password(user_in.password, user.hashed_password):
-        raise HTTPException(status_code=400, detail="Invalid credentials")
+        raise HTTPException(status_code=400, detail="Invalid email or password.")
     tenant = (await db.execute(select(Tenant).where(Tenant.id == user.tenant_id))).scalar_one_or_none()
-    return {"access_token": create_access_token({"sub": user.id, "tenant_id": user.tenant_id}), "token_type": "bearer", "tenant_id": user.tenant_id, "email": user.email, "company_name": tenant.name if tenant else "Client"}
+    user_role = getattr(user, "role", "tenant_admin")
+    return {
+        "access_token": create_access_token({"sub": user.id, "tenant_id": user.tenant_id, "role": user_role}),
+        "token_type": "bearer",
+        "tenant_id": user.tenant_id,
+        "email": user.email,
+        "company_name": tenant.name if tenant else "Client",
+        "role": user_role
+    }
 
 @app.post("/api/agents", response_model=AgentOut)
 async def create_agent(agent_in: AgentCreate, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
