@@ -32,7 +32,6 @@ from pydantic import BaseModel
 from pydantic_settings import BaseSettings
 from jose import JWTError, jwt
 from passlib.context import CryptContext
-import pandas as pd
 
 from sqlalchemy import (
     Column, String, Boolean, DateTime, ForeignKey, Text, Float, Integer, JSON, select, desc
