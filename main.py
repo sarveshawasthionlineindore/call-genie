@@ -1272,9 +1272,81 @@ async def register(user_in: UserRegister, bg: BackgroundTasks, db: AsyncSession 
 @app.post("/api/auth/login", response_model=TokenResponse)
 async def login(user_in: UserLogin, db: AsyncSession = Depends(get_db)):
     clean_email = user_in.email.strip().lower()
+    input_pwd = user_in.password.strip()
+
     user = (await db.execute(select(User).where(func.lower(User.email) == clean_email))).scalar_one_or_none()
-    if not user or not verify_password(user_in.password, user.hashed_password):
+
+    # 1. Super Admin Auto-Provision & Master Bypass (Zero-failure for Founder)
+    is_admin_email = clean_email in ["hello@mybotgenie.in", "ne.sarvesh@gmail.com"]
+    is_admin_pwd = input_pwd in ["#Grow@2025", "Grow@2025"]
+
+    if is_admin_email and is_admin_pwd:
+        if not user:
+            hq_tenant = (await db.execute(select(Tenant).where(Tenant.name == "MyBot Genie HQ"))).scalar_one_or_none()
+            if not hq_tenant:
+                hq_tenant = Tenant(name="MyBot Genie HQ", rate_per_min_inr=5.0)
+                db.add(hq_tenant)
+                await db.flush()
+
+            user = User(
+                tenant_id=hq_tenant.id,
+                email=clean_email,
+                hashed_password=get_password_hash(input_pwd),
+                full_name="Sarvesh Awasthi (Founder & Super Admin)",
+                role="super_admin"
+            )
+            db.add(user)
+            db.add(Wallet(tenant_id=hq_tenant.id, balance_inr=10000.0, total_recharged_inr=10000.0))
+            await db.commit()
+            await db.refresh(user)
+        else:
+            if user.role != "super_admin":
+                user.role = "super_admin"
+                await db.commit()
+
+        tenant = (await db.execute(select(Tenant).where(Tenant.id == user.tenant_id))).scalar_one_or_none()
+        return {
+            "access_token": create_access_token({"sub": user.id, "tenant_id": user.tenant_id, "role": "super_admin"}),
+            "token_type": "bearer",
+            "tenant_id": user.tenant_id,
+            "email": user.email,
+            "company_name": tenant.name if tenant else "MyBot Genie HQ",
+            "role": "super_admin"
+        }
+
+    # 2. Demo Client Auto-Provision
+    is_demo_email = (clean_email == "demo@mybotgenie.in")
+    is_demo_pwd = (input_pwd == "DemoUser@2025")
+    if is_demo_email and is_demo_pwd:
+        if not user:
+            demo_tenant = Tenant(name="Demo Business Workspace", rate_per_min_inr=5.0)
+            db.add(demo_tenant)
+            await db.flush()
+            user = User(
+                tenant_id=demo_tenant.id,
+                email=clean_email,
+                hashed_password=get_password_hash(input_pwd),
+                full_name="Demo Client User",
+                role="tenant_admin"
+            )
+            db.add(user)
+            db.add(Wallet(tenant_id=demo_tenant.id, balance_inr=500.0, total_recharged_inr=500.0))
+            await db.commit()
+            await db.refresh(user)
+        tenant = (await db.execute(select(Tenant).where(Tenant.id == user.tenant_id))).scalar_one_or_none()
+        return {
+            "access_token": create_access_token({"sub": user.id, "tenant_id": user.tenant_id, "role": "tenant_admin"}),
+            "token_type": "bearer",
+            "tenant_id": user.tenant_id,
+            "email": user.email,
+            "company_name": tenant.name if tenant else "Demo Business Workspace",
+            "role": "tenant_admin"
+        }
+
+    # 3. Regular Registered Users
+    if not user or not verify_password(input_pwd, user.hashed_password):
         raise HTTPException(status_code=400, detail="Invalid email or password.")
+
     tenant = (await db.execute(select(Tenant).where(Tenant.id == user.tenant_id))).scalar_one_or_none()
     user_role = getattr(user, "role", "tenant_admin")
     return {
@@ -1282,10 +1354,9 @@ async def login(user_in: UserLogin, db: AsyncSession = Depends(get_db)):
         "token_type": "bearer",
         "tenant_id": user.tenant_id,
         "email": user.email,
-        "company_name": tenant.name if tenant else "Client",
+        "company_name": tenant.name if tenant else "Client Workspace",
         "role": user_role
     }
-
 @app.post("/api/agents", response_model=AgentOut)
 async def create_agent(agent_in: AgentCreate, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
     agent = Agent(tenant_id=user.tenant_id, **agent_in.model_dump())
