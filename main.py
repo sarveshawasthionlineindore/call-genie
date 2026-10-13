@@ -7,6 +7,8 @@ import logging
 import asyncio
 import httpx
 import json
+import hashlib
+import hmac
 import re
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
@@ -97,7 +99,7 @@ class Settings(BaseSettings):
     SMTP_HOST: str = os.getenv("SMTP_HOST", "smtp.hostinger.com")
     SMTP_PORT: int = int(os.getenv("SMTP_PORT", "465"))
     SMTP_USER: str = os.getenv("SMTP_USER", "bot@mybotgenie.in")
-    SMTP_PASSWORD: str = os.getenv("SMTP_PASSWORD", "#Grow@2025")
+    SMTP_PASSWORD: str = os.getenv("SMTP_PASSWORD", "")
     SMTP_FROM_NAME: str = "Call Genie by MyBot Genie"
     DEFAULT_RETAIL_RATE_PER_MIN_INR: float = 5.00
     BILLING_PULSE_SECONDS: int = 60
@@ -891,8 +893,25 @@ pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
 api_key_header_scheme = APIKeyHeader(name="X-CallGenie-Key", auto_error=False)
 
-def verify_password(plain, hashed): return pwd_context.verify(plain, hashed)
-def get_password_hash(password): return pwd_context.hash(password)
+def get_password_hash(password: str) -> str:
+    salt = secrets.token_hex(16)
+    pwd_hash = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), 100000).hex()
+    return f"pbkdf2_sha256"
+
+def verify_password(plain: str, hashed: str) -> bool:
+    if not hashed: return False
+    if hashed.startswith("pbkdf2_sha256$"):
+        try:
+            parts = hashed.split("$")
+            salt, target = parts[1], parts[2]
+            calc = hashlib.pbkdf2_hmac("sha256", plain.encode("utf-8"), salt.encode("utf-8"), 100000).hex()
+            return hmac.compare_digest(calc, target)
+        except Exception: return False
+    try:
+        return pwd_context.verify(plain, hashed)
+    except Exception:
+        calc_sha = hashlib.sha256(plain.encode("utf-8")).hexdigest()
+        return hmac.compare_digest(calc_sha, hashed)
 def create_access_token(data: dict):
     to_encode = data.copy()
     to_encode.update({"exp": datetime.utcnow() + timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)})
@@ -945,11 +964,11 @@ async def on_startup():
             await conn.run_sync(Base.metadata.create_all)
         logger.info("SQLite fallback database initialized successfully.")
 
-    # Automatically Seed Founder & Super Admin Credentials
+    # Automatically Seed Founder & Super Admin + Demo Client Credentials
     try:
         async with AsyncSessionLocal() as session:
-            admin_emails = ["hello@mybotgenie.in", "ne.sarvesh@gmail.com"]
-            for adm_email in admin_emails:
+            # 1. Seed Super Admins
+            for adm_email in ["hello@mybotgenie.in", "ne.sarvesh@gmail.com"]:
                 existing_admin = (await session.execute(
                     select(User).where(func.lower(User.email) == adm_email.lower())
                 )).scalar_one_or_none()
@@ -977,10 +996,30 @@ async def on_startup():
                     if existing_admin.role != "super_admin":
                         existing_admin.role = "super_admin"
                         await session.commit()
-                        logger.info(f"Updated role to super_admin for: {adm_email}")
-    except Exception as seed_err:
-        logger.warning(f"Super admin auto-seed notice: {seed_err}")
 
+            # 2. Seed Default Demo Client User (Instant Testing)
+            demo_email = "demo@mybotgenie.in"
+            existing_demo = (await session.execute(
+                select(User).where(func.lower(User.email) == demo_email.lower())
+            )).scalar_one_or_none()
+            if not existing_demo:
+                demo_tenant = Tenant(name="Demo Business Workspace", rate_per_min_inr=5.0)
+                session.add(demo_tenant)
+                await session.flush()
+
+                demo_user = User(
+                    tenant_id=demo_tenant.id,
+                    email=demo_email.lower(),
+                    hashed_password=get_password_hash("DemoUser@2025"),
+                    full_name="Demo Business User",
+                    role="tenant_admin"
+                )
+                session.add(demo_user)
+                session.add(Wallet(tenant_id=demo_tenant.id, balance_inr=500.0, total_recharged_inr=500.0))
+                await session.commit()
+                logger.info(f"Default Demo Client seeded: {demo_email} (DemoUser@2025)")
+    except Exception as seed_err:
+        logger.warning(f"Default users auto-seed notice: {seed_err}")
 @app.get("/")
 async def root(): return {"status": "online", "app": "Call Genie API", "powered_by": "MyBot Genie", "city": "Indore"}
 
@@ -1183,15 +1222,52 @@ async def test_whatsapp_delivery(phone_number: str, name: Optional[str] = "Sarve
 # 10. AUTH, AGENTS, WALLET & DEMO APIS
 # ==============================================================================
 @app.post("/api/auth/register", response_model=TokenResponse)
-async def register(user_in: UserRegister, db: AsyncSession = Depends(get_db)):
-    if (await db.execute(select(User).where(User.email == user_in.email))).scalar_one_or_none():
-        raise HTTPException(status_code=400, detail="Email already registered")
-    tenant = Tenant(name=user_in.company_name)
-    db.add(tenant); await db.flush()
-    new_user = User(tenant_id=tenant.id, email=user_in.email, hashed_password=get_password_hash(user_in.password), full_name=user_in.full_name)
-    db.add(new_user); db.add(Wallet(tenant_id=tenant.id, balance_inr=100.0))
-    await db.commit(); await db.refresh(new_user)
-    return {"access_token": create_access_token({"sub": new_user.id, "tenant_id": tenant.id}), "token_type": "bearer", "tenant_id": tenant.id, "email": new_user.email, "company_name": tenant.name}
+async def register(user_in: UserRegister, bg: BackgroundTasks, db: AsyncSession = Depends(get_db)):
+    clean_email = user_in.email.strip().lower()
+    if not is_valid_email(clean_email):
+        raise HTTPException(status_code=400, detail="Please enter a valid email address with a domain (e.g. name@gmail.com). UPI handles are not allowed.")
+    if len(user_in.password) < 6:
+        raise HTTPException(status_code=400, detail="Password must be at least 6 characters long.")
+
+    existing = (await db.execute(select(User).where(func.lower(User.email) == clean_email))).scalar_one_or_none()
+    if existing:
+        raise HTTPException(status_code=400, detail="This email is already registered. Please go to Login.")
+
+    tenant = Tenant(name=user_in.company_name.strip() or "Client Workspace", rate_per_min_inr=5.0)
+    db.add(tenant)
+    await db.flush()
+
+    new_user = User(
+        tenant_id=tenant.id,
+        email=clean_email,
+        hashed_password=get_password_hash(user_in.password),
+        full_name=(user_in.full_name or "").strip() or "Client",
+        role="tenant_admin"
+    )
+    db.add(new_user)
+    db.add(Wallet(tenant_id=tenant.id, balance_inr=100.0, total_recharged_inr=100.0))
+    await db.commit()
+    await db.refresh(new_user)
+
+    # Send Welcome Email in background
+    welcome_subject = "Welcome to Call Genie! Your Account is Activated"
+    welcome_html = f"""<html><body style='font-family: Arial; padding: 20px; background: #0f172a; color: #fff;'>
+    <h2>Welcome to Call Genie, {new_user.full_name}!</h2>
+    <p>Your business account for <b>{tenant.name}</b> has been activated with <b>₹100 Free Calling Credits</b>.</p>
+    <p>Login URL: <a href='https://call.mybotgenie.in/login.html' style='color: #6366f1;'>https://call.mybotgenie.in/login.html</a></p>
+    <p>Helpline: +91 94795 80001 | Email: hello@mybotgenie.in</p>
+    </body></html>"""
+    bg.add_task(EmailService.send_via_hostinger_relay, clean_email, welcome_subject, welcome_html)
+
+    token = create_access_token({"sub": new_user.id, "tenant_id": tenant.id, "role": "tenant_admin"})
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "tenant_id": tenant.id,
+        "email": new_user.email,
+        "company_name": tenant.name,
+        "role": "tenant_admin"
+    }
 
 @app.post("/api/auth/login", response_model=TokenResponse)
 async def login(user_in: UserLogin, db: AsyncSession = Depends(get_db)):
