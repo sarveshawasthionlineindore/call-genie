@@ -1222,9 +1222,9 @@ SAMPLE_AUDIO_CACHE = {}
 
 @app.get("/api/voice/sample-audio/{sample_id}")
 async def get_sample_audio(sample_id: str):
-    """Returns synthesized audio or cached studio voice for landing page audio cards."""
+    """Returns authentic Sarvam Bulbul studio audio with in-memory caching."""
     sample_key = sample_id.lower().strip()
-    if sample_key in SAMPLE_AUDIO_CACHE:
+    if sample_key in SAMPLE_AUDIO_CACHE and SAMPLE_AUDIO_CACHE[sample_key]:
         return {"sample_id": sample_key, "audio_base64": SAMPLE_AUDIO_CACHE[sample_key], "status": "ready"}
 
     sample_meta = SAMPLE_RECORDINGS.get(sample_key, SAMPLE_RECORDINGS["automotive"])
@@ -1232,12 +1232,13 @@ async def get_sample_audio(sample_id: str):
     if settings.SARVAM_API_KEY:
         try:
             async with httpx.AsyncClient(timeout=15.0) as client:
+                # Primary: bulbul:v4-flash with suman_hi_companion (the ultra-realistic voice)
                 payload = {
                     "inputs": [sample_meta["text"]],
                     "target_language_code": "hi-IN",
-                    "speaker": sample_meta.get("speaker", "arvind"),
+                    "speaker": "suman_hi_companion",
                     "model": "bulbul:v4-flash",
-                    "pace": 1.10,
+                    "pace": 1.12,
                     "speech_sample_rate": 16000,
                     "enable_preprocessing": True
                 }
@@ -1252,26 +1253,25 @@ async def get_sample_audio(sample_id: str):
                         SAMPLE_AUDIO_CACHE[sample_key] = audios[0]
                         return {"sample_id": sample_key, "audio_base64": audios[0], "status": "ready"}
                 else:
-                    logger.warning(f"Sarvam TTS bulbul:v4-flash returned HTTP {res.status_code}: {res.text}. Trying bulbul:v1 fallback...")
-                    # Fallback to bulbul:v1
-                    payload["model"] = "bulbul:v1"
-                    payload["speaker"] = "meera" if sample_meta.get("gender") == "female" else "arvind"
-                    res2 = await client.post(
-                        "https://api.sarvam.ai/text-to-speech",
-                        headers={"api-subscription-key": settings.SARVAM_API_KEY, "Content-Type": "application/json"},
-                        json=payload
-                    )
-                    if res2.status_code == 200:
-                        audios2 = res2.json().get("audios", [])
-                        if audios2 and audios2[0]:
-                            SAMPLE_AUDIO_CACHE[sample_key] = audios2[0]
-                            return {"sample_id": sample_key, "audio_base64": audios2[0], "status": "ready"}
-                    else:
-                        logger.error(f"Sarvam TTS fallback also failed: HTTP {res2.status_code}: {res2.text}")
-        except Exception as e:
-            logger.error(f"Error fetching sample audio from Sarvam: {e}")
+                    logger.warning(f"Sarvam bulbul:v4-flash returned {res.status_code}. Trying bulbul:v1...")
 
-    return {"sample_id": sample_key, "text": sample_meta["text"], "status": "fallback"}
+                # Secondary: bulbul:v1 with meera
+                payload["model"] = "bulbul:v1"
+                payload["speaker"] = "meera"
+                res2 = await client.post(
+                    "https://api.sarvam.ai/text-to-speech",
+                    headers={"api-subscription-key": settings.SARVAM_API_KEY, "Content-Type": "application/json"},
+                    json=payload
+                )
+                if res2.status_code == 200:
+                    audios2 = res2.json().get("audios", [])
+                    if audios2 and audios2[0]:
+                        SAMPLE_AUDIO_CACHE[sample_key] = audios2[0]
+                        return {"sample_id": sample_key, "audio_base64": audios2[0], "status": "ready"}
+        except Exception as e:
+            logger.error(f"Sarvam sample audio error: {e}")
+
+    return {"sample_id": sample_key, "text": sample_meta["text"], "status": "no_audio"}
 
 @app.get("/api/voice/status")
 async def voice_status():
