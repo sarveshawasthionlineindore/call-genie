@@ -354,9 +354,13 @@ class AgentCreate(BaseModel):
     name: str
     description: Optional[str] = None
     language: Optional[str] = "hi-IN"
+    tts_provider: Optional[str] = "sarvam"
+    voice_provider: Optional[str] = None
     tts_voice: Optional[str] = "suman_hi_companion"
+    custom_voice_id: Optional[str] = None
     system_prompt: str
-    greeting_message: str
+    greeting_message: Optional[str] = None
+    first_message: Optional[str] = None
     post_call_whatsapp_enabled: Optional[bool] = True
     whatsapp_template_name: Optional[str] = None
     whatsapp_followup_message: Optional[str] = None
@@ -364,13 +368,15 @@ class AgentCreate(BaseModel):
 class AgentOut(BaseModel):
     id: str
     name: str
-    description: Optional[str]
+    description: Optional[str] = None
     language: str
+    tts_provider: Optional[str] = "sarvam"
     tts_voice: str
+    custom_voice_id: Optional[str] = None
     system_prompt: str
     greeting_message: str
     post_call_whatsapp_enabled: bool
-    whatsapp_followup_message: Optional[str]
+    whatsapp_followup_message: Optional[str] = None
     is_active: bool
     created_at: datetime
     class Config: from_attributes = True
@@ -1376,8 +1382,34 @@ async def login(user_in: UserLogin, db: AsyncSession = Depends(get_db)):
     }
 @app.post("/api/agents", response_model=AgentOut)
 async def create_agent(agent_in: AgentCreate, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
-    agent = Agent(tenant_id=user.tenant_id, **agent_in.model_dump())
-    db.add(agent); await db.commit(); await db.refresh(agent); return agent
+    greeting = agent_in.greeting_message or agent_in.first_message or "Namaste! Main Call Genie AI se baat kar raha hoon. Kya main aapki koi madad kar sakta hoon?"
+    voice_choice = agent_in.voice_provider or agent_in.tts_provider or "sarvam"
+    custom_v_id = agent_in.custom_voice_id
+
+    tts_provider = voice_choice
+    if voice_choice and (voice_choice.startswith("clone_") or (custom_v_id and voice_choice not in ["sarvam", "cartesia", "deepgram", "gemini_live", "elevenlabs_multilingual"])):
+        custom_v_id = voice_choice
+        tts_provider = "custom_cloned"
+
+    agent_data = {
+        "tenant_id": user.tenant_id,
+        "name": agent_in.name,
+        "description": agent_in.description,
+        "language": agent_in.language or "hi-IN",
+        "tts_provider": tts_provider,
+        "tts_voice": agent_in.tts_voice or "suman_hi_companion",
+        "custom_voice_id": custom_v_id,
+        "system_prompt": agent_in.system_prompt,
+        "greeting_message": greeting,
+        "post_call_whatsapp_enabled": agent_in.post_call_whatsapp_enabled if agent_in.post_call_whatsapp_enabled is not None else True,
+        "whatsapp_template_name": agent_in.whatsapp_template_name,
+        "whatsapp_followup_message": agent_in.whatsapp_followup_message
+    }
+    agent = Agent(**agent_data)
+    db.add(agent)
+    await db.commit()
+    await db.refresh(agent)
+    return agent
 
 @app.get("/api/agents", response_model=List[AgentOut])
 async def list_agents(user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
@@ -2091,3 +2123,216 @@ async def admin_adjust_wallet(
     db.add(tx)
     await db.commit()
     return {"new_balance_inr": round(w.balance_inr, 2)}
+
+
+# ==============================================================================
+# ENTERPRISE RAG: WEBSITE SCRAPER & MULTI-DOCUMENT PARSING (PDF, DOCX, TXT, CSV)
+# ==============================================================================
+class UrlKnowledgeRequest(BaseModel):
+    url: str
+
+class TextKnowledgeRequest(BaseModel):
+    title: str
+    content: str
+
+@app.get("/api/knowledge")
+async def list_knowledge_documents(
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    docs = (await db.execute(
+        select(KnowledgeDocument).where(KnowledgeDocument.tenant_id == user.tenant_id).order_by(desc(KnowledgeDocument.created_at))
+    )).scalars().all()
+    return [
+        {
+            "id": d.id,
+            "title": d.title,
+            "doc_type": d.doc_type,
+            "char_count": len(d.raw_content) if d.raw_content else 0,
+            "created_at": d.created_at.strftime("%Y-%m-%d %H:%M") if d.created_at else ""
+        }
+        for d in docs
+    ]
+
+@app.post("/api/knowledge/url")
+async def scrape_and_train_url(
+    req: UrlKnowledgeRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    clean_url = req.url.strip()
+    if not clean_url.startswith("http://") and not clean_url.startswith("https://"):
+        clean_url = "https://" + clean_url
+
+    try:
+        async with httpx.AsyncClient(timeout=25.0, follow_redirects=True, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36 CallGenieBot/1.0"
+        }) as client:
+            resp = await client.get(clean_url)
+            if resp.status_code != 200:
+                raise HTTPException(status_code=400, detail=f"Failed to fetch website (HTTP {resp.status_code}). Please check if URL is publicly accessible.")
+            html_text = resp.text
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Website connection error: {str(e)}")
+
+    # Clean HTML with BeautifulSoup
+    try:
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(html_text, "html.parser")
+        for tag in soup(["script", "style", "noscript", "svg", "header", "footer", "nav", "iframe"]):
+            tag.decompose()
+        
+        page_title = soup.title.string.strip() if (soup.title and soup.title.string) else clean_url.replace("https://", "").replace("http://", "").split("/")[0]
+        extracted_text = " ".join(soup.stripped_strings)
+    except Exception as parse_err:
+        raise HTTPException(status_code=500, detail=f"HTML parsing error: {str(parse_err)}")
+
+    if len(extracted_text) < 30:
+        raise HTTPException(status_code=400, detail="Website content was too short or could not be read.")
+
+    # Truncate to reasonable RAG token ceiling (approx 15,000 words max per page)
+    clean_content = extracted_text[:40000]
+
+    doc = KnowledgeDocument(
+        tenant_id=user.tenant_id,
+        title=f"🌐 {page_title[:100]}",
+        doc_type="url",
+        raw_content=clean_content
+    )
+    db.add(doc)
+
+    # Train all agents belonging to this tenant
+    agents = (await db.execute(select(Agent).where(Agent.tenant_id == user.tenant_id))).scalars().all()
+    for ag in agents:
+        ag.system_prompt = (ag.system_prompt or "") + f"\n\n[WEBSITE KNOWLEDGE ({page_title[:60]})]:\n{clean_content[:8000]}"
+
+    await db.commit()
+    await db.refresh(doc)
+
+    return {
+        "status": "success",
+        "doc_id": doc.id,
+        "title": doc.title,
+        "char_count": len(clean_content),
+        "message": f"Website '{page_title[:50]}' scraped & AI agent successfully trained on its contents!"
+    }
+
+@app.post("/api/knowledge/upload")
+async def upload_document_knowledge(
+    file: UploadFile = File(...),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    fname = file.filename or "uploaded_document"
+    ext = fname.lower().split(".")[-1]
+    extracted_text = ""
+
+    contents = await file.read()
+
+    if ext == "pdf":
+        try:
+            import io, pypdf
+            reader = pypdf.PdfReader(io.BytesIO(contents))
+            pages_text = []
+            for page in reader.pages:
+                t = page.extract_text()
+                if t: pages_text.append(t)
+            extracted_text = "\n".join(pages_text)
+        except Exception as pdf_err:
+            raise HTTPException(status_code=400, detail=f"Failed to read PDF file: {str(pdf_err)}")
+
+    elif ext in ["docx", "doc"]:
+        try:
+            import io, docx
+            doc = docx.Document(io.BytesIO(contents))
+            extracted_text = "\n".join([p.text for p in doc.paragraphs if p.text.strip()])
+        except Exception as docx_err:
+            raise HTTPException(status_code=400, detail=f"Failed to read Word document: {str(docx_err)}")
+
+    elif ext in ["txt", "csv", "md"]:
+        try:
+            extracted_text = contents.decode("utf-8", errors="ignore")
+        except Exception as txt_err:
+            raise HTTPException(status_code=400, detail=f"Failed to decode text file: {str(txt_err)}")
+    else:
+        raise HTTPException(status_code=400, detail="Unsupported file format. Please upload .pdf, .docx, .txt, or .csv files.")
+
+    clean_content = extracted_text.strip()
+    if len(clean_content) < 10:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty or no readable text was found.")
+
+    clean_content = clean_content[:50000]
+
+    doc = KnowledgeDocument(
+        tenant_id=user.tenant_id,
+        title=f"📄 {fname[:100]}",
+        doc_type=ext,
+        raw_content=clean_content
+    )
+    db.add(doc)
+
+    # Train all agents of this tenant
+    agents = (await db.execute(select(Agent).where(Agent.tenant_id == user.tenant_id))).scalars().all()
+    for ag in agents:
+        ag.system_prompt = (ag.system_prompt or "") + f"\n\n[DOCUMENT KNOWLEDGE ({fname})]:\n{clean_content[:8000]}"
+
+    await db.commit()
+    await db.refresh(doc)
+
+    return {
+        "status": "success",
+        "doc_id": doc.id,
+        "title": doc.title,
+        "char_count": len(clean_content),
+        "message": f"Document '{fname}' uploaded and AI agent successfully trained!"
+    }
+
+@app.post("/api/knowledge/text")
+async def add_manual_text_knowledge(
+    req: TextKnowledgeRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    clean_title = req.title.strip() or "Business FAQs"
+    clean_content = req.content.strip()
+    if len(clean_content) < 5:
+        raise HTTPException(status_code=400, detail="Content must be at least 5 characters long.")
+
+    doc = KnowledgeDocument(
+        tenant_id=user.tenant_id,
+        title=f"✍️ {clean_title[:100]}",
+        doc_type="text",
+        raw_content=clean_content[:40000]
+    )
+    db.add(doc)
+
+    agents = (await db.execute(select(Agent).where(Agent.tenant_id == user.tenant_id))).scalars().all()
+    for ag in agents:
+        ag.system_prompt = (ag.system_prompt or "") + f"\n\n[MANUAL FACTS ({clean_title})]:\n{clean_content[:8000]}"
+
+    await db.commit()
+    await db.refresh(doc)
+
+    return {
+        "status": "success",
+        "doc_id": doc.id,
+        "title": doc.title,
+        "char_count": len(clean_content),
+        "message": f"Knowledge '{clean_title}' added and AI agent trained!"
+    }
+
+@app.delete("/api/knowledge/{doc_id}")
+async def delete_knowledge_document(
+    doc_id: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    doc = (await db.execute(
+        select(KnowledgeDocument).where(KnowledgeDocument.id == doc_id, KnowledgeDocument.tenant_id == user.tenant_id)
+    )).scalar_one_or_none()
+    if not doc:
+        raise HTTPException(status_code=404, detail="Knowledge document not found.")
+
+    await db.delete(doc)
+    await db.commit()
+    return {"status": "success", "message": "Knowledge document deleted from AI brain."}
