@@ -1074,88 +1074,123 @@ def discover_caller_name(user_text: str) -> Optional[str]:
             return name
     return None
 
-def generate_dynamic_hindi_reply(user_msg: str, client_name: str, biz_name: str, biz_type: str) -> str:
+def generate_dynamic_hindi_reply(user_msg: str, client_name: str, biz_name: str, biz_type: str, history: Optional[List[Dict[str, str]]] = None) -> str:
     msg = (user_msg or "").lower().strip()
     c_name = client_name.strip() if client_name and client_name.strip().lower() not in ["ji", ""] else "सर"
     b_name = biz_name.strip() if biz_name and biz_name.strip().lower() not in ["business", "aapke business", ""] else "मायबॉट जीनी"
-    
-    # Greetings
-    if any(w in msg for w in ["नमस्ते", "हैलो", "हेलो", "हाय", "namaste", "hello", "hi", "hey", "kaise ho", "kya haal"]):
-        return f"अरे नमस्ते {c_name} जी! मैं {b_name} से रिया बोल रही हूँ। बताइये, आज किस बिज़नेस के लिए कॉलिंग ऑटोमेशन समझना चाहते हैं?"
+    hist_len = len(history) if history else 0
 
-    # Real Estate queries
-    if any(w in msg for w in ["real estate", "रियल एस्टेट", "प्रॉपर्टी", "plot", "प्लॉट", "फ्लैट", "मकान", "zameen", "super corridor"]):
-        return f"जी बिल्कुल {c_name} जी! मान लीजिये मैं एपेक्स रियल्टी से रिया बोल रही हूँ। हमारे पास सुपर कॉरिडोर पर ₹3,200 प्रति वर्ग फीट पर प्राइम प्लॉट्स उपलब्ध हैं। क्या इस रविवार आपकी साइट विजिट शेड्यूल कर दूँ?"
+    # 1. Festival & Occasion Greetings (Diwali / New Year / Celebration 2-Way Dialogue)
+    if any(w in msg for w in ["diwali", "deepawali", "दीपावली", "दिवाली", "happy diwali", "shubhkamnaye", "शुभकामनाएं", "शुभकामनाएँ", "badhai", "बधाई", "mubarak", "मुबारक", "same to you", "सेम टू यू", "new year", "त्यौहार", "त्योहार"]):
+        if any(w in msg for w in ["office", "kaam", "business", "chalega", "demo", "kaise", "service", "सॉफ्टवेयर", "बिज़नेस", "ऑफिस", "काम", "इंदौर"]):
+            return "जी बिल्कुल! हमारे पास आपके बिज़नेस के लिए सम्पूर्ण कॉलिंग ऑटोमेशन तैयार है। अभी त्योहार का आनंद लीजिए—दीपावली के तुरंत बाद मैं पर्सनली आपसे संपर्क करूँगा। क्या बुनियादी विवरण आपके व्हाट्सएप पर साझा कर दूँ?"
+        return f"सादर धन्यवाद {c_name}! माँ लक्ष्मी की कृपा आप और आपके परिवार पर सदा बनी रहे। यह पावन पर्व आपके जीवन और व्यापार में असीम समृद्धि व खुशियाँ लेकर आए। दीपावली की हार्दिक शुभकामनाएँ!"
 
-    # Healthcare / Clinic queries
-    if any(w in msg for w in ["clinic", "क्लिनिक", "hospital", "अस्पताल", "doctor", "डॉक्टर", "dental", "डेंटल", "appointment"]):
-        return f"जी! जैसे किसी पेशेंट का फोन आया, तो मैं बोलूँगी: हेलो! केयर डेंटल क्लिनिक से रिया बात कर रही हूँ। डॉक्टर के पास आज शाम 6:15 का स्लॉट खाली है, क्या टोकन बुक कर दूँ?"
+    # 2. Polite Executive Greetings
+    if any(w in msg for w in ["नमस्ते", "हैलो", "हेलो", "हाय", "namaste", "hello", "hi", "hey"]):
+        return f"सादर नमस्कार {c_name}! मैं {b_name} से सीनियर क्लाइंट कंसलटेंट बात कर रही हूँ। कृपया बताइये, आपके बिज़नेस के लिए कॉलिंग ऑटोमेशन किस प्रकार कस्टमाइज़ करें?"
 
-    # Automobile Workshop queries
-    if any(w in msg for w in ["workshop", "वर्कशॉप", "car", "कार", "गाड़ी", "service", "सर्विस", "repair", "ऑटो"]):
-        return f"जी! वर्कशॉप के लिए मैं बोलूँगी: नमस्ते! आपकी कार की सर्विस और वाशिंग पूरी हो चुकी है। कुल बिल ₹4,850 है। क्या गेटपास व्हाट्सएप पर भेज दूँ?"
+    # 2. Agriculture / Seeds / Beej
+    if any(w in msg for w in ["seed", "सीड्स", "बीज", "krishi", "कृषि", "kisaan", "किसान", "khet", "खेती", "gehu", "गेहूं", "chana", "चना", "soyabean", "सोयाबीन"]):
+        return "निश्चित रूप से! यदि आपका बीजों का बिज़नेस है, तो मैं आपके डीलर्स और किसान भाइयों से बेहद शालीनता से बात करूँगी—'सादर नमस्कार, मैं केडीएम सीड्स से बात कर रही हूँ। इस सीज़न के लिए हमारी उन्नत प्रमाणित हाइब्रिड बीजों की नई खेप आ चुकी है। क्या मैं आपके लिए बुकिंग या रेट-लिस्ट व्हाट्सएप पर साझा करूँ?'"
 
-    # Loan / Finance / EMI queries
-    if any(w in msg for w in ["loan", "लोन", "finance", "फाइनेंस", "emi", "ईएमआई", "recovery", "बकाया"]):
-        return f"जी! फाइनेंस के लिए मैं बहुत ही शालीनता से बोलूँगी: नमस्कार! आपके लोन की ₹4,500 ईएमआई ड्यू है। क्या मैं तुरंत 1-टैप यूपीआई लिंक आपके व्हाट्सएप पर शेयर कर दूँ?"
+    # 3. Real Estate / Plots / Flats
+    if any(w in msg for w in ["real estate", "रियल एस्टेट", "प्रॉपर्टी", "plot", "प्लॉट", "फ्लैट", "मकान", "zameen", "कॉरिडोर"]):
+        return "सादर नमस्कार! रियल एस्टेट इन्वेस्टर्स के लिए हमारी कॉलिंग का अंदाज़ कुछ इस तरह रहेगा—'नमस्कार, मैं एपेक्स रियल्टी से बात कर रही हूँ। सुपर कॉरिडोर के प्रीमियम प्लॉट्स के संबंध में आपसे संपर्क किया है। क्या इस वीकेंड आपकी साइट विज़िट प्लान करें?'"
 
-    # Pricing & Rate queries
+    # 4. Healthcare / Clinic / Hospital
+    if any(w in msg for w in ["clinic", "क्लिनिक", "hospital", "अस्पताल", "doctor", "डॉक्टर", "dental", "डेंटल", "मरीज़"]):
+        return "बिल्कुल! क्लिनिक के लिए हमारी टोन बेहद सौम्य और केयरिंग रहेगी—'हेलो, केयर क्लिनिक से बात कर रही हूँ। डॉक्टर के पास आज शाम 6:15 का स्लॉट उपलब्ध है। क्या आपका अपॉइंटमेंट टोकन कन्फर्म कर दिया जाए?'"
+
+    # 5. Workshop / Automobiles
+    if any(w in msg for w in ["workshop", "वर्कशॉप", "car", "कार", "गाड़ी", "service", "सर्विस"]):
+        return "ज़रूर! ऑटोमोबाइल सर्विस के लिए हम इस तरह बात करेंगे—'नमस्कार! आपकी गाड़ी की सर्विस और कम्प्लीट वाशिंग पूरी हो चुकी है। कुल बिल ₹4,850 है। क्या पिकअप गेटपास व्हाट्सएप पर शेयर कर दिया जाए?'"
+
+    # 6. Finance / Loans / Recovery
+    if any(w in msg for w in ["loan", "लोन", "finance", "फाइनेंस", "emi", "ईएमआई", "recovery"]):
+        return "निश्चित रूप से! बैंकिंग और ईएमआई के लिए टोन पूरी तरह डिग्निफाइड रहेगी—'नमस्कार, फिनकॉर्प से बात कर रही हूँ। आपके लोन खाते की ₹4,500 की ईएमआई ड्यू है। क्या त्वरित 1-टैप यूपीआई लिंक आपके व्हाट्सएप पर साझा करूँ?'"
+
+    # 7. Numbers / Volume of calls (e.g. 10 se 15, 50, 100)
+    if any(w in msg for w in ["10", "15", "20", "25", "30", "50", "100", "500", "हज़ार", "दस", "पंद्रह", "बीस", "पचास", "सौ", "रोज", "daily"]):
+        return f"बिल्कुल, {user_msg.strip()} हाई-प्रायोरिटी कॉल्स तो हमारी ऑटोमेशन कुछ ही मिनटों में मुकम्मल कर लेगी। इसके साथ ही क्या आप चाहेंगे कि कॉल समाप्त होते ही आपका ऑफिशियल कैटलॉग या रेट-कार्ड सीधे उनके व्हाट्सएप पर चला जाए?"
+
+    # 8. Pricing & Commercials
     if any(w in msg for w in ["kitna paisa", "kitna kharcha", "rate", "cost", "price", "kitna lagega", "charge", "fees", "रुपये"]):
-        return "कॉल जीनी का रेट बहुत ही किफ़ायती है—सिर्फ ₹5 प्रति मिनट! कोई सेटअप फ़ीस नहीं है और आप आज ही शुरू कर सकते हैं।"
+        return "कॉल जीनी का कमर्शियल मॉडल बहुत ही पारदर्शी है—मात्र ₹5 प्रति मिनट का फ्लैट रेट! कोई हिडन सेटअप चार्ज नहीं है।"
 
-    # Identity
-    if any(w in msg for w in ["कौन हो", "kaun ho", "kya naam", "naam kya", "kya ho", "who are you", "tum kaun"]):
-        return f"जी! मैं रिया हूँ, {b_name} की एआई वॉइस कंसलटेंट! मैं इंसानों की तरह बात करके आपकी सारी लीड्स को 24 घंटे कॉल कर सकती हूँ।"
+    # 9. Approvals & WhatsApp
+    if any(w in msg for w in ["haan", "ha", "yes", "bhejo", "bhej do", "भेजो", "हाँ", "हा", "बिल्कुल", "ज़रूर", "sure"]):
+        return "शानदार! हमारे सिस्टम से संबंधित सम्पूर्ण कॉर्पोरेट ब्रोशर और ऑनबोर्डिंग विवरण तुरंत आपके व्हाट्सएप पर प्रेषित किए जा रहे हैं।"
 
-    # Gratitude & Exit
-    if any(w in msg for w in ["dhanyawad", "shukriya", "bye", "alvida", "theek hai", "ok", "thank", "धन्यवाद", "शुक्रिया"]):
-        return f"ओह, बहुत-बहुत धन्यवाद {c_name} जी! आपसे बात करके बहुत अच्छा लगा। मैं सारी जानकारी आपके व्हाट्सएप पर भेज रही हूँ!"
-
-    # Default Contextual Response (Varied, not stuck in a single loop)
-    return f"जी {c_name} जी, मैंने समझ लिया! आपके बिज़नेस के लिए यह कॉलिंग सॉल्यूशन बहुत तेजी से सेल्स बढ़ाएगा। आप कितने कस्टमर्स को रोज़ कॉल करना चाहते हैं?"
+    # 10. Universal Business Turn-based Progression (High-Class Executive Tone)
+    turn_responses = [
+        f"सादर नमस्कार {c_name}! आपके इस बिज़नेस के लिए हमारी एआई कॉलिंग आपके ग्राहकों को बेहद प्रतिष्ठित और शालीन अंदाज़ में अटेंड करेगी। आप प्रतिदिन लगभग कितने संपर्कों पर आउटबाउंड कॉलिंग प्लान कर रहे हैं?",
+        "बिल्कुल! हर कॉल के पश्चात हमारा सिस्टम क्लाइंट्स को तुरंत आधिकारिक व्हाट्सएप विवरण भी डिलीवर करता है। क्या आप इसमें अपना कस्टमाइज़्ड ब्रोशर जोड़ना चाहेंगे?",
+        "उत्कृष्ट! आपके डैशबोर्ड में प्रत्येक कॉल की रिकॉर्डिंग, ऑडियो एनालिटिक्स और लीड स्टेटस रियल-टाइम उपलब्ध रहता है। क्या हम आपके पहले पायलट कैंपेन की शुरुआत करें?"
+    ]
+    idx = (hist_len // 2) % len(turn_responses)
+    return turn_responses[idx]
 
 @app.post("/api/voice/chat")
 async def voice_chat_endpoint(chat_in: VoiceChatRequest):
     """
-    Intelligent conversational telecaller 'Riya' powered by Google Gemini and Sarvam AI Bulbul.
+    High-Class Corporate AI Telecaller powered by Google Gemini and Sarvam AI Bulbul.
+    Adapts dynamically to any universal business without repetitive cliches.
     """
     discovered = discover_caller_name(chat_in.message)
     active_name = discovered or chat_in.client_name or "सर"
 
     system_prompt = (
-        f"You are Riya, a polite, cheerful, highly intelligent female telecaller representing '{chat_in.business_name}' by MyBot Genie. "
-        f"You are talking to {active_name} on a live demo call. "
-        "CRITICAL INSTRUCTIONS: "
-        "1. Understand what the user asks and answer DIRECTLY and naturally in conversational Hindi / Hinglish. "
-        "2. If the user asks for a demo of Real Estate, pretend to be a real estate agent calling about prime plots or apartments. "
-        "3. If the user asks for a demo of Clinic/Doctor, pretend to be a clinic receptionist booking appointments. "
-        "4. If the user asks for a demo of Car Workshop, pretend to call about car service completion. "
-        "5. Keep responses short and punchy (15 to 25 words). "
-        "6. Always use feminine Hindi grammar (बोल रही हूँ, करती हूँ). "
-        "7. Write in clean Devanagari Hindi (हिंदी) so text-to-speech speaks naturally. "
-        "8. Never repeat the exact same sentence twice."
+        f"You are a sophisticated, high-class corporate telecalling executive representing '{chat_in.business_name}' by MyBot Genie. "
+        f"You are speaking with {active_name} on a live enterprise consultation call. "
+        "STRICT EXECUTIVE PERSONA GUIDELINES: "
+        "1. TONE & ETIQUETTE: Speak like an articulate, high-class corporate woman or executive man from a premium Indian MNC. "
+        "2. FORBIDDEN WORDS: NEVER say repetitive colloquial cliches like 'जी सर जी', 'जी सर जी', 'अरे वाह', 'जी मैंने समझ लिया'. "
+        "3. ELEGANT VOCABULARY: Use dignified, refined corporate Hindi/Hinglish like 'सादर नमस्कार', 'बिल्कुल', 'ज़रूर', 'निश्चित रूप से', 'शानदार'. "
+        "4. UNIVERSAL BUSINESS MASTERY: Adapt immediately to ANY industry the caller mentions (Seeds/Agriculture, Real Estate, Clinics, Coaching, CA, Manufacturing, Solar, Retail, Jewellery). "
+        "5. SHOW, DON'T TELL: If the user mentions their business (e.g. seeds), immediately demonstrate an actual realistic, polished phone pitch calling their customers. "
+        "6. NUMBERS & METRICS: If the caller mentions volume (e.g. 10 to 15 calls), acknowledge it with executive professionalism and discuss instant WhatsApp follow-up. "
+        "7. LENGTH: Keep responses crisp and impactful (20 to 30 words max). "
+        "8. SCRIPT: Write in clean Devanagari Hindi (हिंदी) so speech synthesis sounds natural and human. "
+        "9. FESTIVAL & OCCASION BROADCAST MODE: If the call is a Festival Greeting (e.g. Diwali/New Year Wishes), wish the customer with warmth. If they say 'Happy Diwali / Same to you', reciprocate gracefully with blessings. If they ask a business question during the greeting call, answer politely and offer to share full details over WhatsApp post-call so the festive spirit is preserved."
     )
 
     ai_reply = None
 
-    # Priority 1: Google Gemini 2.0 Flash (Fastest, ultra-smart conversational responses)
+    # Priority 1: Google Gemini (With clean system_instruction and multi-turn context)
     if settings.GEMINI_API_KEY:
-        try:
-            async with httpx.AsyncClient(timeout=8.0) as client:
-                gemini_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={settings.GEMINI_API_KEY}"
-                user_context = system_prompt + "\n\nCaller says: " + str(chat_in.message)
+        for model_name in ["gemini-1.5-flash", "gemini-2.0-flash"]:
+            try:
+                async with httpx.AsyncClient(timeout=8.0) as client:
+                    gemini_url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={settings.GEMINI_API_KEY}"
+                    
+                    contents = []
+                    if chat_in.conversation_history:
+                        for h in chat_in.conversation_history[-6:]:
+                            r = "user" if h.get("role") == "user" else "model"
+                            contents.append({"role": r, "parts": [{"text": h.get("content", "")}]})
+                    contents.append({"role": "user", "parts": [{"text": chat_in.message}]})
 
-                payload = {
-                    "contents": [{"parts": [{"text": user_context}]}],
-                    "generationConfig": {"temperature": 0.6, "maxOutputTokens": 100}
-                }
-                res = await client.post(gemini_url, json=payload)
-                if res.status_code == 200:
-                    cand = res.json().get("candidates", [])
-                    if cand:
-                        ai_reply = cand[0].get("content", {}).get("parts", [{}])[0].get("text", "").strip()
-        except Exception as e:
-            logger.warning(f"Gemini chat error: {e}")
+                    payload = {
+                        "system_instruction": {
+                            "parts": [{"text": system_prompt}]
+                        },
+                        "contents": contents,
+                        "generationConfig": {"temperature": 0.6, "maxOutputTokens": 100}
+                    }
+                    res = await client.post(gemini_url, json=payload)
+                    if res.status_code == 200:
+                        cand = res.json().get("candidates", [])
+                        if cand:
+                            ai_reply = cand[0].get("content", {}).get("parts", [{}])[0].get("text", "").strip()
+                            if ai_reply:
+                                break
+                    else:
+                        logger.warning(f"Gemini {model_name} status {res.status_code}: {res.text}")
+            except Exception as e:
+                logger.warning(f"Gemini {model_name} error: {e}")
+            if ai_reply:
+                break
 
     # Priority 2: Groq Llama 3.3
     if not ai_reply and settings.GROQ_API_KEY:
@@ -1181,13 +1216,14 @@ async def voice_chat_endpoint(chat_in: VoiceChatRequest):
         except Exception as e:
             logger.warning(f"Groq chat error: {e}")
 
-    # Priority 3: Contextual Dynamic Hindi Engine
+    # Priority 3: Universal Corporate Dynamic Hindi Engine
     if not ai_reply:
         ai_reply = generate_dynamic_hindi_reply(
             chat_in.message,
             active_name,
             chat_in.business_name or "MyBot Genie",
-            chat_in.business_type or "AI Calling Solution"
+            chat_in.business_type or "AI Calling Solution",
+            chat_in.conversation_history
         )
 
     clean_speech_text = ai_reply.replace("*", "").replace("#", "").replace("_", "").strip()
@@ -1201,7 +1237,7 @@ async def voice_chat_endpoint(chat_in: VoiceChatRequest):
                     "target_language_code": "hi-IN",
                     "speaker": "suman_hi_companion",
                     "model": "bulbul:v4-flash",
-                    "pace": 1.10,
+                    "pace": 1.08,
                     "speech_sample_rate": 16000,
                     "enable_preprocessing": True
                 }
@@ -1213,7 +1249,6 @@ async def voice_chat_endpoint(chat_in: VoiceChatRequest):
                 if sarvam_res.status_code == 200:
                     audio_base64 = sarvam_res.json().get("audios", [None])[0]
                 else:
-                    # Fallback to bulbul:v3 with Priya (authentic female)
                     payload_sarvam["model"] = "bulbul:v3"
                     payload_sarvam["speaker"] = "priya"
                     fb_res = await client.post(
@@ -1225,6 +1260,7 @@ async def voice_chat_endpoint(chat_in: VoiceChatRequest):
                         audio_base64 = fb_res.json().get("audios", [None])[0]
         except Exception as e:
             logger.warning(f"Sarvam live chat TTS error: {e}")
+
     return {
         "reply": ai_reply,
         "discovered_name": discovered,
@@ -1250,10 +1286,10 @@ SAMPLE_RECORDINGS = {
         "name": "रिया (Riya)",
         "business": "Dental Clinic Consultation & Token Booking",
         "gender": "female",
-        "speaker": "priya",  # Official Sarvam Bulbul v3 Top Female Voice
-        "fallback_speaker": "ishita",
-        "model": "bulbul:v3",
-        "pace": 1.00,
+        "speaker": "suman_hi_companion",  # Ultra-Expressive Human Conversational Female Voice
+        "fallback_speaker": "priya",
+        "model": "bulbul:v4-flash",
+        "pace": 1.08,
         "text": "हेलो! केयर डेंटल क्लिनिक से रिया बोल रही हूँ। डॉक्टर अमित के पास आज शाम 6:15 का स्लॉट खाली है। क्या मैं आपका अपॉइंटमेंट टोकन और क्लिनिक लोकेशन व्हाट्सएप पर कन्फर्म कर दूँ?"
     },
     "realestate": {
@@ -1374,6 +1410,166 @@ async def voice_status():
         "whatsapp": bool(settings.WHATSAPP_TOKEN and settings.WHATSAPP_PHONE_NUMBER_ID),
         "template": settings.WHATSAPP_TEMPLATE_NAME,
         "lang": settings.WHATSAPP_TEMPLATE_LANG
+    }
+
+# ==============================================================================
+# 8B. CUSTOM SCRIPT LIVE VOICE GENERATION & GOOGLE GEMINI TTS
+# ==============================================================================
+class CustomDemoRequest(BaseModel):
+    script: str
+    gender: Optional[str] = "female"
+    voice_engine: Optional[str] = "auto"
+    tone: Optional[str] = "corporate"  # corporate, sales, polite, urgent
+
+async def synthesize_google_tts(text: str, gender: str = "female", tone: str = "corporate") -> Optional[str]:
+    """Synthesizes human-sounding speech using Google Neural2 / Wavenet with GEMINI_API_KEY and Tone Tuning."""
+    if not settings.GEMINI_API_KEY:
+        return None
+    try:
+        voice_name = "hi-IN-Neural2-A" if gender == "female" else "hi-IN-Neural2-B"
+        
+        # Tone adjustments for rate and pitch
+        tone_settings = {
+            "corporate": {"rate": 1.02, "pitch": 0.0},
+            "sales": {"rate": 1.14, "pitch": 0.8},
+            "polite": {"rate": 0.96, "pitch": -0.4},
+            "urgent": {"rate": 1.10, "pitch": 0.4}
+        }
+        cfg = tone_settings.get(tone.lower(), tone_settings["corporate"])
+
+        url = f"https://texttospeech.googleapis.com/v1/text:synthesize?key={settings.GEMINI_API_KEY}"
+        payload = {
+            "input": {"text": text},
+            "voice": {"languageCode": "hi-IN", "name": voice_name},
+            "audioConfig": {
+                "audioEncoding": "MP3",
+                "speakingRate": cfg["rate"],
+                "pitch": cfg["pitch"]
+            }
+        }
+        async with httpx.AsyncClient(timeout=12.0) as client:
+            res = await client.post(url, json=payload)
+            if res.status_code == 200:
+                return res.json().get("audioContent")
+            else:
+                logger.warning(f"Google TTS API status {res.status_code}: {res.text}")
+    except Exception as e:
+        logger.warning(f"Google TTS synthesis error: {e}")
+    return None
+
+async def synthesize_sarvam_tts(text: str, gender: str = "female", tone: str = "corporate") -> Optional[str]:
+    """Synthesizes human-sounding speech using Sarvam Bulbul Studio with tone pace control."""
+    if not settings.SARVAM_API_KEY:
+        return None
+    try:
+        tone_paces = {
+            "corporate": 1.05,
+            "sales": 1.15,
+            "polite": 0.98,
+            "urgent": 1.12
+        }
+        pace_val = tone_paces.get(tone.lower(), 1.05)
+
+        # Female uses ultra-natural suman_hi_companion (bulbul:v4-flash)
+        # Male uses rohan / arvind (bulbul:v3)
+        if gender == "female":
+            model = "bulbul:v4-flash"
+            speaker = "suman_hi_companion"
+        else:
+            model = "bulbul:v3"
+            speaker = "rohan"
+
+        payload = {
+            "inputs": [text],
+            "target_language_code": "hi-IN",
+            "speaker": speaker,
+            "model": model,
+            "pace": pace_val,
+            "speech_sample_rate": 16000,
+            "enable_preprocessing": True
+        }
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            res = await client.post(
+                "https://api.sarvam.ai/text-to-speech",
+                headers={"api-subscription-key": settings.SARVAM_API_KEY, "Content-Type": "application/json"},
+                json=payload
+            )
+            if res.status_code == 200:
+                audios = res.json().get("audios", [])
+                if audios and audios[0]:
+                    return audios[0]
+
+            # Fallback to bulbul:v3 with Priya / Shubh
+            payload["model"] = "bulbul:v3"
+            payload["speaker"] = "priya" if gender == "female" else "shubh"
+            res2 = await client.post(
+                "https://api.sarvam.ai/text-to-speech",
+                headers={"api-subscription-key": settings.SARVAM_API_KEY, "Content-Type": "application/json"},
+                json=payload
+            )
+            if res2.status_code == 200:
+                audios2 = res2.json().get("audios", [])
+                if audios2 and audios2[0]:
+                    return audios2[0]
+    except Exception as e:
+        logger.warning(f"Sarvam synthesis error: {e}")
+    return None
+
+@app.post("/api/voice/generate-custom-demo")
+async def generate_custom_demo(req: CustomDemoRequest):
+    """
+    Takes any user-provided business script, synthesizes speech in Male or Female voice
+    with 4 distinct calling tones (Corporate, High Energy Sales, Polite, Urgent Reminder),
+    using Google Gemini Neural or Sarvam Bulbul.
+    """
+    clean_text = (req.script or "").strip()
+    if not clean_text:
+        raise HTTPException(status_code=400, detail="Kripya script text dalein.")
+
+    clean_text = clean_text[:400]
+    gender = "female" if req.gender and req.gender.lower() == "female" else "male"
+    engine_choice = (req.voice_engine or "auto").lower()
+    tone = (req.tone or "corporate").lower()
+
+    audio_b64 = None
+    engine_used = "Sarvam AI Bulbul"
+    audio_format = "wav"
+
+    # 1. If Gemini / Google engine selected or preferred
+    if engine_choice in ["gemini", "google"] and settings.GEMINI_API_KEY:
+        audio_b64 = await synthesize_google_tts(clean_text, gender, tone)
+        if audio_b64:
+            engine_used = "Google Gemini Neural2"
+            audio_format = "mp3"
+
+    # 2. If Sarvam engine selected or primary
+    if not audio_b64 and settings.SARVAM_API_KEY:
+        audio_b64 = await synthesize_sarvam_tts(clean_text, gender, tone)
+        if audio_b64:
+            engine_used = "Sarvam AI Bulbul"
+            audio_format = "wav"
+
+    # 3. Fallback to Google if Sarvam failed
+    if not audio_b64 and settings.GEMINI_API_KEY:
+        audio_b64 = await synthesize_google_tts(clean_text, gender, tone)
+        if audio_b64:
+            engine_used = "Google Gemini Neural2"
+            audio_format = "mp3"
+
+    if not audio_b64:
+        raise HTTPException(
+            status_code=503,
+            detail="Voice generation temporarily unavailable. Please verify SARVAM_API_KEY or GEMINI_API_KEY on Render."
+        )
+
+    return {
+        "status": "success",
+        "audio_base64": audio_b64,
+        "audio_format": audio_format,
+        "gender": gender,
+        "tone": tone,
+        "engine_used": engine_used,
+        "script": clean_text
     }
 
 # ==============================================================================
