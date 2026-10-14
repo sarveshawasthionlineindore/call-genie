@@ -85,6 +85,9 @@ class Settings(BaseSettings):
     DEEPGRAM_API_KEY: str = os.getenv("DEEPGRAM_API_KEY", "")
     GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")
     SARVAM_API_KEY: str = os.getenv("SARVAM_API_KEY", "")
+    GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
+    ELEVENLABS_API_KEY: str = os.getenv("ELEVENLABS_API_KEY", "")
+    CARTESIA_API_KEY: str = os.getenv("CARTESIA_API_KEY", "")
 
     # Meta WhatsApp Cloud API via WhatAPI Gateway
     WHATSAPP_API_URL: str = os.getenv("WHATSAPP_API_URL", "https://crmapi1.whatapi.in/api/meta")
@@ -1189,27 +1192,78 @@ async def voice_chat_endpoint(chat_in: VoiceChatRequest):
 # ==============================================================================
 # 8. AUDIO SAMPLES & DIAGNOSTIC APIS
 # ==============================================================================
-SAMPLE_AUDIO_MAP = {
-    "sales": "https://call.mybotgenie.in/assets/samples/sales_lead_followup.mp3",
-    "lead-followup": "https://call.mybotgenie.in/assets/samples/sales_lead_followup.mp3",
-    "support": "https://call.mybotgenie.in/assets/samples/support_appointment.mp3",
-    "appointment": "https://call.mybotgenie.in/assets/samples/support_appointment.mp3",
-    "realestate": "https://call.mybotgenie.in/assets/samples/realestate_sitevisit.mp3",
-    "realty": "https://call.mybotgenie.in/assets/samples/realestate_sitevisit.mp3"
+SAMPLE_RECORDINGS = {
+    "automotive": {
+        "text": "नमस्ते! ऑटोकेयर वर्कशॉप इंदौर से रोहन बात कर रहा हूँ। आपकी हुंडई क्रेटा की सर्विस और वाशिंग पूरी हो चुकी है। जॉब कार्ड नंबर 4092 का कुल बिल 4,850 रुपये है। क्या मैं आपके इसी नंबर पर पिकअप गेटपास और ऑनलाइन बिल व्हाट्सएप कर दूँ?",
+        "speaker": "arvind",
+        "gender": "male",
+        "accent": "Indore Hindi Male"
+    },
+    "clinic": {
+        "text": "हेलो! केयर डेंटल क्लिनिक से रिया बोल रही हूँ। डॉक्टर अमित के पास आज शाम 6:15 का स्लॉट खाली है। क्या मैं आपका अपॉइंटमेंट टोकन और क्लिनिक लोकेशन व्हाट्सएप पर कन्फर्म कर दूँ?",
+        "speaker": "meera",
+        "gender": "female",
+        "accent": "Polite Clinic Hinglish Female"
+    },
+    "realestate": {
+        "text": "नमस्ते! एपेक्स रियल्टी इंदौर से मैं मीरा बात कर रही हूँ। आपने सुपर कॉरिडोर पर प्राइम प्लॉट्स के लिए इन्क्वायरी की थी। 3,200 रुपये प्रति वर्ग फीट का रेट है। क्या इस रविवार आपकी साइट विजिट शेड्यूल कर दूँ?",
+        "speaker": "meera",
+        "gender": "female",
+        "accent": "Warm Malwi Hindi Female"
+    },
+    "finance": {
+        "text": "नमस्कार! फिनकॉर्प लोन सर्विसेज से आर्यन बात कर रहा हूँ। आपके लोन अकाउंट की 4,500 रुपये की ईएमआई ड्यू है। अगर आप अभी पे करना चाहें तो मैं तुरंत 1-टैप यूपीआई पेमेंट लिंक आपके व्हाट्सएप पर शेयर कर रहा हूँ।",
+        "speaker": "arvind",
+        "gender": "male",
+        "accent": "Professional Banking Hindi Male"
+    }
 }
+SAMPLE_AUDIO_CACHE = {}
 
 @app.get("/api/voice/sample-audio/{sample_id}")
 async def get_sample_audio(sample_id: str):
-    """Returns direct stream/redirect or generated TTS for landing page audio cards."""
+    """Returns synthesized audio or cached studio voice for landing page audio cards."""
     sample_key = sample_id.lower().strip()
-    target_url = SAMPLE_AUDIO_MAP.get(sample_key, SAMPLE_AUDIO_MAP["sales"])
-    return {"sample_id": sample_id, "audio_url": target_url, "status": "ready"}
+    if sample_key in SAMPLE_AUDIO_CACHE:
+        return {"sample_id": sample_key, "audio_base64": SAMPLE_AUDIO_CACHE[sample_key], "status": "ready"}
+
+    sample_meta = SAMPLE_RECORDINGS.get(sample_key, SAMPLE_RECORDINGS["automotive"])
+
+    if settings.SARVAM_API_KEY:
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                payload = {
+                    "inputs": [sample_meta["text"]],
+                    "target_language_code": "hi-IN",
+                    "speaker": sample_meta.get("speaker", "suman_hi_companion"),
+                    "model": "bulbul:v4-flash",
+                    "pace": 1.10,
+                    "speech_sample_rate": 16000,
+                    "enable_preprocessing": True
+                }
+                res = await client.post(
+                    "https://api.sarvam.ai/text-to-speech",
+                    headers={"api-subscription-key": settings.SARVAM_API_KEY, "Content-Type": "application/json"},
+                    json=payload
+                )
+                if res.status_code == 200:
+                    audios = res.json().get("audios", [])
+                    if audios and audios[0]:
+                        SAMPLE_AUDIO_CACHE[sample_key] = audios[0]
+                        return {"sample_id": sample_key, "audio_base64": audios[0], "status": "ready"}
+        except Exception as e:
+            logger.warning(f"Error fetching sample audio from Sarvam: {e}")
+
+    return {"sample_id": sample_key, "text": sample_meta["text"], "status": "fallback"}
 
 @app.get("/api/voice/status")
 async def voice_status():
     return {
         "groq": bool(settings.GROQ_API_KEY),
         "sarvam": bool(settings.SARVAM_API_KEY),
+        "gemini": bool(settings.GEMINI_API_KEY),
+        "elevenlabs": bool(settings.ELEVENLABS_API_KEY),
+        "cartesia": bool(settings.CARTESIA_API_KEY),
         "livekit": bool(settings.LIVEKIT_API_KEY),
         "whatsapp": bool(settings.WHATSAPP_TOKEN and settings.WHATSAPP_PHONE_NUMBER_ID),
         "template": settings.WHATSAPP_TEMPLATE_NAME,
