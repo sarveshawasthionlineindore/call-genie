@@ -1079,48 +1079,92 @@ def generate_dynamic_hindi_reply(user_msg: str, client_name: str, biz_name: str,
     c_name = client_name.strip() if client_name and client_name.strip().lower() not in ["ji", ""] else "सर"
     b_name = biz_name.strip() if biz_name and biz_name.strip().lower() not in ["business", "aapke business", ""] else "मायबॉट जीनी"
     
+    # Greetings
     if any(w in msg for w in ["नमस्ते", "हैलो", "हेलो", "हाय", "namaste", "hello", "hi", "hey", "kaise ho", "kya haal"]):
-        return f"अरे नमस्ते {c_name} जी! मैं {b_name} से रिया बोल रही हूँ। बताइये, आज मैं आपकी क्या सहायता कर सकती हूँ?"
+        return f"अरे नमस्ते {c_name} जी! मैं {b_name} से रिया बोल रही हूँ। बताइये, आज किस बिज़नेस के लिए कॉलिंग ऑटोमेशन समझना चाहते हैं?"
+
+    # Real Estate queries
+    if any(w in msg for w in ["real estate", "रियल एस्टेट", "प्रॉपर्टी", "plot", "प्लॉट", "फ्लैट", "मकान", "zameen", "super corridor"]):
+        return f"जी बिल्कुल {c_name} जी! मान लीजिये मैं एपेक्स रियल्टी से रिया बोल रही हूँ। हमारे पास सुपर कॉरिडोर पर ₹3,200 प्रति वर्ग फीट पर प्राइम प्लॉट्स उपलब्ध हैं। क्या इस रविवार आपकी साइट विजिट शेड्यूल कर दूँ?"
+
+    # Healthcare / Clinic queries
+    if any(w in msg for w in ["clinic", "क्लिनिक", "hospital", "अस्पताल", "doctor", "डॉक्टर", "dental", "डेंटल", "appointment"]):
+        return f"जी! जैसे किसी पेशेंट का फोन आया, तो मैं बोलूँगी: हेलो! केयर डेंटल क्लिनिक से रिया बात कर रही हूँ। डॉक्टर के पास आज शाम 6:15 का स्लॉट खाली है, क्या टोकन बुक कर दूँ?"
+
+    # Automobile Workshop queries
+    if any(w in msg for w in ["workshop", "वर्कशॉप", "car", "कार", "गाड़ी", "service", "सर्विस", "repair", "ऑटो"]):
+        return f"जी! वर्कशॉप के लिए मैं बोलूँगी: नमस्ते! आपकी कार की सर्विस और वाशिंग पूरी हो चुकी है। कुल बिल ₹4,850 है। क्या गेटपास व्हाट्सएप पर भेज दूँ?"
+
+    # Loan / Finance / EMI queries
+    if any(w in msg for w in ["loan", "लोन", "finance", "फाइनेंस", "emi", "ईएमआई", "recovery", "बकाया"]):
+        return f"जी! फाइनेंस के लिए मैं बहुत ही शालीनता से बोलूँगी: नमस्कार! आपके लोन की ₹4,500 ईएमआई ड्यू है। क्या मैं तुरंत 1-टैप यूपीआई लिंक आपके व्हाट्सएप पर शेयर कर दूँ?"
+
+    # Pricing & Rate queries
+    if any(w in msg for w in ["kitna paisa", "kitna kharcha", "rate", "cost", "price", "kitna lagega", "charge", "fees", "रुपये"]):
+        return "कॉल जीनी का रेट बहुत ही किफ़ायती है—सिर्फ ₹5 प्रति मिनट! कोई सेटअप फ़ीस नहीं है और आप आज ही शुरू कर सकते हैं।"
+
+    # Identity
     if any(w in msg for w in ["कौन हो", "kaun ho", "kya naam", "naam kya", "kya ho", "who are you", "tum kaun"]):
-        return f"जी! मैं रिया हूँ, {b_name} की एआई कॉलिंग कंसलटेंट! मैं चौबीस घंटे आपके ग्राहकों से बिल्कुल इंसानों की तरह बात कर सकती हूँ।"
-    if any(w in msg for w in ["kya kar sakte", "kya kaam", "kaise kaam", "kya service", "features", "kya karte", "madad"]):
-        return f"अरे वाह! मैं आपके लीड्स को तुरंत कॉल करके फॉलो-अप कर सकती हूँ, अपॉइंटमेंट बुक कर सकती हूँ और सीधे व्हाट्सएप पर मैसेज भी भेज सकती हूँ।"
-    if any(w in msg for w in ["kitna paisa", "kitna kharcha", "rate", "cost", "price", "kitna lagega", "charge", "fees"]):
-        return "कॉल जीनी का रेट बहुत ही किफायती है, सिर्फ पाँच रुपये प्रति मिनट! कोई सेटअप चार्ज नहीं है, आप तुरंत शुरू कर सकते हैं।"
-    if any(w in msg for w in ["demo", "test", "aawaz", "bol ke", "live", "suno", "check"]):
-        return "हाँ जी बिल्कुल! आप इस समय मेरा ही लाइव डेमो सुन रहे हैं। क्या आप अपने बिज़नेस में एआई कॉलिंग शुरू करना चाहेंगे?"
-    if any(w in msg for w in ["dhanyawad", "shukriya", "bye", "alvida", "theek hai", "ok", "thank"]):
-        return f"ओह, थैंक यू सो मच {c_name} जी! आपसे बात करके बहुत अच्छा लगा। मैं व्हाट्सएप पर सारी डिटेल्स भेज रही हूँ!"
-    return f"जी {c_name} जी, मैंने समझ लिया! आपके बिज़नेस के लिए यह कॉलिंग ऑटोमेशन बहुत जबरदस्त काम करेगा। क्या मैं इस पर व्हाट्सएप डिटेल्स भेज दूँ?"
+        return f"जी! मैं रिया हूँ, {b_name} की एआई वॉइस कंसलटेंट! मैं इंसानों की तरह बात करके आपकी सारी लीड्स को 24 घंटे कॉल कर सकती हूँ।"
+
+    # Gratitude & Exit
+    if any(w in msg for w in ["dhanyawad", "shukriya", "bye", "alvida", "theek hai", "ok", "thank", "धन्यवाद", "शुक्रिया"]):
+        return f"ओह, बहुत-बहुत धन्यवाद {c_name} जी! आपसे बात करके बहुत अच्छा लगा। मैं सारी जानकारी आपके व्हाट्सएप पर भेज रही हूँ!"
+
+    # Default Contextual Response (Varied, not stuck in a single loop)
+    return f"जी {c_name} जी, मैंने समझ लिया! आपके बिज़नेस के लिए यह कॉलिंग सॉल्यूशन बहुत तेजी से सेल्स बढ़ाएगा। आप कितने कस्टमर्स को रोज़ कॉल करना चाहते हैं?"
 
 @app.post("/api/voice/chat")
 async def voice_chat_endpoint(chat_in: VoiceChatRequest):
     """
-    Energetic, cheerful telecaller 'Riya' with 1-turn discovery and Sarvam Bulbul native voice.
+    Intelligent conversational telecaller 'Riya' powered by Google Gemini and Sarvam AI Bulbul.
     """
     discovered = discover_caller_name(chat_in.message)
     active_name = discovered or chat_in.client_name or "सर"
 
     system_prompt = (
-        f"You are Riya, a cheerful, smiling, energetic female telecaller from Indore representing '{chat_in.business_name}' by MyBot Genie. "
-        f"You are having a live 1-on-1 phone conversation with {active_name}. "
-        "CRITICAL RULES: "
-        "1. Always use strictly feminine Hindi grammar (बोल रही हूँ, करती हूँ, बता सकती हूँ, मदद करूँगी). Never use masculine forms. "
-        "2. Speak in short, snappy, natural 1-turn telecaller responses (strictly 12 to 20 words). Never give long lectures. "
-        "3. Include natural conversational exclamations like 'अरे वाह!', 'हाँ जी बिल्कुल!', 'ओह थैंक यू!', 'अरे ग्रेट!'. "
-        "4. Write ONLY in Devanagari Hindi script (हिंदी). Never write English alphabets or romanized words. "
-        "5. Ask 1 engaging discovery question at a time to keep the customer engaged."
+        f"You are Riya, a polite, cheerful, highly intelligent female telecaller representing '{chat_in.business_name}' by MyBot Genie. "
+        f"You are talking to {active_name} on a live demo call. "
+        "CRITICAL INSTRUCTIONS: "
+        "1. Understand what the user asks and answer DIRECTLY and naturally in conversational Hindi / Hinglish. "
+        "2. If the user asks for a demo of Real Estate, pretend to be a real estate agent calling about prime plots or apartments. "
+        "3. If the user asks for a demo of Clinic/Doctor, pretend to be a clinic receptionist booking appointments. "
+        "4. If the user asks for a demo of Car Workshop, pretend to call about car service completion. "
+        "5. Keep responses short and punchy (15 to 25 words). "
+        "6. Always use feminine Hindi grammar (बोल रही हूँ, करती हूँ). "
+        "7. Write in clean Devanagari Hindi (हिंदी) so text-to-speech speaks naturally. "
+        "8. Never repeat the exact same sentence twice."
     )
 
-    messages = [{"role": "system", "content": system_prompt}]
-    if chat_in.conversation_history:
-        for msg in chat_in.conversation_history[-6:]:
-            messages.append({"role": msg.get("role", "user"), "content": msg.get("content", "")})
-    messages.append({"role": "user", "content": chat_in.message})
-
     ai_reply = None
-    if settings.GROQ_API_KEY:
+
+    # Priority 1: Google Gemini 2.0 Flash (Fastest, ultra-smart conversational responses)
+    if settings.GEMINI_API_KEY:
         try:
+            async with httpx.AsyncClient(timeout=8.0) as client:
+                gemini_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={settings.GEMINI_API_KEY}"
+                user_context = system_prompt + "\n\nCaller says: " + str(chat_in.message)
+
+                payload = {
+                    "contents": [{"parts": [{"text": user_context}]}],
+                    "generationConfig": {"temperature": 0.6, "maxOutputTokens": 100}
+                }
+                res = await client.post(gemini_url, json=payload)
+                if res.status_code == 200:
+                    cand = res.json().get("candidates", [])
+                    if cand:
+                        ai_reply = cand[0].get("content", {}).get("parts", [{}])[0].get("text", "").strip()
+        except Exception as e:
+            logger.warning(f"Gemini chat error: {e}")
+
+    # Priority 2: Groq Llama 3.3
+    if not ai_reply and settings.GROQ_API_KEY:
+        try:
+            messages = [{"role": "system", "content": system_prompt}]
+            if chat_in.conversation_history:
+                for msg in chat_in.conversation_history[-4:]:
+                    messages.append({"role": msg.get("role", "user"), "content": msg.get("content", "")})
+            messages.append({"role": "user", "content": chat_in.message})
             async with httpx.AsyncClient(timeout=6.0) as client:
                 res = await client.post(
                     "https://api.groq.com/openai/v1/chat/completions",
@@ -1135,8 +1179,9 @@ async def voice_chat_endpoint(chat_in: VoiceChatRequest):
                 if res.status_code == 200:
                     ai_reply = res.json()["choices"][0]["message"]["content"].strip()
         except Exception as e:
-            logger.warning(f"Groq error: {str(e)}")
+            logger.warning(f"Groq chat error: {e}")
 
+    # Priority 3: Contextual Dynamic Hindi Engine
     if not ai_reply:
         ai_reply = generate_dynamic_hindi_reply(
             chat_in.message,
@@ -1150,14 +1195,13 @@ async def voice_chat_endpoint(chat_in: VoiceChatRequest):
     audio_base64 = None
     if settings.SARVAM_API_KEY:
         try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                # Primary: Sarvam Bulbul v4-flash / v2 / v1
+            async with httpx.AsyncClient(timeout=12.0) as client:
                 payload_sarvam = {
                     "inputs": [clean_speech_text],
                     "target_language_code": "hi-IN",
                     "speaker": "suman_hi_companion",
                     "model": "bulbul:v4-flash",
-                    "pace": 1.15,
+                    "pace": 1.10,
                     "speech_sample_rate": 16000,
                     "enable_preprocessing": True
                 }
@@ -1169,9 +1213,9 @@ async def voice_chat_endpoint(chat_in: VoiceChatRequest):
                 if sarvam_res.status_code == 200:
                     audio_base64 = sarvam_res.json().get("audios", [None])[0]
                 else:
-                    # Fallback to Bulbul v1 Meera
-                    payload_sarvam["model"] = "bulbul:v1"
-                    payload_sarvam["speaker"] = "meera"
+                    # Fallback to bulbul:v3 with Priya (authentic female)
+                    payload_sarvam["model"] = "bulbul:v3"
+                    payload_sarvam["speaker"] = "priya"
                     fb_res = await client.post(
                         "https://api.sarvam.ai/text-to-speech",
                         headers={"api-subscription-key": settings.SARVAM_API_KEY, "Content-Type": "application/json"},
@@ -1180,8 +1224,7 @@ async def voice_chat_endpoint(chat_in: VoiceChatRequest):
                     if fb_res.status_code == 200:
                         audio_base64 = fb_res.json().get("audios", [None])[0]
         except Exception as e:
-            logger.warning(f"Sarvam TTS error: {str(e)}")
-
+            logger.warning(f"Sarvam live chat TTS error: {e}")
     return {
         "reply": ai_reply,
         "discovered_name": discovered,
