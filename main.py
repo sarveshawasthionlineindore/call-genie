@@ -1231,11 +1231,11 @@ async def get_sample_audio(sample_id: str):
 
     if settings.SARVAM_API_KEY:
         try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
+            async with httpx.AsyncClient(timeout=15.0) as client:
                 payload = {
                     "inputs": [sample_meta["text"]],
                     "target_language_code": "hi-IN",
-                    "speaker": sample_meta.get("speaker", "suman_hi_companion"),
+                    "speaker": sample_meta.get("speaker", "arvind"),
                     "model": "bulbul:v4-flash",
                     "pace": 1.10,
                     "speech_sample_rate": 16000,
@@ -1251,8 +1251,25 @@ async def get_sample_audio(sample_id: str):
                     if audios and audios[0]:
                         SAMPLE_AUDIO_CACHE[sample_key] = audios[0]
                         return {"sample_id": sample_key, "audio_base64": audios[0], "status": "ready"}
+                else:
+                    logger.warning(f"Sarvam TTS bulbul:v4-flash returned HTTP {res.status_code}: {res.text}. Trying bulbul:v1 fallback...")
+                    # Fallback to bulbul:v1
+                    payload["model"] = "bulbul:v1"
+                    payload["speaker"] = "meera" if sample_meta.get("gender") == "female" else "arvind"
+                    res2 = await client.post(
+                        "https://api.sarvam.ai/text-to-speech",
+                        headers={"api-subscription-key": settings.SARVAM_API_KEY, "Content-Type": "application/json"},
+                        json=payload
+                    )
+                    if res2.status_code == 200:
+                        audios2 = res2.json().get("audios", [])
+                        if audios2 and audios2[0]:
+                            SAMPLE_AUDIO_CACHE[sample_key] = audios2[0]
+                            return {"sample_id": sample_key, "audio_base64": audios2[0], "status": "ready"}
+                    else:
+                        logger.error(f"Sarvam TTS fallback also failed: HTTP {res2.status_code}: {res2.text}")
         except Exception as e:
-            logger.warning(f"Error fetching sample audio from Sarvam: {e}")
+            logger.error(f"Error fetching sample audio from Sarvam: {e}")
 
     return {"sample_id": sample_key, "text": sample_meta["text"], "status": "fallback"}
 
@@ -2229,17 +2246,31 @@ async def scrape_and_train_url(
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Website connection error: {str(e)}")
 
-    # Clean HTML with BeautifulSoup
+    # Clean HTML with resilient parser (BeautifulSoup if installed, built-in re+html fallback)
+    page_title = clean_url.replace("https://", "").replace("http://", "").split("/")[0]
+    extracted_text = ""
+
     try:
         from bs4 import BeautifulSoup
         soup = BeautifulSoup(html_text, "html.parser")
         for tag in soup(["script", "style", "noscript", "svg", "header", "footer", "nav", "iframe"]):
             tag.decompose()
-        
-        page_title = soup.title.string.strip() if (soup.title and soup.title.string) else clean_url.replace("https://", "").replace("http://", "").split("/")[0]
+        if soup.title and soup.title.string:
+            page_title = soup.title.string.strip()
         extracted_text = " ".join(soup.stripped_strings)
-    except Exception as parse_err:
-        raise HTTPException(status_code=500, detail=f"HTML parsing error: {str(parse_err)}")
+    except Exception:
+        # Built-in zero-dependency Python HTML parser (works 100% even without bs4 installed!)
+        import html
+        title_m = re.search(r'<title[^>]*>(.*?)</title>', html_text, re.IGNORECASE | re.DOTALL)
+        if title_m:
+            page_title = html.unescape(title_m.group(1).strip())
+        
+        # Remove noisy tags
+        cleaned = re.sub(r'<(script|style|noscript|svg|header|footer|nav|iframe)[^>]*>.*?</ >', ' ', html_text, flags=re.IGNORECASE | re.DOTALL)
+        # Remove all other HTML tags
+        cleaned = re.sub(r'<[^>]+>', ' ', cleaned)
+        # Clean entities and normalize whitespace
+        extracted_text = re.sub(r'\s+', ' ', html.unescape(cleaned)).strip()
 
     if len(extracted_text) < 30:
         raise HTTPException(status_code=400, detail="Website content was too short or could not be read.")
