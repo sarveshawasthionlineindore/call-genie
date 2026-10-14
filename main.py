@@ -1321,7 +1321,7 @@ async def get_sample_audio(sample_id: str):
     sample_key = sample_id.lower().strip()
     sample_meta = SAMPLE_RECORDINGS.get(sample_key, SAMPLE_RECORDINGS["automotive"])
 
-    cache_key = f"{sample_key}_{sample_meta['speaker']}_v3"
+    cache_key = f"{sample_key}_{sample_meta['speaker']}_{sample_meta.get('model', 'v4')}_v4"
     if cache_key in SAMPLE_AUDIO_CACHE and SAMPLE_AUDIO_CACHE[cache_key]:
         return {
             "sample_id": sample_key,
@@ -1335,9 +1335,9 @@ async def get_sample_audio(sample_id: str):
     if settings.SARVAM_API_KEY:
         try:
             async with httpx.AsyncClient(timeout=15.0) as client:
-                target_speaker = sample_meta.get("speaker", "rohan" if sample_meta["gender"] == "male" else "priya")
-                target_model = "bulbul:v3"
-                target_pace = sample_meta.get("pace", 1.02)
+                target_speaker = sample_meta.get("speaker", "rohan" if sample_meta["gender"] == "male" else "suman_hi_companion")
+                target_model = sample_meta.get("model", "bulbul:v4-flash" if sample_meta["gender"] == "female" else "bulbul:v3")
+                target_pace = sample_meta.get("pace", 1.06)
 
                 payload = {
                     "inputs": [sample_meta["text"]],
