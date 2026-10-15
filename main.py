@@ -243,7 +243,7 @@ class Agent(Base):
     llm_provider = Column(String(50), default="groq")
     llm_model = Column(String(50), default="llama-3.3-70b-versatile")
     tts_provider = Column(String(50), default="sarvam")
-    tts_voice = Column(String(50), default="suman_hi_companion")
+    tts_voice = Column(String(50), default="priya")
     system_prompt = Column(Text, nullable=False)
     greeting_message = Column(Text, nullable=False)
     call_direction = Column(String(20), default="both")
@@ -262,6 +262,14 @@ class Agent(Base):
     tenant = relationship("Tenant", back_populates="agents")
     call_logs = relationship("CallLog", back_populates="agent")
 
+    @property
+    def voice_provider(self):
+        return self.tts_provider
+
+    @property
+    def first_message(self):
+        return self.greeting_message
+
 class KnowledgeDocument(Base):
     __tablename__ = "knowledge_documents"
     id = Column(String(36), primary_key=True, default=generate_uuid)
@@ -271,6 +279,10 @@ class KnowledgeDocument(Base):
     raw_content = Column(Text, nullable=False)
     cleaned_chunks = Column(JSON, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
+
+    @property
+    def content(self):
+        return self.raw_content
 
 class Campaign(Base):
     __tablename__ = "campaigns"
@@ -1344,19 +1356,24 @@ async def on_startup():
         except Exception as sq_err:
             logger.warning(f"SQLite fallback note: {sq_err}")
 
-    # Seed Founder super admin in background / fast task (1-second max)
+    # Seed Founder super admin safely without duplicate wallet error
     async def _seed_founder():
         try:
             async with AsyncSessionLocal() as session:
+                hq_tenant = (await session.execute(select(Tenant).where(Tenant.name == "MyBot Genie HQ"))).scalar_one_or_none()
+                if not hq_tenant:
+                    hq_tenant = Tenant(name="MyBot Genie HQ", rate_per_min_inr=5.0)
+                    session.add(hq_tenant)
+                    await session.flush()
+
+                hq_wallet = (await session.execute(select(Wallet).where(Wallet.tenant_id == hq_tenant.id))).scalar_one_or_none()
+                if not hq_wallet:
+                    session.add(Wallet(tenant_id=hq_tenant.id, balance_inr=10000.0, total_recharged_inr=10000.0))
+                    await session.flush()
+
                 for adm_email in ["hello@mybotgenie.in", "ne.sarvesh@gmail.com", "9479580001@mybotgenie.in"]:
                     existing = (await session.execute(select(User).where(func.lower(User.email) == adm_email.lower()))).scalar_one_or_none()
                     if not existing:
-                        hq_tenant = (await session.execute(select(Tenant).where(Tenant.name == "MyBot Genie HQ"))).scalar_one_or_none()
-                        if not hq_tenant:
-                            hq_tenant = Tenant(name="MyBot Genie HQ", rate_per_min_inr=5.0)
-                            session.add(hq_tenant)
-                            await session.flush()
-
                         new_admin = User(
                             tenant_id=hq_tenant.id,
                             email=adm_email.lower(),
@@ -1365,9 +1382,8 @@ async def on_startup():
                             role="super_admin"
                         )
                         session.add(new_admin)
-                        session.add(Wallet(tenant_id=hq_tenant.id, balance_inr=10000.0, total_recharged_inr=10000.0))
-                        await session.commit()
                         logger.info(f"✓ Super Admin verified: {adm_email}")
+                await session.commit()
         except Exception as seed_err:
             logger.warning(f"Seed note: {seed_err}")
 
@@ -1426,15 +1442,14 @@ def discover_caller_name(user_text: str) -> Optional[str]:
 
 def generate_dynamic_hindi_reply(user_msg: str, client_name: str, biz_name: str, biz_type: str, history: Optional[List[Dict[str, str]]] = None, knowledge_context: Optional[str] = None) -> str:
     msg = (user_msg or "").lower().strip()
-    c_name = client_name.strip() if client_name and client_name.strip().lower() not in ["ji", ""] else "सर"
-    b_name = biz_name.strip() if biz_name and biz_name.strip().lower() not in ["business", "aapke business", ""] else "मायबॉट जीनी"
+    c_name = client_name.strip() if client_name and client_name.strip().lower() not in ["ji", "customer", "sir", "user", ""] else "सर"
+    b_name = biz_name.strip() if biz_name and biz_name.strip().lower() not in ["business", "aapke business", "call genie ai client", "mybot genie", ""] else "हमारी कंपनी"
     hist_len = len(history) if history else 0
 
-    # PRIORITY A: If Client Knowledge Base (Trained RAG) exists, extract exact facts!
+    # PRIORITY A: Trained Knowledge Base (Voice RAG)
     if knowledge_context and len(knowledge_context.strip()) > 10:
-        lines = [line.strip() for line in knowledge_context.split("\n") if line.strip()]
-        # Check for query words in trained knowledge lines
-        query_words = [w for w in re.findall(r'[A-Za-z0-9\u0900-\u097F]+', msg) if len(w) > 2 and w not in ["kya", "hai", "batao", "chahiye", "bare"]]
+        lines = [line.strip() for line in knowledge_context.split("\n") if len(line.strip()) > 5]
+        query_words = [w for w in re.findall(r'[A-Za-z0-9\u0900-\u097F]+', msg) if len(w) > 2 and w not in ["kya", "hai", "batao", "chahiye", "bare", "mujhe", "aapke", "karo", "hain", "kaise"]]
         best_match = None
         best_score = 0
         for line in lines:
@@ -1446,32 +1461,24 @@ def generate_dynamic_hindi_reply(user_msg: str, client_name: str, biz_name: str,
 
         if best_match and best_score > 0:
             clean_fact = re.sub(r'^\[.*?\]:\s*', '', best_match).strip()
-            return f"हमारे उपलब्ध डेटा के अनुसार: {clean_fact}। क्या आप इस संबंध में और विस्तृत विवरण या व्हाट्सएप पर जानकारी चाहते हैं?"
+            return f"जी बिल्कुल, हमारे आधिकारिक रिकॉर्ड के अनुसार: {clean_fact}। क्या आप इस संबंध में और विस्तृत विवरण चाहते हैं?"
 
-    # 1. Festival & Occasion Greetings (Diwali / New Year / Celebration 2-Way Dialogue)
-    if any(w in msg for w in ["diwali", "deepawali", "दीपावली", "दिवाली", "happy diwali", "shubhkamnaye", "शुभकामनाएं", "शुभकामनाएँ", "badhai", "बधाई", "mubarak", "मुबारक", "same to you", "सेम टू यू", "new year", "त्यौहार", "त्योहार"]):
-        if any(w in msg for w in ["office", "kaam", "business", "chalega", "demo", "kaise", "service", "सॉफ्टवेयर", "बिज़नेस", "ऑफिस", "काम", "इंदौर"]):
-            return "जी बिल्कुल! हमारे पास आपके बिज़नेस के लिए सम्पूर्ण कॉलिंग ऑटोमेशन तैयार है। अभी त्योहार का आनंद लीजिए—दीपावली के तुरंत बाद मैं पर्सनली आपसे संपर्क करूँगा। क्या बुनियादी विवरण आपके व्हाट्सएप पर साझा कर दूँ?"
-        return f"सादर धन्यवाद {c_name}! माँ लक्ष्मी की कृपा आप और आपके परिवार पर सदा बनी रहे। यह पावन पर्व आपके जीवन और व्यापार में असीम समृद्धि व खुशियाँ लेकर आए। दीपावली की हार्दिक शुभकामनाएँ!"
+    # 1. Festival Greetings (Diwali Wishes)
+    if any(w in msg for w in ["diwali", "deepawali", "दीपावली", "दिवाली", "happy diwali", "shubhkamnaye", "शुभकामनाएं", "शुभकामनाएँ", "badhai", "बधाई", "mubarak", "मुबारक", "same to you", "सेम टू यू", "new year"]):
+        return f"सादर धन्यवाद {c_name}! आपको और आपके पूरे परिवार को भी दीपावली की हार्दिक शुभकामनाएँ। माँ लक्ष्मी आप पर सदा कृपा बनाए रखें!"
 
     # 2. Polite Executive Greetings
     if any(w in msg for w in ["नमस्ते", "हैलो", "हेलो", "हाय", "namaste", "hello", "hi", "hey"]) and len(msg.split()) <= 3:
-        return f"सादर नमस्कार {c_name}! मैं {b_name} से सीनियर क्लाइंट कंसलटेंट बात कर रही हूँ। कृपया बताइये, आपकी किस प्रकार सहायता कर सकती हूँ?"
+        return f"सादर नमस्कार {c_name}! मैं {b_name} से बात कर रही हूँ। कृपया बताएं, मैं आपकी किस प्रकार सहायता कर सकती हूँ?"
 
-    # 3. Direct Pricing / Rate Inquiries
-    if any(w in msg for w in ["price", "rate", "cost", "kharcha", "kitna lagega", "fees", "रुपये", "रेट", "भाव", "दाम", "कीमत"]):
+    # 3. Product / Rate Inquiry (Contextualized to User's Business, NOT Call Genie Software!)
+    if any(w in msg for w in ["price", "rate", "cost", "kharcha", "kitna lagega", "fees", "रुपये", "रेट", "भाव", "दाम", "कीमत", "seeds", "बीज", "वैरायटी", "वैराइटी"]):
         if knowledge_context:
-            return f"सादर नमस्कार! हमारे पास दर सूची उपलब्ध है, कृपया विशिष्ट उत्पाद या सेवा का नाम बताएं ताकि मैं सही रेट बता सकूँ।"
-        return "कॉल जीनी का कमर्शियल मॉडल बहुत ही पारदर्शी है—मात्र ₹5 प्रति मिनट का फ्लैट रेट! कोई हिडन सेटअप चार्ज नहीं है।"
+            return f"जी {c_name}, हमारे पास {b_name} के सभी उत्पादों व सेवाओं की प्रमाणित दरें उपलब्ध हैं। कृपया विशिष्ट वैरायटी या आइटम का नाम बताएं ताकि मैं सही भाव बता सकूँ।"
+        return f"जी बिल्कुल {c_name}, हमारे {b_name} के उत्पादों और दरों की पूरी जानकारी उपलब्ध है। आप किस विशिष्ट उत्पाद के भाव के बारे में जानना चाहते हैं?"
 
-    # 4. Turn-based General Discovery
-    turn_responses = [
-        f"सादर नमस्कार {c_name}! आपके इस बिज़नेस के लिए हमारी एआई कॉलिंग आपके ग्राहकों को बेहद प्रतिष्ठित और शालीन अंदाज़ में अटेंड करेगी। आप प्रतिदिन लगभग कितने संपर्कों पर आउटबाउंड कॉलिंग प्लान कर रहे हैं?",
-        "बिल्कुल! हर कॉल के पश्चात हमारा सिस्टम क्लाइंट्स को तुरंत आधिकारिक व्हाट्सएप विवरण भी डिलीवर करता है। क्या आप इसमें अपना कस्टमाइज़्ड ब्रोशर जोड़ना चाहेंगे?",
-        "उत्कृष्ट! आपके डैशबोर्ड में प्रत्येक कॉल की रिकॉर्डिंग, ऑडियो एनालिटिक्स और लीड स्टेटस रियल-टाइम उपलब्ध रहता है। क्या हम आपके पहले पायलट कैंपेन की शुरुआत करें?"
-    ]
-    idx = (hist_len // 2) % len(turn_responses)
-    return turn_responses[idx]
+    # 4. Universal contextual discovery
+    return f"जी बिल्कुल {c_name}, {b_name} में हम ग्राहकों की आवश्यकता के अनुसार पूरी जानकारी और सेवा प्रदान करते हैं। कृपया अपना प्रश्न थोड़ा विस्तार से बताएं ताकि मैं आपको सही जानकारी दे सकूँ।"
 
 @app.post("/api/voice/chat")
 async def voice_chat_endpoint(chat_in: VoiceChatRequest, request: Request, db: AsyncSession = Depends(get_db)):
@@ -1528,7 +1535,7 @@ async def voice_chat_endpoint(chat_in: VoiceChatRequest, request: Request, db: A
                     stmt = stmt.where(KnowledgeDocument.tenant_id == ag.tenant_id)
             docs = (await db.execute(stmt.order_by(desc(KnowledgeDocument.created_at)).limit(5))).scalars().all()
             if docs:
-                k_context = "\n\n".join([f"[{d.title}]: {d.content[:1500]}" for d in docs])
+                k_context = '\n\n'.join([f'[{d.title}]: ' + (d.raw_content[:2000] if d.raw_content else '') for d in docs])
         except Exception as k_err:
             logger.warning(f"Knowledge context fetch note: {k_err}")
 
@@ -1616,8 +1623,8 @@ async def voice_chat_endpoint(chat_in: VoiceChatRequest, request: Request, db: A
                 payload_sarvam = {
                     "inputs": [clean_speech_text],
                     "target_language_code": "hi-IN",
-                    "speaker": "suman_hi_companion",
-                    "model": "bulbul:v4-flash",
+                    "speaker": "priya",
+                    "model": "bulbul:v3",
                     "pace": 1.08,
                     "speech_sample_rate": 16000,
                     "enable_preprocessing": True
@@ -1667,9 +1674,9 @@ SAMPLE_RECORDINGS = {
         "name": "रिया (Riya)",
         "business": "Dental Clinic Consultation & Token Booking",
         "gender": "female",
-        "speaker": "suman_hi_companion",  # Ultra-Expressive Human Conversational Female Voice
+        "speaker": "priya",  # Ultra-Expressive Human Conversational Female Voice
         "fallback_speaker": "priya",
-        "model": "bulbul:v4-flash",
+        "model": "bulbul:v3",
         "pace": 1.08,
         "text": "हेलो! केयर डेंटल क्लिनिक से रिया बोल रही हूँ। डॉक्टर अमित के पास आज शाम 6:15 का स्लॉट खाली है। क्या मैं आपका अपॉइंटमेंट टोकन और क्लिनिक लोकेशन व्हाट्सएप पर कन्फर्म कर दूँ?"
     },
@@ -2287,29 +2294,47 @@ async def place_single_call(call_req: SingleCallRequest, user: User = Depends(ge
     
     # 1. Fetch Agent details
     agent = (await db.execute(select(Agent).where(Agent.id == call_req.agent_id, Agent.tenant_id == user.tenant_id))).scalar_one_or_none()
+    if not agent:
+        agent = (await db.execute(select(Agent).where(Agent.tenant_id == user.tenant_id))).scalars().first()
     
     # 2. Fetch Knowledge Documents for this Tenant
     docs = (await db.execute(select(KnowledgeDocument).where(KnowledgeDocument.tenant_id == user.tenant_id).order_by(desc(KnowledgeDocument.created_at)).limit(5))).scalars().all()
-    k_snippet = "\n\n".join([f"[{d.title}]: {d.content[:1200]}" for d in docs])
+    k_snippet = '\n\n'.join([f'[{d.title}]: ' + (d.raw_content[:2000] if d.raw_content else '') for d in docs])
     
-    agent_prompt = agent.system_prompt if agent and agent.system_prompt else "Speak like an articulate corporate executive."
+    agent_prompt = getattr(agent, "system_prompt", "Speak like an articulate corporate executive.")
     if k_snippet:
         agent_prompt += "\n\n--- OFFICIAL BUSINESS KNOWLEDGE BASE ---\n" + k_snippet[:3500]
+
+    agent_id_val = getattr(agent, "id", call_req.agent_id)
+    agent_name_val = getattr(agent, "name", "AI Telecaller")
+    voice_prov = getattr(agent, "tts_provider", "sarvam")
+    custom_vid = getattr(agent, "custom_voice_id", None)
+    greeting_val = getattr(agent, "greeting_message", "Namaste! Main AI Consultant baat kar rahi hoon. Kya main aapki koi madad kar sakti hoon?")
 
     custom_meta = {
         **(call_req.custom_variables or {}),
         "tenant_id": user.tenant_id,
-        "agent_id": call_req.agent_id,
-        "agent_name": agent.name if agent else "AI Telecaller",
-        "voice_provider": agent.voice_provider if agent else "sarvam",
-        "custom_voice_id": agent.custom_voice_id if agent else None,
-        "first_message": agent.first_message if agent else "Namaste! Main Call Genie AI se baat kar raha hoon. Kya main aapki koi madad kar sakta hoon?",
+        "agent_id": agent_id_val,
+        "agent_name": agent_name_val,
+        "voice_provider": voice_prov,
+        "custom_voice_id": custom_vid,
+        "first_message": greeting_val,
         "system_prompt": agent_prompt
     }
     
-    room = await LiveKitService.create_outbound_call(clean_phone, call_req.agent_id, user.tenant_id, custom_meta)
+    room = await LiveKitService.create_outbound_call(clean_phone, agent_id_val, user.tenant_id, custom_meta)
+    
+    # If Exotel credentials provided, trigger real GSM call
+    exotel_result = None
+    if settings.EXOTEL_SID and settings.EXOTEL_API_KEY:
+        try:
+            exotel_result = await ExotelService.trigger_outbound_call(to_phone=clean_phone, caller_id=settings.EXOTEL_CALLER_NUMBER)
+            logger.info(f"Exotel call result: {exotel_result}")
+        except Exception as ex_err:
+            logger.warning(f"Exotel outbound error: {ex_err}")
+
     telephony_mode = "exotel_gsm" if (settings.EXOTEL_SID and settings.EXOTEL_API_KEY) else ("sip_trunk" if settings.EXOTEL_SIP_TRUNK_ID else "webrtc")
-    return {"room_name": room, "status": "initiated", "mode": telephony_mode}
+    return {"room_name": room, "status": "initiated", "mode": telephony_mode, "exotel": exotel_result}
 
 @app.post("/api/integrations/api-keys")
 async def make_key(user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
