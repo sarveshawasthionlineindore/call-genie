@@ -2207,39 +2207,80 @@ async def register_otp(user_in: UserRegister, bg: BackgroundTasks, db: AsyncSess
     }
 
 # ==============================================================================
-# WHATSAPP OTP AUTHENTICATION & LOGIN (ZERO-FRICTION INDIAN TELEPHONY)
+# ENTERPRISE WHATSAPP AUTHENTICATION (LOGIN & SIGN UP / FREE TRIAL)
 # ==============================================================================
-@app.post("/api/auth/whatsapp/send-otp")
-async def send_whatsapp_otp(req: WhatsAppSendOTPRequest, bg: BackgroundTasks):
+class WhatsAppLoginSendRequest(BaseModel):
+    phone: str
+
+class WhatsAppLoginVerifyRequest(BaseModel):
+    phone: str
+    otp: str
+
+class WhatsAppSignupSendRequest(BaseModel):
+    phone: str
+    company_name: str
+    full_name: str
+    password: str
+    email: Optional[str] = None
+
+class WhatsAppSignupVerifyRequest(BaseModel):
+    phone: str
+    otp: str
+
+@app.post("/api/auth/whatsapp/login-send-otp")
+async def whatsapp_login_send_otp(req: WhatsAppLoginSendRequest, bg: BackgroundTasks, db: AsyncSession = Depends(get_db)):
     clean_phone = WhatsAppService._clean_phone_number(req.phone)
-    if len(clean_phone) < 10:
+    digits = clean_phone[-10:] if len(clean_phone) >= 10 else clean_phone
+    if len(digits) != 10:
         raise HTTPException(status_code=400, detail="Please enter a valid 10-digit Indian mobile number.")
 
+    phone_email = f"{digits}@mybotgenie.in"
+    phone_with_91 = f"91{digits}@mybotgenie.in"
+
+    user = (await db.execute(select(User).where(
+        or_(
+            User.email == phone_email,
+            User.email == phone_with_91,
+            func.lower(User.email).like(f"%{digits}%")
+        )
+    ))).scalar_one_or_none()
+
+    # Allow founder numbers to bypass registration check
+    if digits in ["9479580001", "9425329851"]:
+        pass
+    elif not user:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Mobile number +91 {digits} is not registered yet. Please click 'Free Trial' to create an account."
+        )
+
     otp = generate_6digit_otp()
-    OTP_STORE[f"wa_{clean_phone}"] = {
+    OTP_STORE[f"wa_login_{digits}"] = {
         "otp": otp,
         "purpose": "whatsapp_login",
         "expires_at": datetime.utcnow() + timedelta(minutes=10)
     }
+    logger.info(f"🔑 [WHATSAPP LOGIN OTP] for +91 {digits}: {otp}")
 
-    logger.info(f"🔑 [WHATSAPP OTP CODE] Generated for +{clean_phone}: {otp}")
     bg.add_task(WhatsAppService.send_otp_message, clean_phone, otp)
     return {
         "status": "success",
-        "phone": clean_phone,
-        "message": f"WhatsApp verification code sent to +{clean_phone}",
-        "hint": f"Your code: {otp}" if not settings.WHATSAPP_TOKEN else "Check your WhatsApp message"
+        "phone": digits,
+        "message": f"WhatsApp verification code sent to +91 {digits}"
     }
 
+@app.post("/api/auth/whatsapp/login-verify-otp", response_model=TokenResponse)
 @app.post("/api/auth/whatsapp/verify-otp", response_model=TokenResponse)
-async def verify_whatsapp_otp(req: WhatsAppVerifyOTPRequest, db: AsyncSession = Depends(get_db)):
+async def whatsapp_login_verify_otp(req: WhatsAppLoginVerifyRequest, db: AsyncSession = Depends(get_db)):
     clean_phone = WhatsAppService._clean_phone_number(req.phone)
-    key = f"wa_{clean_phone}"
-    entry = OTP_STORE.get(key) or OTP_STORE.get(clean_phone)
+    digits = clean_phone[-10:] if len(clean_phone) >= 10 else clean_phone
+    key = f"wa_login_{digits}"
 
+    entry = OTP_STORE.get(key) or OTP_STORE.get(f"wa_{clean_phone}") or OTP_STORE.get(clean_phone)
     clean_otp = req.otp.strip()
+
     if not entry or entry["otp"] != clean_otp:
-        raise HTTPException(status_code=400, detail="Incorrect or expired WhatsApp OTP code. Please request a new code.")
+        raise HTTPException(status_code=400, detail="Incorrect or expired WhatsApp OTP code. Please check your WhatsApp and try again.")
 
     if datetime.utcnow() > entry["expires_at"]:
         if key in OTP_STORE:
@@ -2249,34 +2290,37 @@ async def verify_whatsapp_otp(req: WhatsAppVerifyOTPRequest, db: AsyncSession = 
     if key in OTP_STORE:
         del OTP_STORE[key]
 
-    # Find or auto-provision user
-    phone_email = f"{clean_phone}@mybotgenie.in"
+    phone_email = f"{digits}@mybotgenie.in"
+    phone_with_91 = f"91{digits}@mybotgenie.in"
     user = (await db.execute(select(User).where(
         or_(
             User.email == phone_email,
-            func.lower(User.email).like(f"%{clean_phone[-10:]}%")
+            User.email == phone_with_91,
+            func.lower(User.email).like(f"%{digits}%")
         )
     ))).scalar_one_or_none()
 
-    if not user:
-        # Instant Free Trial auto-provisioning
-        company = req.company_name or f"Workspace +91 {clean_phone[-10:]}"
-        tenant = Tenant(name=company, rate_per_min_inr=5.0)
-        db.add(tenant)
-        await db.flush()
+    if not user and digits in ["9479580001", "9425329851"]:
+        hq_tenant = (await db.execute(select(Tenant).where(Tenant.name == "MyBot Genie HQ"))).scalar_one_or_none()
+        if not hq_tenant:
+            hq_tenant = Tenant(name="MyBot Genie HQ", rate_per_min_inr=5.0)
+            db.add(hq_tenant)
+            await db.flush()
 
         user = User(
-            tenant_id=tenant.id,
-            email=phone_email,
-            hashed_password=get_password_hash("WhatsAppLogin@2026"),
-            full_name=req.full_name or f"User {clean_phone[-10:]}",
-            role="tenant_admin"
+            tenant_id=hq_tenant.id,
+            email=f"{digits}@mybotgenie.in",
+            hashed_password=get_password_hash("#Grow@2025"),
+            full_name="Sarvesh Awasthi (Founder)",
+            role="super_admin"
         )
         db.add(user)
-        # ₹100 Free Trial bonus wallet
-        db.add(Wallet(tenant_id=tenant.id, balance_inr=100.0, total_recharged_inr=100.0))
+        db.add(Wallet(tenant_id=hq_tenant.id, balance_inr=10000.0, total_recharged_inr=10000.0))
         await db.commit()
         await db.refresh(user)
+
+    if not user:
+        raise HTTPException(status_code=404, detail="User account not found. Please sign up for Free Trial.")
 
     tenant = (await db.execute(select(Tenant).where(Tenant.id == user.tenant_id))).scalar_one_or_none()
     token = create_access_token({"sub": user.id, "tenant_id": user.tenant_id, "role": user.role})
@@ -2289,6 +2333,100 @@ async def verify_whatsapp_otp(req: WhatsAppVerifyOTPRequest, db: AsyncSession = 
         "company_name": tenant.name if tenant else "Client Workspace",
         "role": user.role
     }
+
+@app.post("/api/auth/whatsapp/signup-send-otp")
+async def whatsapp_signup_send_otp(req: WhatsAppSignupSendRequest, bg: BackgroundTasks, db: AsyncSession = Depends(get_db)):
+    clean_phone = WhatsAppService._clean_phone_number(req.phone)
+    digits = clean_phone[-10:] if len(clean_phone) >= 10 else clean_phone
+    if len(digits) != 10:
+        raise HTTPException(status_code=400, detail="Please enter a valid 10-digit Indian mobile number.")
+
+    phone_email = f"{digits}@mybotgenie.in"
+    phone_with_91 = f"91{digits}@mybotgenie.in"
+    user = (await db.execute(select(User).where(
+        or_(
+            User.email == phone_email,
+            User.email == phone_with_91,
+            func.lower(User.email).like(f"%{digits}%")
+        )
+    ))).scalar_one_or_none()
+
+    if user:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Mobile number +91 {digits} is already registered. Please go to Login."
+        )
+
+    otp = generate_6digit_otp()
+    OTP_STORE[f"wa_signup_{digits}"] = {
+        "otp": otp,
+        "purpose": "whatsapp_signup",
+        "expires_at": datetime.utcnow() + timedelta(minutes=10),
+        "data": {
+            "company_name": req.company_name.strip() or "Client Workspace",
+            "full_name": req.full_name.strip() or "Client User",
+            "password": req.password.strip() or "CallGenie@2026",
+            "email": req.email.strip().lower() if (req.email and "@" in req.email) else f"{digits}@mybotgenie.in",
+            "phone": digits
+        }
+    }
+    logger.info(f"🔑 [WHATSAPP SIGNUP OTP] for +91 {digits}: {otp}")
+
+    bg.add_task(WhatsAppService.send_otp_message, clean_phone, otp)
+    return {
+        "status": "success",
+        "phone": digits,
+        "message": f"WhatsApp verification code sent to +91 {digits}"
+    }
+
+@app.post("/api/auth/whatsapp/signup-verify-otp", response_model=TokenResponse)
+async def whatsapp_signup_verify_otp(req: WhatsAppSignupVerifyRequest, db: AsyncSession = Depends(get_db)):
+    clean_phone = WhatsAppService._clean_phone_number(req.phone)
+    digits = clean_phone[-10:] if len(clean_phone) >= 10 else clean_phone
+    key = f"wa_signup_{digits}"
+
+    entry = OTP_STORE.get(key)
+    clean_otp = req.otp.strip()
+
+    if not entry or entry["otp"] != clean_otp:
+        raise HTTPException(status_code=400, detail="Incorrect or expired verification code. Please check your WhatsApp.")
+
+    if datetime.utcnow() > entry["expires_at"]:
+        del OTP_STORE[key]
+        raise HTTPException(status_code=400, detail="Verification code has expired. Please request a new code.")
+
+    signup_data = entry["data"]
+    del OTP_STORE[key]
+
+    tenant = Tenant(name=signup_data["company_name"] or "Client Workspace", rate_per_min_inr=5.0)
+    db.add(tenant)
+    await db.flush()
+
+    new_user = User(
+        tenant_id=tenant.id,
+        email=signup_data["email"],
+        hashed_password=get_password_hash(signup_data["password"]),
+        full_name=signup_data["full_name"],
+        role="tenant_admin"
+    )
+    db.add(new_user)
+    db.add(Wallet(tenant_id=tenant.id, balance_inr=100.0, total_recharged_inr=100.0))
+    await db.commit()
+    await db.refresh(new_user)
+
+    token = create_access_token({"sub": new_user.id, "tenant_id": tenant.id, "role": "tenant_admin"})
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "tenant_id": tenant.id,
+        "email": new_user.email,
+        "company_name": tenant.name,
+        "role": "tenant_admin"
+    }
+
+@app.post("/api/auth/whatsapp/send-otp")
+async def send_whatsapp_otp_alias(req: WhatsAppLoginSendRequest, bg: BackgroundTasks, db: AsyncSession = Depends(get_db)):
+    return await whatsapp_login_send_otp(req, bg, db)
 
 @app.post("/api/auth/verify-signup-otp", response_model=TokenResponse)
 async def verify_signup_otp(req: VerifyOTPOpRequest, db: AsyncSession = Depends(get_db)):
