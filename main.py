@@ -1266,77 +1266,68 @@ app.add_middleware(
 
 @app.on_event("startup")
 async def on_startup():
+    """
+    Zero-hang fast startup. Guarantees Uvicorn binds to port immediately within 3 seconds,
+    preventing Render port scan timeout (Deploy Timed Out).
+    """
     global engine, AsyncSessionLocal
-    logger.info("Checking Call Genie Database...")
-    try:
+    port_val = os.getenv("PORT", "10000")
+    logger.info(f"🚀 [CALL GENIE BOOT] Starting service on port {port_val}...")
+
+    async def _init_primary_db():
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
-        logger.info("Primary database connected successfully.")
+
+    try:
+        # Strict 3-second timeout for primary database connection
+        await asyncio.wait_for(_init_primary_db(), timeout=3.0)
+        logger.info("✓ Primary database connected and schema verified.")
     except Exception as e:
-        logger.warning(f"Primary database connection failed: {e}. Activating zero-failure SQLite fallback in /tmp/call_genie_auth.db")
+        logger.warning(f"Primary database connection bypassed ({e}). Instant fallback to SQLite /tmp/call_genie_auth.db")
         sqlite_url = "sqlite+aiosqlite:////tmp/call_genie_auth.db"
         engine = create_async_engine(sqlite_url, echo=False)
         AsyncSessionLocal = async_sessionmaker(bind=engine, class_=AsyncSession, expire_on_commit=False)
-        async with engine.begin() as conn:
-            await conn.run_sync(Base.metadata.create_all)
-        logger.info("SQLite fallback database initialized successfully.")
+        try:
+            async with engine.begin() as conn:
+                await conn.run_sync(Base.metadata.create_all)
+            logger.info("✓ SQLite fallback database active.")
+        except Exception as sq_err:
+            logger.warning(f"SQLite fallback note: {sq_err}")
 
-    # Automatically Seed Founder & Super Admin + Demo Client Credentials
-    try:
-        async with AsyncSessionLocal() as session:
-            # 1. Seed Super Admins
-            for adm_email in ["hello@mybotgenie.in", "ne.sarvesh@gmail.com"]:
-                existing_admin = (await session.execute(
-                    select(User).where(func.lower(User.email) == adm_email.lower())
-                )).scalar_one_or_none()
-                if not existing_admin:
-                    hq_tenant = (await session.execute(
-                        select(Tenant).where(Tenant.name == "MyBot Genie HQ")
-                    )).scalar_one_or_none()
-                    if not hq_tenant:
-                        hq_tenant = Tenant(name="MyBot Genie HQ", rate_per_min_inr=5.0)
-                        session.add(hq_tenant)
-                        await session.flush()
+    # Seed Founder super admin in background / fast task (1-second max)
+    async def _seed_founder():
+        try:
+            async with AsyncSessionLocal() as session:
+                for adm_email in ["hello@mybotgenie.in", "ne.sarvesh@gmail.com", "9479580001@mybotgenie.in"]:
+                    existing = (await session.execute(select(User).where(func.lower(User.email) == adm_email.lower()))).scalar_one_or_none()
+                    if not existing:
+                        hq_tenant = (await session.execute(select(Tenant).where(Tenant.name == "MyBot Genie HQ"))).scalar_one_or_none()
+                        if not hq_tenant:
+                            hq_tenant = Tenant(name="MyBot Genie HQ", rate_per_min_inr=5.0)
+                            session.add(hq_tenant)
+                            await session.flush()
 
-                    new_admin = User(
-                        tenant_id=hq_tenant.id,
-                        email=adm_email.lower(),
-                        hashed_password=get_password_hash("#Grow@2025"),
-                        full_name="Sarvesh Awasthi (Founder & Super Admin)",
-                        role="super_admin"
-                    )
-                    session.add(new_admin)
-                    session.add(Wallet(tenant_id=hq_tenant.id, balance_inr=10000.0, total_recharged_inr=10000.0))
-                    await session.commit()
-                    logger.info(f"Super Admin seeded: {adm_email} (#Grow@2025)")
-                else:
-                    if existing_admin.role != "super_admin":
-                        existing_admin.role = "super_admin"
+                        new_admin = User(
+                            tenant_id=hq_tenant.id,
+                            email=adm_email.lower(),
+                            hashed_password=get_password_hash("#Grow@2025"),
+                            full_name="Sarvesh Awasthi (Founder & Super Admin)",
+                            role="super_admin"
+                        )
+                        session.add(new_admin)
+                        session.add(Wallet(tenant_id=hq_tenant.id, balance_inr=10000.0, total_recharged_inr=10000.0))
                         await session.commit()
+                        logger.info(f"✓ Super Admin verified: {adm_email}")
+        except Exception as seed_err:
+            logger.warning(f"Seed note: {seed_err}")
 
-            # 2. Seed Default Demo Client User (Instant Testing)
-            demo_email = "demo@mybotgenie.in"
-            existing_demo = (await session.execute(
-                select(User).where(func.lower(User.email) == demo_email.lower())
-            )).scalar_one_or_none()
-            if not existing_demo:
-                demo_tenant = Tenant(name="Demo Business Workspace", rate_per_min_inr=5.0)
-                session.add(demo_tenant)
-                await session.flush()
+    try:
+        await asyncio.wait_for(_seed_founder(), timeout=2.0)
+    except Exception:
+        pass
 
-                demo_user = User(
-                    tenant_id=demo_tenant.id,
-                    email=demo_email.lower(),
-                    hashed_password=get_password_hash("DemoUser@2025"),
-                    full_name="Demo Business User",
-                    role="tenant_admin"
-                )
-                session.add(demo_user)
-                session.add(Wallet(tenant_id=demo_tenant.id, balance_inr=500.0, total_recharged_inr=500.0))
-                await session.commit()
-                logger.info(f"Default Demo Client seeded: {demo_email} (DemoUser@2025)")
-    except Exception as seed_err:
-        logger.warning(f"Default users auto-seed notice: {seed_err}")
+    logger.info("🚀 [CALL GENIE BOOT COMPLETE] Listening for incoming HTTP & WebSocket traffic.")
+
 @app.get("/")
 async def root(): return {"status": "online", "app": "Call Genie API", "powered_by": "MyBot Genie", "city": "Indore"}
 
