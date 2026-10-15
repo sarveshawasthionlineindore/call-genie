@@ -10,6 +10,8 @@ import json
 import hashlib
 import hmac
 import re
+import time
+import random
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
 
@@ -23,7 +25,7 @@ import ssl
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from sqlalchemy import (
-    func,
+    func, or_, and_,
     Column, String, Boolean, DateTime, ForeignKey, Text, Float, Integer, JSON, select, desc
 )
 from fastapi.responses import PlainTextResponse, JSONResponse
@@ -337,6 +339,30 @@ class ClientWebhookEndpoint(Base):
     target_url = Column(String(512), nullable=False)
     event_type = Column(String(100), default="call.completed")
     is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+class RechargeRequest(Base):
+    __tablename__ = "recharge_requests"
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    tenant_id = Column(String(36), ForeignKey("tenants.id"), nullable=False)
+    user_id = Column(String(36), ForeignKey("users.id"), nullable=False)
+    amount_inr = Column(Float, nullable=False)
+    utr_number = Column(String(100), unique=True, index=True, nullable=False)
+    payment_method = Column(String(50), default="UPI_QR")
+    status = Column(String(20), default="PENDING")
+    admin_notes = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+class Invoice(Base):
+    __tablename__ = "invoices"
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    tenant_id = Column(String(36), ForeignKey("tenants.id"), nullable=False)
+    invoice_number = Column(String(50), unique=True, index=True, nullable=False)
+    amount_inr = Column(Float, nullable=False)
+    total_amount_inr = Column(Float, nullable=False)
+    payment_method = Column(String(50), default="UPI_QR")
+    utr_number = Column(String(100), nullable=True)
+    status = Column(String(20), default="PAID")
     created_at = Column(DateTime, default=datetime.utcnow)
 
 # ==============================================================================
