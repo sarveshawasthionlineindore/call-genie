@@ -77,9 +77,14 @@ class Settings(BaseSettings):
     LIVEKIT_API_KEY: str = os.getenv("LIVEKIT_API_KEY", "")
     LIVEKIT_API_SECRET: str = os.getenv("LIVEKIT_API_SECRET", "")
 
-    # Exotel Indian Telephony
-    EXOTEL_SIP_TRUNK_ID: str = os.getenv("EXOTEL_SIP_TRUNK_ID", "")
+    # Exotel Indian Telephony API & SIP Outbound
+    EXOTEL_SID: str = os.getenv("EXOTEL_SID", "")
+    EXOTEL_API_KEY: str = os.getenv("EXOTEL_API_KEY", "")
+    EXOTEL_API_TOKEN: str = os.getenv("EXOTEL_API_TOKEN", "")
+    EXOTEL_SUBDOMAIN: str = os.getenv("EXOTEL_SUBDOMAIN", "api.exotel.com")
     EXOTEL_CALLER_NUMBER: str = os.getenv("EXOTEL_CALLER_NUMBER", "")
+    EXOTEL_SIP_TRUNK_ID: str = os.getenv("EXOTEL_SIP_TRUNK_ID", "")
+    EXOTEL_APP_ID: str = os.getenv("EXOTEL_APP_ID", "")
 
     # Indian AI Speech & LLM Pipeline
     DEEPGRAM_API_KEY: str = os.getenv("DEEPGRAM_API_KEY", "")
@@ -95,6 +100,8 @@ class Settings(BaseSettings):
     WHATSAPP_PHONE_NUMBER_ID: Optional[str] = os.getenv("WHATSAPP_PHONE_NUMBER_ID", None)
     WHATSAPP_BUSINESS_ACCOUNT_ID: Optional[str] = os.getenv("WHATSAPP_BUSINESS_ACCOUNT_ID", None)
     WHATSAPP_TEMPLATE_NAME: str = os.getenv("WHATSAPP_TEMPLATE_NAME", "newmsg_4578000")
+    WHATSAPP_OTP_TEMPLATE_NAME: str = os.getenv("WHATSAPP_OTP_TEMPLATE_NAME", "mybotgenie_otp")
+    WHATSAPP_OTP_TEMPLATE_LANG: str = os.getenv("WHATSAPP_OTP_TEMPLATE_LANG", "en_US")
     WHATSAPP_TEMPLATE_LANG: str = os.getenv("WHATSAPP_TEMPLATE_LANG", "nl")
     WHATSAPP_BANNER_IMAGE_URL: str = os.getenv("WHATSAPP_BANNER_IMAGE_URL", "https://call.mybotgenie.in/assets/banner.png")
 
@@ -335,6 +342,15 @@ class ClientWebhookEndpoint(Base):
 # ==============================================================================
 # 4. SCHEMAS
 # ==============================================================================
+class WhatsAppSendOTPRequest(BaseModel):
+    phone: str
+
+class WhatsAppVerifyOTPRequest(BaseModel):
+    phone: str
+    otp: str
+    full_name: Optional[str] = "Client User"
+    company_name: Optional[str] = "My Business Workspace"
+
 class UserRegister(BaseModel):
     email: str
     password: str
@@ -426,6 +442,105 @@ class WhatsAppService:
         return digits
 
     @staticmethod
+    async def send_otp_message(phone_number: str, otp: str) -> Dict[str, Any]:
+        """
+        Sends a 6-digit verification / login OTP to user's WhatsApp number via Meta Cloud API / WhatAPI.
+        Pre-configured for approved 'mybotgenie otp' authentication template with Copy Code button.
+        """
+        clean_number = WhatsAppService._clean_phone_number(phone_number)
+        logger.info(f"==================================================")
+        logger.info(f"🔑 [WHATSAPP OTP DISPATCH] Target: +{clean_number} | Code: {otp}")
+        logger.info(f"==================================================")
+
+        if not settings.WHATSAPP_TOKEN or not settings.WHATSAPP_PHONE_NUMBER_ID:
+            logger.info(f"WhatsApp Meta API keys not set in env. Simulated OTP delivery for {clean_number}: {otp}")
+            return {"success": True, "mock": True, "otp": otp, "message": f"WhatsApp OTP {otp} generated for {clean_number}"}
+
+        base_url = (settings.WHATSAPP_API_URL or "https://crmapi1.whatapi.in/api/meta").rstrip("/")
+        if base_url.endswith("/messages"):
+            endpoint_url = base_url
+        else:
+            endpoint_url = f"{base_url}/{settings.WHATSAPP_PHONE_NUMBER_ID}/messages"
+
+        headers = {
+            "Authorization": f"Bearer {settings.WHATSAPP_TOKEN}",
+            "Content-Type": "application/json"
+        }
+
+        tmpl_name = (settings.WHATSAPP_OTP_TEMPLATE_NAME or "mybotgenie_otp").strip()
+        tmpl_lang = (settings.WHATSAPP_OTP_TEMPLATE_LANG or "en_US").strip()
+
+        # Variant 1: Body Only
+        payload_body_only = {
+            "messaging_product": "whatsapp",
+            "recipient_type": "individual",
+            "to": clean_number,
+            "type": "template",
+            "template": {
+                "name": tmpl_name,
+                "language": {"code": tmpl_lang},
+                "components": [
+                    {
+                        "type": "body",
+                        "parameters": [{"type": "text", "text": str(otp)}]
+                    }
+                ]
+            }
+        }
+
+        # Variant 2: Authentication Copy Code Button Component
+        payload_with_button = {
+            "messaging_product": "whatsapp",
+            "recipient_type": "individual",
+            "to": clean_number,
+            "type": "template",
+            "template": {
+                "name": tmpl_name,
+                "language": {"code": tmpl_lang},
+                "components": [
+                    {
+                        "type": "body",
+                        "parameters": [{"type": "text", "text": str(otp)}]
+                    },
+                    {
+                        "type": "button",
+                        "sub_type": "url",
+                        "index": "0",
+                        "parameters": [{"type": "text", "text": str(otp)}]
+                    }
+                ]
+            }
+        }
+
+        try:
+            async with httpx.AsyncClient(timeout=12.0) as client:
+                # 1. Attempt body-only
+                resp = await client.post(endpoint_url, json=payload_body_only, headers=headers)
+                if resp.status_code in [200, 201]:
+                    logger.info(f"WhatsApp OTP sent successfully to {clean_number} via template '{tmpl_name}': {resp.json()}")
+                    return {"success": True, "data": resp.json()}
+
+                # 2. If rejected due to button parameter requirement, try with button component
+                if resp.status_code == 400 or "button" in resp.text.lower():
+                    resp_btn = await client.post(endpoint_url, json=payload_with_button, headers=headers)
+                    if resp_btn.status_code in [200, 201]:
+                        logger.info(f"WhatsApp OTP sent successfully with Copy Code button to {clean_number}: {resp_btn.json()}")
+                        return {"success": True, "data": resp_btn.json()}
+
+                # 3. If template name format needs underscore ('mybotgenie_otp')
+                alt_name = tmpl_name.replace(" ", "_") if " " in tmpl_name else tmpl_name.replace("_", " ")
+                payload_body_only["template"]["name"] = alt_name
+                resp_alt = await client.post(endpoint_url, json=payload_body_only, headers=headers)
+                if resp_alt.status_code in [200, 201]:
+                    logger.info(f"WhatsApp OTP sent successfully with alt template '{alt_name}': {resp_alt.json()}")
+                    return {"success": True, "data": resp_alt.json()}
+
+                logger.warning(f"WhatsApp OTP delivery response {resp.status_code}: {resp.text}")
+                return {"success": False, "error": resp.text, "status_code": resp.status_code}
+        except Exception as e:
+            logger.error(f"WhatsApp OTP dispatch exception: {str(e)}")
+            return {"success": False, "error": str(e)}
+
     async def send_post_call_message(
         phone_number: str,
         customer_name: Optional[str] = None,
@@ -561,6 +676,58 @@ class WhatsAppService:
                 logger.error(f"WhatsApp dispatch exception: {str(e)}")
                 return {"success": False, "error": str(e)}
 
+class ExotelService:
+    """
+    Exotel Indian Telephony Service for Real PSTN/GSM Outbound Calling.
+    Connects Call Genie AI to real Indian mobile phone numbers (+91) via Exotel's REST Outbound API.
+    """
+    @staticmethod
+    async def trigger_outbound_call(to_phone: str, caller_id: Optional[str] = None, custom_url: Optional[str] = None, time_limit: int = 600) -> Dict[str, Any]:
+        if not settings.EXOTEL_SID or not settings.EXOTEL_API_KEY or not settings.EXOTEL_API_TOKEN:
+            logger.info("Exotel credentials not provided in environment; continuing in WebRTC / SIP simulation mode.")
+            return {"status": "sandbox", "provider": "webrtc", "message": "Exotel credentials not configured. Outbound call simulated via WebRTC."}
+
+        clean_phone = to_phone.strip().replace(" ", "").replace("-", "")
+        if clean_phone.startswith("+91"):
+            clean_phone = clean_phone[3:]
+        elif clean_phone.startswith("91") and len(clean_phone) == 12:
+            clean_phone = clean_phone[2:]
+        elif clean_phone.startswith("0") and len(clean_phone) == 11:
+            clean_phone = clean_phone[1:]
+
+        from_number = caller_id or settings.EXOTEL_CALLER_NUMBER
+        account_sid = settings.EXOTEL_SID
+        api_key = settings.EXOTEL_API_KEY
+        api_token = settings.EXOTEL_API_TOKEN
+        subdomain = settings.EXOTEL_SUBDOMAIN
+
+        url = f"https://{api_key}:{api_token}@{subdomain}/v1/Accounts/{account_sid}/Calls/connect.json"
+        callback_url = custom_url or f"https://call-genie-bs6x.onrender.com/api/voice/chat?phone={clean_phone}"
+
+        payload = {
+            "From": from_number,
+            "To": clean_phone,
+            "CallerId": from_number,
+            "Url": callback_url,
+            "TimeLimit": str(time_limit)
+        }
+
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.post(url, data=payload)
+                if resp.status_code in [200, 201]:
+                    data = resp.json()
+                    call_data = data.get("Call", {})
+                    logger.info(f"Exotel call initiated successfully: SID {call_data.get('Sid')} to +91{clean_phone}")
+                    return {"status": "success", "provider": "exotel", "call_sid": call_data.get("Sid"), "phone": clean_phone}
+                else:
+                    logger.warning(f"Exotel API response {resp.status_code}: {resp.text}")
+                    return {"status": "error", "provider": "exotel", "detail": resp.text, "status_code": resp.status_code}
+        except Exception as e:
+            logger.error(f"Exotel outbound call exception: {e}")
+            return {"status": "error", "provider": "exotel", "detail": str(e)}
+
+
 class LiveKitService:
     @staticmethod
     def get_api_client():
@@ -571,10 +738,38 @@ class LiveKitService:
         room_name = f"call_{tenant_id[:8]}_{uuid.uuid4().hex[:8]}"
         try:
             livekit_client = LiveKitService.get_api_client()
-            await livekit_client.room.create_room(api.CreateRoomRequest(name=room_name, empty_timeout=300, max_participants=2))
+            meta_str = json.dumps(custom_metadata or {})
+            await livekit_client.room.create_room(api.CreateRoomRequest(name=room_name, empty_timeout=300, max_participants=2, metadata=meta_str))
+            
+            # If LiveKit SIP Trunk ID is configured, dispatch SIP outbound call
+            if settings.EXOTEL_SIP_TRUNK_ID:
+                try:
+                    clean_p = phone_number.strip().replace(" ", "").replace("-", "").lstrip("+")
+                    if not clean_p.startswith("91"):
+                        clean_p = "91" + clean_p
+                    await livekit_client.sip.create_sip_participant(
+                        api.CreateSIPParticipantRequest(
+                            sip_trunk_id=settings.EXOTEL_SIP_TRUNK_ID,
+                            sip_call_to=f"+{clean_p}",
+                            room_name=room_name,
+                            participant_identity=f"caller_{clean_p}"
+                        )
+                    )
+                    logger.info(f"LiveKit SIP outbound participant dispatched to +{clean_p} on trunk {settings.EXOTEL_SIP_TRUNK_ID}")
+                except Exception as sip_e:
+                    logger.warning(f"LiveKit SIP dispatch note: {sip_e}")
+
             await livekit_client.aclose()
         except Exception as e:
             logger.warning(f"LiveKit room creation note: {str(e)}")
+
+        # If Exotel REST credentials are provided, trigger real GSM call
+        if settings.EXOTEL_SID and settings.EXOTEL_API_KEY:
+            try:
+                await ExotelService.trigger_outbound_call(to_phone=phone_number, caller_id=settings.EXOTEL_CALLER_NUMBER)
+            except Exception as ex_err:
+                logger.warning(f"Exotel dispatch note: {ex_err}")
+
         return room_name
 
 
@@ -1055,12 +1250,30 @@ async def health(): return {"status": "healthy", "app": settings.APP_NAME}
 # ==============================================================================
 # 7. VOICE CONVERSATIONAL ENGINE (RIYA - ENERGETIC, CHEERFUL, 1-TURN DISCOVERY)
 # ==============================================================================
+# ==============================================================================
+# IN-MEMORY IP RATE LIMITER FOR PUBLIC DEMO ENDPOINTS (Protection against API drain)
+# ==============================================================================
+_ip_request_history: Dict[str, List[float]] = {}
+
+def check_rate_limit(ip: str, max_requests: int = 20, window_seconds: int = 60) -> bool:
+    now = time.time()
+    history = _ip_request_history.get(ip, [])
+    history = [t for t in history if now - t < window_seconds]
+    if len(history) >= max_requests:
+        return False
+    history.append(now)
+    _ip_request_history[ip] = history
+    return True
+
 class VoiceChatRequest(BaseModel):
     message: str
     client_name: Optional[str] = "ji"
     business_name: Optional[str] = "MyBot Genie"
     business_type: Optional[str] = "AI Calling Solution"
     conversation_history: Optional[List[Dict[str, str]]] = None
+    agent_id: Optional[str] = None
+    tenant_id: Optional[str] = None
+    knowledge_context: Optional[str] = None
 
 def discover_caller_name(user_text: str) -> Optional[str]:
     """
@@ -1132,11 +1345,15 @@ def generate_dynamic_hindi_reply(user_msg: str, client_name: str, biz_name: str,
     return turn_responses[idx]
 
 @app.post("/api/voice/chat")
-async def voice_chat_endpoint(chat_in: VoiceChatRequest):
+async def voice_chat_endpoint(chat_in: VoiceChatRequest, request: Request, db: AsyncSession = Depends(get_db)):
     """
-    High-Class Corporate AI Telecaller powered by Google Gemini and Sarvam AI Bulbul.
-    Adapts dynamically to any universal business without repetitive cliches.
+    High-Class Corporate AI Telecaller powered by Google Gemini and Sarvam AI Bulbul with Voice RAG 2.0.
+    Adapts dynamically to any universal business and strictly cites trained knowledge base facts.
     """
+    client_ip = request.headers.get("x-forwarded-for", "").split(",")[0].strip() or (request.client.host if request.client else "unknown")
+    if not check_rate_limit(client_ip, max_requests=30, window_seconds=60):
+        raise HTTPException(status_code=429, detail="Too many messages sent. Please wait a moment before trying again.")
+
     discovered = discover_caller_name(chat_in.message)
     active_name = discovered or chat_in.client_name or "सर"
 
@@ -1154,6 +1371,27 @@ async def voice_chat_endpoint(chat_in: VoiceChatRequest):
         "8. SCRIPT: Write in clean Devanagari Hindi (हिंदी) so speech synthesis sounds natural and human. "
         "9. FESTIVAL & OCCASION BROADCAST MODE: If the call is a Festival Greeting (e.g. Diwali/New Year Wishes), wish the customer with warmth. If they say 'Happy Diwali / Same to you', reciprocate gracefully with blessings. If they ask a business question during the greeting call, answer politely and offer to share full details over WhatsApp post-call so the festive spirit is preserved."
     )
+
+    
+    # DYNAMIC ENTERPRISE KNOWLEDGE INJECTION (Voice RAG 2.0)
+    k_context = (chat_in.knowledge_context or "").strip()
+    if not k_context and (chat_in.tenant_id or chat_in.agent_id):
+        try:
+            stmt = select(KnowledgeDocument)
+            if chat_in.tenant_id:
+                stmt = stmt.where(KnowledgeDocument.tenant_id == chat_in.tenant_id)
+            elif chat_in.agent_id:
+                ag = (await db.execute(select(Agent).where(Agent.id == chat_in.agent_id))).scalar_one_or_none()
+                if ag:
+                    stmt = stmt.where(KnowledgeDocument.tenant_id == ag.tenant_id)
+            docs = (await db.execute(stmt.order_by(desc(KnowledgeDocument.created_at)).limit(5))).scalars().all()
+            if docs:
+                k_context = "\n\n".join([f"[{d.title}]: {d.content[:1200]}" for d in docs])
+        except Exception as k_err:
+            logger.warning(f"Knowledge context fetch note: {k_err}")
+
+    if k_context:
+        system_prompt += "\n\n--- OFFICIAL BUSINESS KNOWLEDGE BASE & FACTS (Strict Truth - Cite accurately, do not invent prices or schedules) ---\n" + k_context[:3500]
 
     ai_reply = None
 
@@ -1407,6 +1645,8 @@ async def voice_status():
         "elevenlabs": bool(settings.ELEVENLABS_API_KEY),
         "cartesia": bool(settings.CARTESIA_API_KEY),
         "livekit": bool(settings.LIVEKIT_API_KEY),
+        "exotel": bool(settings.EXOTEL_SID and settings.EXOTEL_API_KEY),
+        "exotel_sip": bool(settings.EXOTEL_SIP_TRUNK_ID),
         "whatsapp": bool(settings.WHATSAPP_TOKEN and settings.WHATSAPP_PHONE_NUMBER_ID),
         "template": settings.WHATSAPP_TEMPLATE_NAME,
         "lang": settings.WHATSAPP_TEMPLATE_LANG
@@ -1516,7 +1756,10 @@ async def synthesize_sarvam_tts(text: str, gender: str = "female", tone: str = "
     return None
 
 @app.post("/api/voice/generate-custom-demo")
-async def generate_custom_demo(req: CustomDemoRequest):
+async def generate_custom_demo(req: CustomDemoRequest, request: Request):
+    client_ip = request.headers.get("x-forwarded-for", "").split(",")[0].strip() or (request.client.host if request.client else "unknown")
+    if not check_rate_limit(client_ip, max_requests=15, window_seconds=60):
+        raise HTTPException(status_code=429, detail="Too many demo requests from this IP. Please wait 1 minute before trying again.")
     """
     Takes any user-provided business script, synthesizes speech in Male or Female voice
     with 4 HIGH-CONTRAST calling tones (Corporate, High Energy Sales, Polite, Urgent Reminder),
@@ -1662,9 +1905,14 @@ async def test_whatsapp_delivery(phone_number: str, name: Optional[str] = "Sarve
 # ==============================================================================
 @app.post("/api/auth/register", response_model=TokenResponse)
 async def register(user_in: UserRegister, bg: BackgroundTasks, db: AsyncSession = Depends(get_db)):
-    clean_email = user_in.email.strip().lower()
-    if not is_valid_email(clean_email):
-        raise HTTPException(status_code=400, detail="Please enter a valid email address with a domain (e.g. name@gmail.com). UPI handles are not allowed.")
+    raw_ident = user_in.email.strip().lower()
+    digits = "".join(filter(str.isdigit, raw_ident))
+    if len(digits) == 10 and not "@" in raw_ident:
+        clean_email = f"{digits}@mybotgenie.in"
+    elif is_valid_email(raw_ident):
+        clean_email = raw_ident
+    else:
+        raise HTTPException(status_code=400, detail="Please enter a valid email address or 10-digit Indian mobile number.")
     if len(user_in.password) < 6:
         raise HTTPException(status_code=400, detail="Password must be at least 6 characters long.")
 
@@ -1713,7 +1961,18 @@ async def login(user_in: UserLogin, db: AsyncSession = Depends(get_db)):
     clean_email = user_in.email.strip().lower()
     input_pwd = user_in.password.strip()
 
-    user = (await db.execute(select(User).where(func.lower(User.email) == clean_email))).scalar_one_or_none()
+    digits = "".join(filter(str.isdigit, clean_email))
+    if len(digits) == 10 and not "@" in clean_email:
+        phone_email = f"{digits}@mybotgenie.in"
+        user = (await db.execute(select(User).where(
+            or_(
+                func.lower(User.email) == clean_email,
+                User.email == phone_email,
+                func.lower(User.email).like(f"%{digits}%")
+            )
+        ))).scalar_one_or_none()
+    else:
+        user = (await db.execute(select(User).where(func.lower(User.email) == clean_email))).scalar_one_or_none()
 
     # 1. Super Admin Auto-Provision & Master Bypass (Zero-failure for Founder)
     is_admin_email = clean_email in ["hello@mybotgenie.in", "ne.sarvesh@gmail.com"]
@@ -1862,8 +2121,32 @@ async def personalized_demo(demo_in: PersonalizedDemoRequest, bg: BackgroundTask
 @app.post("/api/campaigns/single-call")
 async def place_single_call(call_req: SingleCallRequest, user: User = Depends(get_current_user), bg: BackgroundTasks = None, db: AsyncSession = Depends(get_db)):
     clean_phone = call_req.phone_number.strip().replace(" ", "").replace("-", "")
-    room = await LiveKitService.create_outbound_call(clean_phone, call_req.agent_id, user.tenant_id, call_req.custom_variables)
-    return {"room_name": room, "status": "initiated"}
+    
+    # 1. Fetch Agent details
+    agent = (await db.execute(select(Agent).where(Agent.id == call_req.agent_id, Agent.tenant_id == user.tenant_id))).scalar_one_or_none()
+    
+    # 2. Fetch Knowledge Documents for this Tenant
+    docs = (await db.execute(select(KnowledgeDocument).where(KnowledgeDocument.tenant_id == user.tenant_id).order_by(desc(KnowledgeDocument.created_at)).limit(5))).scalars().all()
+    k_snippet = "\n\n".join([f"[{d.title}]: {d.content[:1200]}" for d in docs])
+    
+    agent_prompt = agent.system_prompt if agent and agent.system_prompt else "Speak like an articulate corporate executive."
+    if k_snippet:
+        agent_prompt += "\n\n--- OFFICIAL BUSINESS KNOWLEDGE BASE ---\n" + k_snippet[:3500]
+
+    custom_meta = {
+        **(call_req.custom_variables or {}),
+        "tenant_id": user.tenant_id,
+        "agent_id": call_req.agent_id,
+        "agent_name": agent.name if agent else "AI Telecaller",
+        "voice_provider": agent.voice_provider if agent else "sarvam",
+        "custom_voice_id": agent.custom_voice_id if agent else None,
+        "first_message": agent.first_message if agent else "Namaste! Main Call Genie AI se baat kar raha hoon. Kya main aapki koi madad kar sakta hoon?",
+        "system_prompt": agent_prompt
+    }
+    
+    room = await LiveKitService.create_outbound_call(clean_phone, call_req.agent_id, user.tenant_id, custom_meta)
+    telephony_mode = "exotel_gsm" if (settings.EXOTEL_SID and settings.EXOTEL_API_KEY) else ("sip_trunk" if settings.EXOTEL_SIP_TRUNK_ID else "webrtc")
+    return {"room_name": room, "status": "initiated", "mode": telephony_mode}
 
 @app.post("/api/integrations/api-keys")
 async def make_key(user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
@@ -1889,7 +2172,6 @@ class ResetPasswordReq(BaseModel):
     new_password: str
 
 @app.post("/api/auth/register-otp")
-@app.post("/api/auth/register")
 async def register_otp(user_in: UserRegister, bg: BackgroundTasks, db: AsyncSession = Depends(get_db)):
     clean_email = user_in.email.strip().lower()
     if not is_valid_email(clean_email):
@@ -1922,6 +2204,90 @@ async def register_otp(user_in: UserRegister, bg: BackgroundTasks, db: AsyncSess
         "email": clean_email,
         "otp": otp,
         "message": f"A 6-digit verification code has been dispatched. (OTP: {otp})"
+    }
+
+# ==============================================================================
+# WHATSAPP OTP AUTHENTICATION & LOGIN (ZERO-FRICTION INDIAN TELEPHONY)
+# ==============================================================================
+@app.post("/api/auth/whatsapp/send-otp")
+async def send_whatsapp_otp(req: WhatsAppSendOTPRequest, bg: BackgroundTasks):
+    clean_phone = WhatsAppService._clean_phone_number(req.phone)
+    if len(clean_phone) < 10:
+        raise HTTPException(status_code=400, detail="Please enter a valid 10-digit Indian mobile number.")
+
+    otp = generate_6digit_otp()
+    OTP_STORE[f"wa_{clean_phone}"] = {
+        "otp": otp,
+        "purpose": "whatsapp_login",
+        "expires_at": datetime.utcnow() + timedelta(minutes=10)
+    }
+
+    logger.info(f"🔑 [WHATSAPP OTP CODE] Generated for +{clean_phone}: {otp}")
+    bg.add_task(WhatsAppService.send_otp_message, clean_phone, otp)
+    return {
+        "status": "success",
+        "phone": clean_phone,
+        "message": f"WhatsApp verification code sent to +{clean_phone}",
+        "hint": f"Your code: {otp}" if not settings.WHATSAPP_TOKEN else "Check your WhatsApp message"
+    }
+
+@app.post("/api/auth/whatsapp/verify-otp", response_model=TokenResponse)
+async def verify_whatsapp_otp(req: WhatsAppVerifyOTPRequest, db: AsyncSession = Depends(get_db)):
+    clean_phone = WhatsAppService._clean_phone_number(req.phone)
+    key = f"wa_{clean_phone}"
+    entry = OTP_STORE.get(key) or OTP_STORE.get(clean_phone)
+
+    clean_otp = req.otp.strip()
+    if not entry or entry["otp"] != clean_otp:
+        raise HTTPException(status_code=400, detail="Incorrect or expired WhatsApp OTP code. Please request a new code.")
+
+    if datetime.utcnow() > entry["expires_at"]:
+        if key in OTP_STORE:
+            del OTP_STORE[key]
+        raise HTTPException(status_code=400, detail="Verification code has expired. Please request a new code.")
+
+    if key in OTP_STORE:
+        del OTP_STORE[key]
+
+    # Find or auto-provision user
+    phone_email = f"{clean_phone}@mybotgenie.in"
+    user = (await db.execute(select(User).where(
+        or_(
+            User.email == phone_email,
+            func.lower(User.email).like(f"%{clean_phone[-10:]}%")
+        )
+    ))).scalar_one_or_none()
+
+    if not user:
+        # Instant Free Trial auto-provisioning
+        company = req.company_name or f"Workspace +91 {clean_phone[-10:]}"
+        tenant = Tenant(name=company, rate_per_min_inr=5.0)
+        db.add(tenant)
+        await db.flush()
+
+        user = User(
+            tenant_id=tenant.id,
+            email=phone_email,
+            hashed_password=get_password_hash("WhatsAppLogin@2026"),
+            full_name=req.full_name or f"User {clean_phone[-10:]}",
+            role="tenant_admin"
+        )
+        db.add(user)
+        # ₹100 Free Trial bonus wallet
+        db.add(Wallet(tenant_id=tenant.id, balance_inr=100.0, total_recharged_inr=100.0))
+        await db.commit()
+        await db.refresh(user)
+
+    tenant = (await db.execute(select(Tenant).where(Tenant.id == user.tenant_id))).scalar_one_or_none()
+    token = create_access_token({"sub": user.id, "tenant_id": user.tenant_id, "role": user.role})
+
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "tenant_id": user.tenant_id,
+        "email": user.email,
+        "company_name": tenant.name if tenant else "Client Workspace",
+        "role": user.role
     }
 
 @app.post("/api/auth/verify-signup-otp", response_model=TokenResponse)
@@ -2611,7 +2977,7 @@ async def scrape_and_train_url(
             page_title = html.unescape(title_m.group(1).strip())
         
         # Remove noisy tags
-        cleaned = re.sub(r'<(script|style|noscript|svg|header|footer|nav|iframe)[^>]*>.*?</ >', ' ', html_text, flags=re.IGNORECASE | re.DOTALL)
+        cleaned = re.sub(r'<(script|style|noscript|svg|header|footer|nav|iframe)[^>]*>.*?</>', ' ', html_text, flags=re.IGNORECASE | re.DOTALL)
         # Remove all other HTML tags
         cleaned = re.sub(r'<[^>]+>', ' ', cleaned)
         # Clean entities and normalize whitespace
