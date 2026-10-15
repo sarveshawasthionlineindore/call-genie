@@ -80,11 +80,11 @@ class Settings(BaseSettings):
     LIVEKIT_API_SECRET: str = os.getenv("LIVEKIT_API_SECRET", "")
 
     # Exotel Indian Telephony API & SIP Outbound
-    EXOTEL_SID: str = os.getenv("EXOTEL_SID", "mybotgenie1")
+    EXOTEL_SID: str = os.getenv("EXOTEL_SID", "")
     EXOTEL_API_KEY: str = os.getenv("EXOTEL_API_KEY", "")
     EXOTEL_API_TOKEN: str = os.getenv("EXOTEL_API_TOKEN", "")
     EXOTEL_SUBDOMAIN: str = os.getenv("EXOTEL_SUBDOMAIN", "api.exotel.com")
-    EXOTEL_CALLER_NUMBER: str = os.getenv("EXOTEL_CALLER_NUMBER", "09513886363")
+    EXOTEL_CALLER_NUMBER: str = os.getenv("EXOTEL_CALLER_NUMBER", "")
     EXOTEL_SIP_TRUNK_ID: str = os.getenv("EXOTEL_SIP_TRUNK_ID", "")
     EXOTEL_APP_ID: str = os.getenv("EXOTEL_APP_ID", "")
 
@@ -834,7 +834,7 @@ class ExotelService:
             }
             # If first leg and destination are the same, use URL flow to prevent identical number error
             if payload.get("From") == payload.get("To"):
-                webhook_fallback = f"https://call-genie-bs6x.onrender.com/api/telephony/exoml/voice?phone={customer_phone}"
+                webhook_fallback = f"https://call-genie-bs6x.onrender.com/api/voice/chat?phone={customer_phone}"
                 payload = {
                     "From": customer_phone,
                     "CallerId": exophone or customer_phone,
@@ -3528,17 +3528,3 @@ async def test_exotel_diagnostic(phone_number: str):
         "target_phone": phone_number,
         "exotel_result": res
     }
-
-
-@app.get("/api/telephony/exoml/voice", response_class=Response)
-@app.post("/api/telephony/exoml/voice", response_class=Response)
-async def exoml_voice_handler(request: Request):
-    """
-    ExoML Response Endpoint for Exotel Outbound Voice Calls.
-    Returns valid XML so Exotel's voice gateway immediately speaks the AI greeting!
-    """
-    xml_content = """<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-    <Say>Namaste! Main Call Genie AI se baat kar raha hoon. Aapki AI Voice Call safaltapoorvak connect ho gayi hai. MyBot Genie Indore me aapka swagat hai.</Say>
-</Response>"""
-    return Response(content=xml_content, media_type="application/xml")
