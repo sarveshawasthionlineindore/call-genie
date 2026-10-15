@@ -459,6 +459,14 @@ class SingleCallRequest(BaseModel):
 # ==============================================================================
 class WhatsAppService:
     @staticmethod
+    def _clean_phone_id(raw_id: str) -> str:
+        """Extracts pure numeric phone number ID even if user entered '1222/93914250482'."""
+        if not raw_id:
+            return ""
+        raw = raw_id.strip()
+        return raw.split("/")[-1].strip() if "/" in raw else raw
+
+    @staticmethod
     def _clean_phone_number(phone: str) -> str:
         digits = "".join(filter(str.isdigit, phone or ""))
         if len(digits) == 10:
@@ -470,8 +478,8 @@ class WhatsAppService:
     @staticmethod
     async def send_otp_message(phone_number: str, otp: str) -> Dict[str, Any]:
         """
-        Sends a 6-digit verification / login OTP to user's WhatsApp number via Meta Cloud API / WhatAPI.
-        Pre-configured for approved 'mybotgenie otp' authentication template with Copy Code button.
+        Sends a 6-digit verification / login OTP to user's WhatsApp number.
+        Auto-sanitizes Phone Number ID and ensures valid Meta API version (/v19.0) is present in URL.
         """
         clean_number = WhatsAppService._clean_phone_number(phone_number)
         logger.info(f"==================================================")
@@ -479,93 +487,155 @@ class WhatsAppService:
         logger.info(f"==================================================")
 
         if not settings.WHATSAPP_TOKEN or not settings.WHATSAPP_PHONE_NUMBER_ID:
-            logger.info(f"WhatsApp Meta API keys not set in env. Simulated OTP delivery for {clean_number}: {otp}")
-            return {"success": True, "mock": True, "otp": otp, "message": f"WhatsApp OTP {otp} generated for {clean_number}"}
+            logger.warning("WhatsApp Meta API keys not set in env.")
+            return {"success": False, "error": "Missing WHATSAPP_TOKEN or WHATSAPP_PHONE_NUMBER_ID in Render Environment."}
 
-        base_url = (settings.WHATSAPP_API_URL or "https://crmapi1.whatapi.in/api/meta").rstrip("/")
-        if base_url.endswith("/messages"):
-            endpoint_url = base_url
+        # 1. Clean Phone Number ID (Extracts '93914250482' even if configured as '1222/93914250482')
+        phone_id = WhatsAppService._clean_phone_id(settings.WHATSAPP_PHONE_NUMBER_ID)
+
+        # 2. Build candidate endpoints with valid Meta API version (/v19.0)
+        base_raw = (settings.WHATSAPP_API_URL or "https://crmapi1.whatapi.in/api/meta").rstrip("/")
+        
+        # Ensure version is present in base_url
+        if not re.search(r"/v\d+\.\d+", base_raw):
+            base_with_version = f"{base_raw}/v19.0"
         else:
-            endpoint_url = f"{base_url}/{settings.WHATSAPP_PHONE_NUMBER_ID}/messages"
+            base_with_version = base_raw
+
+        endpoints_to_try = [
+            # Candidate 1: WhatAPI Meta Proxy with v19.0
+            f"{base_with_version}/{phone_id}/messages",
+            # Candidate 2: Direct official Meta Cloud API
+            f"https://graph.facebook.com/v19.0/{phone_id}/messages",
+            # Candidate 3: WhatAPI with v20.0
+            f"https://crmapi1.whatapi.in/api/meta/v20.0/{phone_id}/messages"
+        ]
+        endpoints_to_try = list(dict.fromkeys(endpoints_to_try))
 
         headers = {
             "Authorization": f"Bearer {settings.WHATSAPP_TOKEN}",
             "Content-Type": "application/json"
         }
 
-        tmpl_name = (settings.WHATSAPP_OTP_TEMPLATE_NAME or "mybotgenie_otp").strip()
-        tmpl_lang = (settings.WHATSAPP_OTP_TEMPLATE_LANG or "en_US").strip()
+        # Template variants
+        primary_name = (settings.WHATSAPP_OTP_TEMPLATE_NAME or "mybotgenie_otp").strip()
+        names_to_try = [primary_name]
+        if "_" in primary_name:
+            names_to_try.append(primary_name.replace("_", " "))
+        elif " " in primary_name:
+            names_to_try.append(primary_name.replace(" ", "_"))
+        if "mybotgenie_otp" not in names_to_try:
+            names_to_try.append("mybotgenie_otp")
+        if "mybotgenie otp" not in names_to_try:
+            names_to_try.append("mybotgenie otp")
 
-        # Variant 1: Body Only
-        payload_body_only = {
-            "messaging_product": "whatsapp",
-            "recipient_type": "individual",
-            "to": clean_number,
-            "type": "template",
-            "template": {
-                "name": tmpl_name,
-                "language": {"code": tmpl_lang},
-                "components": [
-                    {
-                        "type": "body",
-                        "parameters": [{"type": "text", "text": str(otp)}]
+        langs_to_try = [(settings.WHATSAPP_OTP_TEMPLATE_LANG or "en_US").strip(), "en_US", "en"]
+        langs_to_try = list(dict.fromkeys(langs_to_try))
+
+        errors = []
+
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            for endpoint_url in endpoints_to_try:
+                for tmpl_name in names_to_try:
+                    for lang in langs_to_try:
+                        # Variant A: Standard Positional Body Parameter
+                        p_body = {
+                            "messaging_product": "whatsapp",
+                            "recipient_type": "individual",
+                            "to": clean_number,
+                            "type": "template",
+                            "template": {
+                                "name": tmpl_name,
+                                "language": {"code": lang},
+                                "components": [
+                                    {
+                                        "type": "body",
+                                        "parameters": [{"type": "text", "text": str(otp)}]
+                                    }
+                                ]
+                            }
+                        }
+
+                        # Variant B: Copy-Code button parameter with integer index 0
+                        p_button = {
+                            "messaging_product": "whatsapp",
+                            "recipient_type": "individual",
+                            "to": clean_number,
+                            "type": "template",
+                            "template": {
+                                "name": tmpl_name,
+                                "language": {"code": lang},
+                                "components": [
+                                    {
+                                        "type": "body",
+                                        "parameters": [{"type": "text", "text": str(otp)}]
+                                    },
+                                    {
+                                        "type": "button",
+                                        "sub_type": "url",
+                                        "index": 0,
+                                        "parameters": [{"type": "text", "text": str(otp)}]
+                                    }
+                                ]
+                            }
+                        }
+
+                        for payload in [p_body, p_button]:
+                            try:
+                                resp = await client.post(endpoint_url, json=payload, headers=headers)
+                                is_http_ok = resp.status_code in [200, 201]
+                                resp_data = {}
+                                try:
+                                    resp_data = resp.json()
+                                except Exception:
+                                    pass
+
+                                is_internal_error = (
+                                    resp_data.get("success") is False or
+                                    "error" in resp_data or
+                                    "errors" in resp_data
+                                )
+
+                                if is_http_ok and not is_internal_error and ("messages" in resp_data or resp_data.get("success") is True):
+                                    logger.info(f"✓ [WHATSAPP OTP DELIVERED] Target: +{clean_number} | Endpoint: {endpoint_url} | Template: '{tmpl_name}' ({lang}) | Response: {resp_data}")
+                                    return {
+                                        "success": True,
+                                        "endpoint": endpoint_url,
+                                        "template": tmpl_name,
+                                        "lang": lang,
+                                        "data": resp_data
+                                    }
+                                else:
+                                    err_msg = resp_data.get("error") or resp_data.get("message") or resp.text[:120]
+                                    errors.append(f"{endpoint_url} [{tmpl_name}]: {err_msg}")
+                            except Exception as req_e:
+                                errors.append(f"{endpoint_url}: {str(req_e)}")
+
+            # Fallback Variant: Direct Text Message
+            for endpoint_url in endpoints_to_try:
+                try:
+                    p_text = {
+                        "messaging_product": "whatsapp",
+                        "recipient_type": "individual",
+                        "to": clean_number,
+                        "type": "text",
+                        "text": {
+                            "preview_url": False,
+                            "body": f"🔐 *Call Genie Verification Code*\n\nYour 6-digit OTP is: *{otp}*\n\nExpires in 10 minutes. Do not share this code.\n\n— MyBot Genie Indore"
+                        }
                     }
-                ]
-            }
-        }
+                    resp = await client.post(endpoint_url, json=p_text, headers=headers)
+                    if resp.status_code in [200, 201]:
+                        r_data = resp.json()
+                        if r_data.get("success") is not False and "error" not in r_data:
+                            logger.info(f"✓ WhatsApp OTP sent via text fallback to +{clean_number}")
+                            return {"success": True, "type": "text_fallback", "endpoint": endpoint_url, "data": r_data}
+                except Exception:
+                    pass
 
-        # Variant 2: Authentication Copy Code Button Component
-        payload_with_button = {
-            "messaging_product": "whatsapp",
-            "recipient_type": "individual",
-            "to": clean_number,
-            "type": "template",
-            "template": {
-                "name": tmpl_name,
-                "language": {"code": tmpl_lang},
-                "components": [
-                    {
-                        "type": "body",
-                        "parameters": [{"type": "text", "text": str(otp)}]
-                    },
-                    {
-                        "type": "button",
-                        "sub_type": "url",
-                        "index": "0",
-                        "parameters": [{"type": "text", "text": str(otp)}]
-                    }
-                ]
-            }
-        }
-
-        try:
-            async with httpx.AsyncClient(timeout=12.0) as client:
-                # 1. Attempt body-only
-                resp = await client.post(endpoint_url, json=payload_body_only, headers=headers)
-                if resp.status_code in [200, 201]:
-                    logger.info(f"WhatsApp OTP sent successfully to {clean_number} via template '{tmpl_name}': {resp.json()}")
-                    return {"success": True, "data": resp.json()}
-
-                # 2. If rejected due to button parameter requirement, try with button component
-                if resp.status_code == 400 or "button" in resp.text.lower():
-                    resp_btn = await client.post(endpoint_url, json=payload_with_button, headers=headers)
-                    if resp_btn.status_code in [200, 201]:
-                        logger.info(f"WhatsApp OTP sent successfully with Copy Code button to {clean_number}: {resp_btn.json()}")
-                        return {"success": True, "data": resp_btn.json()}
-
-                # 3. If template name format needs underscore ('mybotgenie_otp')
-                alt_name = tmpl_name.replace(" ", "_") if " " in tmpl_name else tmpl_name.replace("_", " ")
-                payload_body_only["template"]["name"] = alt_name
-                resp_alt = await client.post(endpoint_url, json=payload_body_only, headers=headers)
-                if resp_alt.status_code in [200, 201]:
-                    logger.info(f"WhatsApp OTP sent successfully with alt template '{alt_name}': {resp_alt.json()}")
-                    return {"success": True, "data": resp_alt.json()}
-
-                logger.warning(f"WhatsApp OTP delivery response {resp.status_code}: {resp.text}")
-                return {"success": False, "error": resp.text, "status_code": resp.status_code}
-        except Exception as e:
-            logger.error(f"WhatsApp OTP dispatch exception: {str(e)}")
-            return {"success": False, "error": str(e)}
+        last_err = errors[0] if errors else "WhatsApp gateway rejected message"
+        logger.warning(f"All WhatsApp OTP attempts failed for +{clean_number}. Summary of rejections: {errors[:5]}")
+        return {"success": False, "error": last_err, "all_errors": errors[:5]}
 
     async def send_post_call_message(
         phone_number: str,
@@ -1926,6 +1996,26 @@ async def test_whatsapp_delivery(phone_number: str, name: Optional[str] = "Sarve
         }
     }
 
+@app.get("/api/whatsapp/test-otp/{phone_number}")
+async def test_whatsapp_otp_endpoint(phone_number: str):
+    """
+    Diagnostic endpoint to test WhatsApp OTP delivery to any phone number.
+    Returns the exact response from WhatAPI/Meta so you can see why messages succeed or fail!
+    """
+    clean_p = WhatsAppService._clean_phone_number(phone_number)
+    test_code = "998877"
+    result = await WhatsAppService.send_otp_message(clean_p, test_code)
+    return {
+        "tested_phone": clean_p,
+        "test_otp": test_code,
+        "result": result,
+        "gateway_url": settings.WHATSAPP_API_URL,
+        "phone_number_id": settings.WHATSAPP_PHONE_NUMBER_ID,
+        "template_name": settings.WHATSAPP_OTP_TEMPLATE_NAME,
+        "template_lang": settings.WHATSAPP_OTP_TEMPLATE_LANG
+    }
+
+
 # ==============================================================================
 # 10. AUTH, AGENTS, WALLET & DEMO APIS
 # ==============================================================================
@@ -2295,12 +2385,21 @@ async def whatsapp_login_send_otp(req: WhatsAppLoginSendRequest, bg: BackgroundT
     logger.info(f"🔑 [WHATSAPP LOGIN OTP DISPATCH] Target: +91 {digits} | Code: {otp}")
     logger.info(f"==================================================")
 
-    bg.add_task(WhatsAppService.send_otp_message, clean_phone, otp)
+    # Dispatch WhatsApp OTP and check delivery status
+    delivery = await WhatsAppService.send_otp_message(clean_phone, otp)
+    if not delivery.get("success"):
+        logger.warning(f"WhatsApp OTP delivery failed: {delivery.get('error')}")
+        # If WhatsApp gateway failed, return clear diagnostic error to the user
+        raise HTTPException(
+            status_code=400,
+            detail=f"WhatsApp पर मैसेज नहीं जा सका। कारण: {delivery.get('error', 'Gateway error')}"
+        )
+
     return {
         "status": "success",
         "phone": digits,
         "message": f"WhatsApp verification code sent to +91 {digits}",
-        "hint": f"Code: {otp}" if not settings.WHATSAPP_TOKEN else "Check your WhatsApp message"
+        "delivery": delivery
     }
 
 @app.post("/api/auth/whatsapp/login-verify-otp", response_model=TokenResponse)
@@ -2414,11 +2513,20 @@ async def whatsapp_signup_send_otp(req: WhatsAppSignupSendRequest, bg: Backgroun
     }
     logger.info(f"🔑 [WHATSAPP SIGNUP OTP] for +91 {digits}: {otp}")
 
-    bg.add_task(WhatsAppService.send_otp_message, clean_phone, otp)
+    # Dispatch WhatsApp OTP and check delivery status
+    delivery = await WhatsAppService.send_otp_message(clean_phone, otp)
+    if not delivery.get("success"):
+        logger.warning(f"WhatsApp Signup OTP delivery failed: {delivery.get('error')}")
+        raise HTTPException(
+            status_code=400,
+            detail=f"WhatsApp पर मैसेज नहीं जा सका। कारण: {delivery.get('error', 'Gateway error')}"
+        )
+
     return {
         "status": "success",
         "phone": digits,
-        "message": f"WhatsApp verification code sent to +91 {digits}"
+        "message": f"WhatsApp verification code sent to +91 {digits}",
+        "delivery": delivery
     }
 
 @app.post("/api/auth/whatsapp/signup-verify-otp", response_model=TokenResponse)
