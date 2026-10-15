@@ -80,11 +80,11 @@ class Settings(BaseSettings):
     LIVEKIT_API_SECRET: str = os.getenv("LIVEKIT_API_SECRET", "")
 
     # Exotel Indian Telephony API & SIP Outbound
-    EXOTEL_SID: str = os.getenv("EXOTEL_SID", "")
+    EXOTEL_SID: str = os.getenv("EXOTEL_SID", "mybotgenie1")
     EXOTEL_API_KEY: str = os.getenv("EXOTEL_API_KEY", "")
     EXOTEL_API_TOKEN: str = os.getenv("EXOTEL_API_TOKEN", "")
     EXOTEL_SUBDOMAIN: str = os.getenv("EXOTEL_SUBDOMAIN", "api.exotel.com")
-    EXOTEL_CALLER_NUMBER: str = os.getenv("EXOTEL_CALLER_NUMBER", "")
+    EXOTEL_CALLER_NUMBER: str = os.getenv("EXOTEL_CALLER_NUMBER", "09513886363")
     EXOTEL_SIP_TRUNK_ID: str = os.getenv("EXOTEL_SIP_TRUNK_ID", "")
     EXOTEL_APP_ID: str = os.getenv("EXOTEL_APP_ID", "")
 
@@ -776,49 +776,99 @@ class ExotelService:
     """
     Exotel Indian Telephony Service for Real PSTN/GSM Outbound Calling.
     Connects Call Genie AI to real Indian mobile phone numbers (+91) via Exotel's REST Outbound API.
+    Handles:
+      1. Automated Call to Flow (Applet / VoiceBot) -> From = Customer (0...), CallerId = ExoPhone, Url = flow_url
+      2. Click-to-Call (Bridge Agent & Customer) -> From = Agent (0...), To = Customer (0...), CallerId = ExoPhone
     """
     @staticmethod
-    async def trigger_outbound_call(to_phone: str, caller_id: Optional[str] = None, custom_url: Optional[str] = None, time_limit: int = 600) -> Dict[str, Any]:
+    def _format_indian_number(phone: str, prefix_zero: bool = True) -> str:
+        """Formats phone number for Exotel. Exotel requires Indian numbers with leading 0 (STD) or +91."""
+        clean = str(phone).strip().replace(" ", "").replace("-", "").replace("+", "")
+        digits = clean[-10:] if len(clean) >= 10 else clean
+        return f"0{digits}" if prefix_zero else f"+91{digits}"
+
+    @staticmethod
+    async def trigger_outbound_call(to_phone: str, caller_id: Optional[str] = None, custom_url: Optional[str] = None, agent_phone: Optional[str] = None, time_limit: int = 600) -> Dict[str, Any]:
         if not settings.EXOTEL_SID or not settings.EXOTEL_API_KEY or not settings.EXOTEL_API_TOKEN:
             logger.info("Exotel credentials not provided in environment; continuing in WebRTC / SIP simulation mode.")
             return {"status": "sandbox", "provider": "webrtc", "message": "Exotel credentials not configured. Outbound call simulated via WebRTC."}
 
-        clean_phone = to_phone.strip().replace(" ", "").replace("-", "")
-        if clean_phone.startswith("+91"):
-            clean_phone = clean_phone[3:]
-        elif clean_phone.startswith("91") and len(clean_phone) == 12:
-            clean_phone = clean_phone[2:]
-        elif clean_phone.startswith("0") and len(clean_phone) == 11:
-            clean_phone = clean_phone[1:]
+        account_sid = settings.EXOTEL_SID.strip()
+        api_key = settings.EXOTEL_API_KEY.strip()
+        api_token = settings.EXOTEL_API_TOKEN.strip()
 
-        from_number = caller_id or settings.EXOTEL_CALLER_NUMBER
-        account_sid = settings.EXOTEL_SID
-        api_key = settings.EXOTEL_API_KEY
-        api_token = settings.EXOTEL_API_TOKEN
-        subdomain = settings.EXOTEL_SUBDOMAIN
+        # Clean subdomain: strip https:// and trailing slashes
+        raw_subdomain = settings.EXOTEL_SUBDOMAIN.strip()
+        subdomain = raw_subdomain.replace("https://", "").replace("http://", "").strip("/") or "api.exotel.com"
 
-        url = f"https://{api_key}:{api_token}@{subdomain}/v1/Accounts/{account_sid}/Calls/connect.json"
-        callback_url = custom_url or f"https://call-genie-bs6x.onrender.com/api/voice/chat?phone={clean_phone}"
+        # Format destination customer phone (with leading 0 as mandated by Exotel)
+        customer_phone = ExotelService._format_indian_number(to_phone)
 
-        payload = {
-            "From": from_number,
-            "To": clean_phone,
-            "CallerId": from_number,
-            "Url": callback_url,
-            "TimeLimit": str(time_limit)
-        }
+        # Virtual ExoPhone CLI
+        raw_exophone = caller_id or settings.EXOTEL_CALLER_NUMBER
+        exophone = ExotelService._format_indian_number(raw_exophone) if raw_exophone else ""
+
+        url = f"https://{subdomain}/v1/Accounts/{account_sid}/Calls/connect.json"
+
+        # Mode A: Automated Voice Flow (Applet / VoiceBot)
+        target_flow = custom_url or (
+            f"http://my.exotel.com/{account_sid}/exoml/start_voice/{settings.EXOTEL_APP_ID}"
+            if settings.EXOTEL_APP_ID else None
+        )
+
+        if target_flow:
+            payload = {
+                "From": customer_phone,
+                "CallerId": exophone or customer_phone,
+                "Url": target_flow,
+                "TimeLimit": str(time_limit)
+            }
+        else:
+            # Click-to-call or direct customer bridge
+            first_leg = ExotelService._format_indian_number(agent_phone) if agent_phone else customer_phone
+            payload = {
+                "From": first_leg,
+                "To": customer_phone,
+                "CallerId": exophone or first_leg,
+                "TimeLimit": str(time_limit)
+            }
+            # If first leg and destination are the same, use URL flow to prevent identical number error
+            if payload.get("From") == payload.get("To"):
+                webhook_fallback = f"https://call-genie-bs6x.onrender.com/api/telephony/exoml/voice?phone={customer_phone}"
+                payload = {
+                    "From": customer_phone,
+                    "CallerId": exophone or customer_phone,
+                    "Url": webhook_fallback,
+                    "TimeLimit": str(time_limit)
+                }
 
         try:
+            auth = httpx.BasicAuth(api_key, api_token)
             async with httpx.AsyncClient(timeout=15.0) as client:
-                resp = await client.post(url, data=payload)
+                resp = await client.post(url, auth=auth, data=payload)
+                logger.info(f"📞 [EXOTEL OUTBOUND] POST {url} | Status: {resp.status_code} | Body: {resp.text}")
+                try:
+                    resp_data = resp.json()
+                except Exception:
+                    resp_data = {"raw_text": resp.text}
+
                 if resp.status_code in [200, 201]:
-                    data = resp.json()
-                    call_data = data.get("Call", {})
-                    logger.info(f"Exotel call initiated successfully: SID {call_data.get('Sid')} to +91{clean_phone}")
-                    return {"status": "success", "provider": "exotel", "call_sid": call_data.get("Sid"), "phone": clean_phone}
+                    call_info = resp_data.get("Call", {})
+                    return {
+                        "status": "success",
+                        "provider": "exotel",
+                        "call_sid": call_info.get("Sid"),
+                        "phone": customer_phone,
+                        "details": call_info
+                    }
                 else:
-                    logger.warning(f"Exotel API response {resp.status_code}: {resp.text}")
-                    return {"status": "error", "provider": "exotel", "detail": resp.text, "status_code": resp.status_code}
+                    return {
+                        "status": "error",
+                        "provider": "exotel",
+                        "status_code": resp.status_code,
+                        "detail": resp.text,
+                        "parsed": resp_data
+                    }
         except Exception as e:
             logger.error(f"Exotel outbound call exception: {e}")
             return {"status": "error", "provider": "exotel", "detail": str(e)}
@@ -1374,11 +1424,29 @@ def discover_caller_name(user_text: str) -> Optional[str]:
             return name
     return None
 
-def generate_dynamic_hindi_reply(user_msg: str, client_name: str, biz_name: str, biz_type: str, history: Optional[List[Dict[str, str]]] = None) -> str:
+def generate_dynamic_hindi_reply(user_msg: str, client_name: str, biz_name: str, biz_type: str, history: Optional[List[Dict[str, str]]] = None, knowledge_context: Optional[str] = None) -> str:
     msg = (user_msg or "").lower().strip()
     c_name = client_name.strip() if client_name and client_name.strip().lower() not in ["ji", ""] else "सर"
     b_name = biz_name.strip() if biz_name and biz_name.strip().lower() not in ["business", "aapke business", ""] else "मायबॉट जीनी"
     hist_len = len(history) if history else 0
+
+    # PRIORITY A: If Client Knowledge Base (Trained RAG) exists, extract exact facts!
+    if knowledge_context and len(knowledge_context.strip()) > 10:
+        lines = [line.strip() for line in knowledge_context.split("\n") if line.strip()]
+        # Check for query words in trained knowledge lines
+        query_words = [w for w in re.findall(r'[A-Za-z0-9\u0900-\u097F]+', msg) if len(w) > 2 and w not in ["kya", "hai", "batao", "chahiye", "bare"]]
+        best_match = None
+        best_score = 0
+        for line in lines:
+            line_lower = line.lower()
+            score = sum(1 for w in query_words if w in line_lower)
+            if score > best_score:
+                best_score = score
+                best_match = line
+
+        if best_match and best_score > 0:
+            clean_fact = re.sub(r'^\[.*?\]:\s*', '', best_match).strip()
+            return f"हमारे उपलब्ध डेटा के अनुसार: {clean_fact}। क्या आप इस संबंध में और विस्तृत विवरण या व्हाट्सएप पर जानकारी चाहते हैं?"
 
     # 1. Festival & Occasion Greetings (Diwali / New Year / Celebration 2-Way Dialogue)
     if any(w in msg for w in ["diwali", "deepawali", "दीपावली", "दिवाली", "happy diwali", "shubhkamnaye", "शुभकामनाएं", "शुभकामनाएँ", "badhai", "बधाई", "mubarak", "मुबारक", "same to you", "सेम टू यू", "new year", "त्यौहार", "त्योहार"]):
@@ -1387,42 +1455,16 @@ def generate_dynamic_hindi_reply(user_msg: str, client_name: str, biz_name: str,
         return f"सादर धन्यवाद {c_name}! माँ लक्ष्मी की कृपा आप और आपके परिवार पर सदा बनी रहे। यह पावन पर्व आपके जीवन और व्यापार में असीम समृद्धि व खुशियाँ लेकर आए। दीपावली की हार्दिक शुभकामनाएँ!"
 
     # 2. Polite Executive Greetings
-    if any(w in msg for w in ["नमस्ते", "हैलो", "हेलो", "हाय", "namaste", "hello", "hi", "hey"]):
-        return f"सादर नमस्कार {c_name}! मैं {b_name} से सीनियर क्लाइंट कंसलटेंट बात कर रही हूँ। कृपया बताइये, आपके बिज़नेस के लिए कॉलिंग ऑटोमेशन किस प्रकार कस्टमाइज़ करें?"
+    if any(w in msg for w in ["नमस्ते", "हैलो", "हेलो", "हाय", "namaste", "hello", "hi", "hey"]) and len(msg.split()) <= 3:
+        return f"सादर नमस्कार {c_name}! मैं {b_name} से सीनियर क्लाइंट कंसलटेंट बात कर रही हूँ। कृपया बताइये, आपकी किस प्रकार सहायता कर सकती हूँ?"
 
-    # 2. Agriculture / Seeds / Beej
-    if any(w in msg for w in ["seed", "सीड्स", "बीज", "krishi", "कृषि", "kisaan", "किसान", "khet", "खेती", "gehu", "गेहूं", "chana", "चना", "soyabean", "सोयाबीन"]):
-        return "निश्चित रूप से! यदि आपका बीजों का बिज़नेस है, तो मैं आपके डीलर्स और किसान भाइयों से बेहद शालीनता से बात करूँगी—'सादर नमस्कार, मैं केडीएम सीड्स से बात कर रही हूँ। इस सीज़न के लिए हमारी उन्नत प्रमाणित हाइब्रिड बीजों की नई खेप आ चुकी है। क्या मैं आपके लिए बुकिंग या रेट-लिस्ट व्हाट्सएप पर साझा करूँ?'"
-
-    # 3. Real Estate / Plots / Flats
-    if any(w in msg for w in ["real estate", "रियल एस्टेट", "प्रॉपर्टी", "plot", "प्लॉट", "फ्लैट", "मकान", "zameen", "कॉरिडोर"]):
-        return "सादर नमस्कार! रियल एस्टेट इन्वेस्टर्स के लिए हमारी कॉलिंग का अंदाज़ कुछ इस तरह रहेगा—'नमस्कार, मैं एपेक्स रियल्टी से बात कर रही हूँ। सुपर कॉरिडोर के प्रीमियम प्लॉट्स के संबंध में आपसे संपर्क किया है। क्या इस वीकेंड आपकी साइट विज़िट प्लान करें?'"
-
-    # 4. Healthcare / Clinic / Hospital
-    if any(w in msg for w in ["clinic", "क्लिनिक", "hospital", "अस्पताल", "doctor", "डॉक्टर", "dental", "डेंटल", "मरीज़"]):
-        return "बिल्कुल! क्लिनिक के लिए हमारी टोन बेहद सौम्य और केयरिंग रहेगी—'हेलो, केयर क्लिनिक से बात कर रही हूँ। डॉक्टर के पास आज शाम 6:15 का स्लॉट उपलब्ध है। क्या आपका अपॉइंटमेंट टोकन कन्फर्म कर दिया जाए?'"
-
-    # 5. Workshop / Automobiles
-    if any(w in msg for w in ["workshop", "वर्कशॉप", "car", "कार", "गाड़ी", "service", "सर्विस"]):
-        return "ज़रूर! ऑटोमोबाइल सर्विस के लिए हम इस तरह बात करेंगे—'नमस्कार! आपकी गाड़ी की सर्विस और कम्प्लीट वाशिंग पूरी हो चुकी है। कुल बिल ₹4,850 है। क्या पिकअप गेटपास व्हाट्सएप पर शेयर कर दिया जाए?'"
-
-    # 6. Finance / Loans / Recovery
-    if any(w in msg for w in ["loan", "लोन", "finance", "फाइनेंस", "emi", "ईएमआई", "recovery"]):
-        return "निश्चित रूप से! बैंकिंग और ईएमआई के लिए टोन पूरी तरह डिग्निफाइड रहेगी—'नमस्कार, फिनकॉर्प से बात कर रही हूँ। आपके लोन खाते की ₹4,500 की ईएमआई ड्यू है। क्या त्वरित 1-टैप यूपीआई लिंक आपके व्हाट्सएप पर साझा करूँ?'"
-
-    # 7. Numbers / Volume of calls (e.g. 10 se 15, 50, 100)
-    if any(w in msg for w in ["10", "15", "20", "25", "30", "50", "100", "500", "हज़ार", "दस", "पंद्रह", "बीस", "पचास", "सौ", "रोज", "daily"]):
-        return f"बिल्कुल, {user_msg.strip()} हाई-प्रायोरिटी कॉल्स तो हमारी ऑटोमेशन कुछ ही मिनटों में मुकम्मल कर लेगी। इसके साथ ही क्या आप चाहेंगे कि कॉल समाप्त होते ही आपका ऑफिशियल कैटलॉग या रेट-कार्ड सीधे उनके व्हाट्सएप पर चला जाए?"
-
-    # 8. Pricing & Commercials
-    if any(w in msg for w in ["kitna paisa", "kitna kharcha", "rate", "cost", "price", "kitna lagega", "charge", "fees", "रुपये"]):
+    # 3. Direct Pricing / Rate Inquiries
+    if any(w in msg for w in ["price", "rate", "cost", "kharcha", "kitna lagega", "fees", "रुपये", "रेट", "भाव", "दाम", "कीमत"]):
+        if knowledge_context:
+            return f"सादर नमस्कार! हमारे पास दर सूची उपलब्ध है, कृपया विशिष्ट उत्पाद या सेवा का नाम बताएं ताकि मैं सही रेट बता सकूँ।"
         return "कॉल जीनी का कमर्शियल मॉडल बहुत ही पारदर्शी है—मात्र ₹5 प्रति मिनट का फ्लैट रेट! कोई हिडन सेटअप चार्ज नहीं है।"
 
-    # 9. Approvals & WhatsApp
-    if any(w in msg for w in ["haan", "ha", "yes", "bhejo", "bhej do", "भेजो", "हाँ", "हा", "बिल्कुल", "ज़रूर", "sure"]):
-        return "शानदार! हमारे सिस्टम से संबंधित सम्पूर्ण कॉर्पोरेट ब्रोशर और ऑनबोर्डिंग विवरण तुरंत आपके व्हाट्सएप पर प्रेषित किए जा रहे हैं।"
-
-    # 10. Universal Business Turn-based Progression (High-Class Executive Tone)
+    # 4. Turn-based General Discovery
     turn_responses = [
         f"सादर नमस्कार {c_name}! आपके इस बिज़नेस के लिए हमारी एआई कॉलिंग आपके ग्राहकों को बेहद प्रतिष्ठित और शालीन अंदाज़ में अटेंड करेगी। आप प्रतिदिन लगभग कितने संपर्कों पर आउटबाउंड कॉलिंग प्लान कर रहे हैं?",
         "बिल्कुल! हर कॉल के पश्चात हमारा सिस्टम क्लाइंट्स को तुरंत आधिकारिक व्हाट्सएप विवरण भी डिलीवर करता है। क्या आप इसमें अपना कस्टमाइज़्ड ब्रोशर जोड़ना चाहेंगे?",
@@ -1561,7 +1603,8 @@ async def voice_chat_endpoint(chat_in: VoiceChatRequest, request: Request, db: A
             active_name,
             chat_in.business_name or "MyBot Genie",
             chat_in.business_type or "AI Calling Solution",
-            chat_in.conversation_history
+            chat_in.conversation_history,
+            knowledge_context=k_context
         )
 
     clean_speech_text = ai_reply.replace("*", "").replace("#", "").replace("_", "").strip()
@@ -3468,3 +3511,34 @@ async def delete_knowledge_document(
     await db.delete(doc)
     await db.commit()
     return {"status": "success", "message": "Knowledge document deleted from AI brain."}
+
+
+@app.get("/api/telephony/test-exotel/{phone_number}")
+async def test_exotel_diagnostic(phone_number: str):
+    """
+    Direct browser diagnostic endpoint to test Exotel connection and credentials.
+    Usage: https://call-genie-bs6x.onrender.com/api/telephony/test-exotel/9425329851
+    """
+    res = await ExotelService.trigger_outbound_call(to_phone=phone_number)
+    return {
+        "status": "diagnostic_complete",
+        "configured_sid": (settings.EXOTEL_SID[:4] + "***") if settings.EXOTEL_SID else "MISSING (Set in Render)",
+        "configured_caller_id": settings.EXOTEL_CALLER_NUMBER or "MISSING (Set in Render)",
+        "subdomain": settings.EXOTEL_SUBDOMAIN,
+        "target_phone": phone_number,
+        "exotel_result": res
+    }
+
+
+@app.get("/api/telephony/exoml/voice", response_class=Response)
+@app.post("/api/telephony/exoml/voice", response_class=Response)
+async def exoml_voice_handler(request: Request):
+    """
+    ExoML Response Endpoint for Exotel Outbound Voice Calls.
+    Returns valid XML so Exotel's voice gateway immediately speaks the AI greeting!
+    """
+    xml_content = """<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Say>Namaste! Main Call Genie AI se baat kar raha hoon. Aapki AI Voice Call safaltapoorvak connect ho gayi hai. MyBot Genie Indore me aapka swagat hai.</Say>
+</Response>"""
+    return Response(content=xml_content, media_type="application/xml")
