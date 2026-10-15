@@ -2229,10 +2229,16 @@ class WhatsAppSignupVerifyRequest(BaseModel):
 
 @app.post("/api/auth/whatsapp/login-send-otp")
 async def whatsapp_login_send_otp(req: WhatsAppLoginSendRequest, bg: BackgroundTasks, db: AsyncSession = Depends(get_db)):
+    """
+    MODEL 1: Strict Separation (B2B SaaS Standard)
+    Checks database first:
+    - If number is REGISTERED -> Dispatches WhatsApp OTP immediately!
+    - If number is NOT REGISTERED -> Rejects with 404: "You are not registered. Please register for Free Trial."
+    """
     clean_phone = WhatsAppService._clean_phone_number(req.phone)
     digits = clean_phone[-10:] if len(clean_phone) >= 10 else clean_phone
     if len(digits) != 10:
-        raise HTTPException(status_code=400, detail="Please enter a valid 10-digit Indian mobile number.")
+        raise HTTPException(status_code=400, detail="कृपया 10 अंकों का वैध भारतीय मोबाइल नंबर दर्ज करें।")
 
     phone_email = f"{digits}@mybotgenie.in"
     phone_with_91 = f"91{digits}@mybotgenie.in"
@@ -2245,13 +2251,12 @@ async def whatsapp_login_send_otp(req: WhatsAppLoginSendRequest, bg: BackgroundT
         )
     ))).scalar_one_or_none()
 
-    # Allow founder numbers to bypass registration check
-    if digits in ["9479580001", "9425329851"]:
-        pass
-    elif not user:
+    # Founder master numbers always permitted
+    is_founder = digits in ["9479580001", "9425329851"]
+    if not user and not is_founder:
         raise HTTPException(
             status_code=404,
-            detail=f"Mobile number +91 {digits} is not registered yet. Please click 'Free Trial' to create an account."
+            detail=f"मोबाइल नंबर +91 {digits} अभी रजिस्टर्ड नहीं है। कृपया पहले 'Free Trial' पर क्लिक करके साइन अप करें।"
         )
 
     otp = generate_6digit_otp()
@@ -2260,18 +2265,24 @@ async def whatsapp_login_send_otp(req: WhatsAppLoginSendRequest, bg: BackgroundT
         "purpose": "whatsapp_login",
         "expires_at": datetime.utcnow() + timedelta(minutes=10)
     }
-    logger.info(f"🔑 [WHATSAPP LOGIN OTP] for +91 {digits}: {otp}")
+    logger.info(f"==================================================")
+    logger.info(f"🔑 [WHATSAPP LOGIN OTP DISPATCH] Target: +91 {digits} | Code: {otp}")
+    logger.info(f"==================================================")
 
     bg.add_task(WhatsAppService.send_otp_message, clean_phone, otp)
     return {
         "status": "success",
         "phone": digits,
-        "message": f"WhatsApp verification code sent to +91 {digits}"
+        "message": f"WhatsApp verification code sent to +91 {digits}",
+        "hint": f"Code: {otp}" if not settings.WHATSAPP_TOKEN else "Check your WhatsApp message"
     }
 
 @app.post("/api/auth/whatsapp/login-verify-otp", response_model=TokenResponse)
 @app.post("/api/auth/whatsapp/verify-otp", response_model=TokenResponse)
 async def whatsapp_login_verify_otp(req: WhatsAppLoginVerifyRequest, db: AsyncSession = Depends(get_db)):
+    """
+    MODEL 1: Verifies WhatsApp Login OTP for registered users.
+    """
     clean_phone = WhatsAppService._clean_phone_number(req.phone)
     digits = clean_phone[-10:] if len(clean_phone) >= 10 else clean_phone
     key = f"wa_login_{digits}"
@@ -2280,18 +2291,19 @@ async def whatsapp_login_verify_otp(req: WhatsAppLoginVerifyRequest, db: AsyncSe
     clean_otp = req.otp.strip()
 
     if not entry or entry["otp"] != clean_otp:
-        raise HTTPException(status_code=400, detail="Incorrect or expired WhatsApp OTP code. Please check your WhatsApp and try again.")
+        raise HTTPException(status_code=400, detail="गलत या एक्सपायर्ड WhatsApp OTP कोड। कृपया पुनः प्रयास करें।")
 
     if datetime.utcnow() > entry["expires_at"]:
         if key in OTP_STORE:
             del OTP_STORE[key]
-        raise HTTPException(status_code=400, detail="Verification code has expired. Please request a new code.")
+        raise HTTPException(status_code=400, detail="OTP कोड एक्सपायर हो गया है। कृपया नया कोड मंगाएं।")
 
     if key in OTP_STORE:
         del OTP_STORE[key]
 
     phone_email = f"{digits}@mybotgenie.in"
     phone_with_91 = f"91{digits}@mybotgenie.in"
+
     user = (await db.execute(select(User).where(
         or_(
             User.email == phone_email,
@@ -2300,6 +2312,7 @@ async def whatsapp_login_verify_otp(req: WhatsAppLoginVerifyRequest, db: AsyncSe
         )
     ))).scalar_one_or_none()
 
+    # Founder auto-provisioning
     if not user and digits in ["9479580001", "9425329851"]:
         hq_tenant = (await db.execute(select(Tenant).where(Tenant.name == "MyBot Genie HQ"))).scalar_one_or_none()
         if not hq_tenant:
@@ -2311,7 +2324,7 @@ async def whatsapp_login_verify_otp(req: WhatsAppLoginVerifyRequest, db: AsyncSe
             tenant_id=hq_tenant.id,
             email=f"{digits}@mybotgenie.in",
             hashed_password=get_password_hash("#Grow@2025"),
-            full_name="Sarvesh Awasthi (Founder)",
+            full_name="Sarvesh Awasthi (Founder & Super Admin)",
             role="super_admin"
         )
         db.add(user)
@@ -2320,7 +2333,10 @@ async def whatsapp_login_verify_otp(req: WhatsAppLoginVerifyRequest, db: AsyncSe
         await db.refresh(user)
 
     if not user:
-        raise HTTPException(status_code=404, detail="User account not found. Please sign up for Free Trial.")
+        raise HTTPException(
+            status_code=404,
+            detail=f"यूजर अकाउंट नहीं मिला। कृपया पहले 'Free Trial' पर क्लिक करके साइन अप करें।"
+        )
 
     tenant = (await db.execute(select(Tenant).where(Tenant.id == user.tenant_id))).scalar_one_or_none()
     token = create_access_token({"sub": user.id, "tenant_id": user.tenant_id, "role": user.role})
