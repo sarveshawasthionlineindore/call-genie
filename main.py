@@ -1462,23 +1462,36 @@ async def voice_chat_endpoint(chat_in: VoiceChatRequest, request: Request, db: A
     
     # DYNAMIC ENTERPRISE KNOWLEDGE INJECTION (Voice RAG 2.0)
     k_context = (chat_in.knowledge_context or "").strip()
-    if not k_context and (chat_in.tenant_id or chat_in.agent_id):
+    active_tenant = chat_in.tenant_id
+
+    # Auto-extract tenant_id from Bearer token if not explicitly passed in body
+    if not active_tenant:
+        auth_hdr = request.headers.get("authorization", "")
+        if auth_hdr.startswith("Bearer "):
+            try:
+                token_val = auth_hdr.split(" ")[1]
+                payload = jwt.decode(token_val, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
+                active_tenant = payload.get("tenant_id")
+            except Exception:
+                pass
+
+    if not k_context and (active_tenant or chat_in.agent_id):
         try:
             stmt = select(KnowledgeDocument)
-            if chat_in.tenant_id:
-                stmt = stmt.where(KnowledgeDocument.tenant_id == chat_in.tenant_id)
+            if active_tenant:
+                stmt = stmt.where(KnowledgeDocument.tenant_id == active_tenant)
             elif chat_in.agent_id:
                 ag = (await db.execute(select(Agent).where(Agent.id == chat_in.agent_id))).scalar_one_or_none()
                 if ag:
                     stmt = stmt.where(KnowledgeDocument.tenant_id == ag.tenant_id)
             docs = (await db.execute(stmt.order_by(desc(KnowledgeDocument.created_at)).limit(5))).scalars().all()
             if docs:
-                k_context = "\n\n".join([f"[{d.title}]: {d.content[:1200]}" for d in docs])
+                k_context = "\n\n".join([f"[{d.title}]: {d.content[:1500]}" for d in docs])
         except Exception as k_err:
             logger.warning(f"Knowledge context fetch note: {k_err}")
 
     if k_context:
-        system_prompt += "\n\n--- OFFICIAL BUSINESS KNOWLEDGE BASE & FACTS (Strict Truth - Cite accurately, do not invent prices or schedules) ---\n" + k_context[:3500]
+        system_prompt += "\n\n--- OFFICIAL BUSINESS KNOWLEDGE BASE & FACTS (Strict Truth - Cite accurately, do not invent prices or schedules) ---\n" + k_context[:4000]
 
     ai_reply = None
 
