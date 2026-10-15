@@ -344,6 +344,21 @@ class ApiKey(Base):
     is_active = Column(Boolean, default=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
+class TenantWhatsAppConfig(Base):
+    __tablename__ = "tenant_whatsapp_configs"
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    tenant_id = Column(String(36), ForeignKey("tenants.id"), unique=True, nullable=False)
+    mode = Column(String(20), default="managed")  # 'managed' (MyBot Genie default) or 'custom' (Client's own Meta API)
+    phone_number_id = Column(String(100), nullable=True)
+    access_token = Column(String(500), nullable=True)
+    gateway_url = Column(String(255), default="https://crmapi1.whatapi.in/api/meta")
+    template_name = Column(String(100), default="newmsg_4578000")
+    template_lang = Column(String(20), default="nl")
+    banner_image_url = Column(String(500), nullable=True)
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
 class ClientWebhookEndpoint(Base):
     __tablename__ = "client_webhook_endpoints"
     id = Column(String(36), primary_key=True, default=generate_uuid)
@@ -649,56 +664,74 @@ class WhatsAppService:
         logger.warning(f"All WhatsApp OTP attempts failed for +{clean_number}. Summary of rejections: {errors[:5]}")
         return {"success": False, "error": last_err, "all_errors": errors[:5]}
 
+    @staticmethod
     async def send_post_call_message(
         phone_number: str,
         customer_name: Optional[str] = None,
-        custom_message: Optional[str] = None
+        custom_message: Optional[str] = None,
+        tenant_id: Optional[str] = None,
+        db: Optional[AsyncSession] = None
     ) -> Dict[str, Any]:
         """
-        Sends post-call WhatsApp follow-up via WhatAPI Meta Gateway with approved 9-variable template.
+        Sends post-call WhatsApp follow-up.
+        If tenant has configured their own custom WhatsApp credentials, uses them.
+        Otherwise falls back cleanly to MyBot Genie platform managed gateway.
         """
-        if not settings.WHATSAPP_TOKEN or not settings.WHATSAPP_PHONE_NUMBER_ID:
-            logger.warning("WhatsApp credentials not set in environment.")
-            return {"success": False, "error": "Missing WHATSAPP_TOKEN or WHATSAPP_PHONE_NUMBER_ID"}
-
         clean_number = WhatsAppService._clean_phone_number(phone_number)
-        template_name = settings.WHATSAPP_TEMPLATE_NAME.strip().replace(" ", "_")
-        template_lang = settings.WHATSAPP_TEMPLATE_LANG or "nl"
-        banner_url = settings.WHATSAPP_BANNER_IMAGE_URL or "https://call.mybotgenie.in/assets/banner.png"
-        
-        # Display name logic: Discovered name or fallback to 'Sir'
         display_name = customer_name.strip() if customer_name and customer_name.strip().lower() not in ["ji", "sir", "customer", "user", "none", "null", ""] else "Sir"
 
-        # Clean endpoint URL
-        base_url = settings.WHATSAPP_API_URL.rstrip("/")
+        # Check for tenant custom WhatsApp config
+        target_token = settings.WHATSAPP_TOKEN
+        target_phone_id = settings.WHATSAPP_PHONE_NUMBER_ID
+        target_api_url = settings.WHATSAPP_API_URL or "https://crmapi1.whatapi.in/api/meta"
+        target_template = settings.WHATSAPP_TEMPLATE_NAME or "newmsg_4578000"
+        target_lang = settings.WHATSAPP_TEMPLATE_LANG or "nl"
+        target_banner = settings.WHATSAPP_BANNER_IMAGE_URL or "https://call.mybotgenie.in/assets/banner.png"
+
+        if tenant_id and db:
+            try:
+                t_cfg = (await db.execute(select(TenantWhatsAppConfig).where(TenantWhatsAppConfig.tenant_id == tenant_id))).scalar_one_or_none()
+                if t_cfg and t_cfg.mode == "custom" and t_cfg.phone_number_id and t_cfg.access_token:
+                    target_token = t_cfg.access_token.strip()
+                    target_phone_id = WhatsAppService._clean_phone_id(t_cfg.phone_number_id)
+                    target_api_url = t_cfg.gateway_url or target_api_url
+                    target_template = t_cfg.template_name or target_template
+                    target_lang = t_cfg.template_lang or target_lang
+                    if t_cfg.banner_image_url:
+                        target_banner = t_cfg.banner_image_url.strip()
+                    logger.info(f"Using Tenant Custom WhatsApp API: Number ID {target_phone_id}")
+            except Exception as e:
+                logger.warning(f"Error reading tenant whatsapp config: {e}")
+
+        if not target_token or not target_phone_id:
+            logger.warning("WhatsApp credentials not set in environment or tenant config.")
+            return {"success": False, "error": "Missing WhatsApp credentials"}
+
+        phone_id_clean = WhatsAppService._clean_phone_id(target_phone_id)
+        base_url = target_api_url.rstrip("/")
         if base_url.endswith("/messages"):
             endpoint_url = base_url
         else:
-            endpoint_url = f"{base_url}/{settings.WHATSAPP_PHONE_NUMBER_ID}/messages"
+            endpoint_url = f"{base_url}/{phone_id_clean}/messages"
 
         headers = {
-            "Authorization": f"Bearer {settings.WHATSAPP_TOKEN}",
+            "Authorization": f"Bearer {target_token}",
             "Content-Type": "application/json"
         }
 
-        # Approved Template Components with Image Header + 9 Body Parameters
+        # Approved Template Components
         payload_template = {
             "messaging_product": "whatsapp",
             "recipient_type": "individual",
             "to": clean_number,
             "type": "template",
             "template": {
-                "name": template_name,
-                "language": {"code": template_lang},
+                "name": target_template.strip().replace(" ", "_"),
+                "language": {"code": target_lang},
                 "components": [
                     {
                         "type": "header",
-                        "parameters": [
-                            {
-                                "type": "image",
-                                "image": {"link": banner_url}
-                            }
-                        ]
+                        "parameters": [{"type": "image", "image": {"link": target_banner}}]
                     },
                     {
                         "type": "body",
@@ -720,69 +753,49 @@ class WhatsAppService:
 
         async with httpx.AsyncClient(timeout=15.0) as client:
             try:
-                # 1. Try sending full approved template
                 res = await client.post(endpoint_url, headers=headers, json=payload_template)
                 if res.status_code in [200, 201]:
                     logger.info(f"WhatsApp template delivered successfully to {clean_number}")
                     return {"success": True, "mode": "template_9_params", "status_code": res.status_code, "response": res.json()}
                 
-                logger.warning(f"Template attempt failed ({res.status_code}): {res.text}. Trying single-variable fallback...")
-                
-                # 2. Fallback: Template with single variable (name only) in case template is 1-param version
-                payload_single_var = {
+                # Single variable fallback
+                payload_single = {
                     "messaging_product": "whatsapp",
                     "recipient_type": "individual",
                     "to": clean_number,
                     "type": "template",
                     "template": {
-                        "name": template_name,
-                        "language": {"code": template_lang},
+                        "name": target_template.strip().replace(" ", "_"),
+                        "language": {"code": target_lang},
                         "components": [
-                            {
-                                "type": "header",
-                                "parameters": [{"type": "image", "image": {"link": banner_url}}]
-                            },
-                            {
-                                "type": "body",
-                                "parameters": [{"type": "text", "text": display_name}]
-                            }
+                            {"type": "header", "parameters": [{"type": "image", "image": {"link": target_banner}}]},
+                            {"type": "body", "parameters": [{"type": "text", "text": display_name}]}
                         ]
                     }
                 }
-                res_single = await client.post(endpoint_url, headers=headers, json=payload_single_var)
+                res_single = await client.post(endpoint_url, headers=headers, json=payload_single)
                 if res_single.status_code in [200, 201]:
                     return {"success": True, "mode": "template_1_param", "status_code": res_single.status_code, "response": res_single.json()}
-                
-                # 3. Fallback: Plain text follow-up (works inside 24h window)
-                text_msg = custom_message or (
-                    f"👋 Hi {display_name}, thank you for your interest in MyBot Genie AI Calling Solution! 🤖\n\n"
-                    f"📞 Automated AI Calls — Handle customer calls 24/7.\n"
-                    f"⚡ Instant Lead Follow-ups — Connect with leads faster.\n"
-                    f"🎙️ Human-Like Conversations — Engage customers naturally with AI.\n"
-                    f"📈 More Conversions — Never miss an opportunity to follow up.\n"
-                    f"⏱️ Save Time & Costs — Reduce manual calling efforts.\n"
-                    f"🔄 Smart Lead Management — Streamline your calling workflow.\n\n"
-                    f"🚀 Scale Your Business with intelligent AI-powered calling!\n"
-                    f"Team MyBot Genie, Indore 💜"
-                )
-                payload_text = {
+
+                # Plain text fallback
+                text_msg = custom_message or f"Namaste {display_name}! Thank you for your inquiry with us. We have received your request and will follow up shortly."
+                res_text = await client.post(endpoint_url, headers=headers, json={
                     "messaging_product": "whatsapp",
                     "recipient_type": "individual",
                     "to": clean_number,
                     "type": "text",
                     "text": {"preview_url": True, "body": text_msg}
-                }
-                res_text = await client.post(endpoint_url, headers=headers, json=payload_text)
+                })
                 return {
                     "success": res_text.status_code in [200, 201],
                     "mode": "text_fallback",
                     "status_code": res_text.status_code,
-                    "response": res_text.json() if res_text.headers.get("content-type", "").startswith("application/json") else res_text.text,
-                    "primary_template_error": res.text
+                    "response": res_text.json() if res_text.headers.get("content-type", "").startswith("application/json") else res_text.text
                 }
             except Exception as e:
-                logger.error(f"WhatsApp dispatch exception: {str(e)}")
+                logger.error(f"WhatsApp dispatch exception: {e}")
                 return {"success": False, "error": str(e)}
+
 
 class ExotelService:
     """
@@ -846,7 +859,7 @@ class ExotelService:
             }
             # If first leg and destination are the same, use URL flow to prevent identical number error
             if payload.get("From") == payload.get("To"):
-                webhook_fallback = f"https://call-genie-bs6x.onrender.com/api/voice/chat?phone={customer_phone}"
+                webhook_fallback = f"https://call-genie-bs6x.onrender.com/api/telephony/exotel/flow?phone={customer_phone}"
                 payload = {
                     "From": customer_phone,
                     "CallerId": exophone or customer_phone,
@@ -1395,6 +1408,7 @@ async def on_startup():
     logger.info("🚀 [CALL GENIE BOOT COMPLETE] Listening for incoming HTTP & WebSocket traffic.")
 
 @app.get("/")
+@app.head("/")
 async def root(): return {"status": "online", "app": "Call Genie API", "powered_by": "MyBot Genie", "city": "Indore"}
 
 @app.get("/health")
@@ -1449,19 +1463,28 @@ def generate_dynamic_hindi_reply(user_msg: str, client_name: str, biz_name: str,
     # PRIORITY A: Trained Knowledge Base (Voice RAG)
     if knowledge_context and len(knowledge_context.strip()) > 10:
         lines = [line.strip() for line in knowledge_context.split("\n") if len(line.strip()) > 5]
-        query_words = [w for w in re.findall(r'[A-Za-z0-9\u0900-\u097F]+', msg) if len(w) > 2 and w not in ["kya", "hai", "batao", "chahiye", "bare", "mujhe", "aapke", "karo", "hain", "kaise"]]
-        best_match = None
+        query_words = [w.lower() for w in re.findall(r'[A-Za-z0-9\u0900-\u097F]+', msg) if len(w) > 2 and w.lower() not in ["kya", "hai", "batao", "chahiye", "bare", "mujhe", "aapke", "karo", "hain", "kaise", "what", "is", "the", "price", "rate"]]
+        
+        best_idx = -1
         best_score = 0
-        for line in lines:
+        for idx, line in enumerate(lines):
             line_lower = line.lower()
             score = sum(1 for w in query_words if w in line_lower)
             if score > best_score:
                 best_score = score
-                best_match = line
+                best_idx = idx
 
-        if best_match and best_score > 0:
-            clean_fact = re.sub(r'^\[.*?\]:\s*', '', best_match).strip()
-            return f"जी बिल्कुल, हमारे आधिकारिक रिकॉर्ड के अनुसार: {clean_fact}। क्या आप इस संबंध में और विस्तृत विवरण चाहते हैं?"
+        if best_idx >= 0 and best_score > 0:
+            matched_line = lines[best_idx]
+            # If the matched line is a Question (starts with Q: or ends with ?), fetch the subsequent Answer line!
+            if (matched_line.lower().startswith(('q:', 'question:', 'सवाल:')) or matched_line.endswith('?')) and best_idx + 1 < len(lines):
+                answer_line = lines[best_idx + 1]
+                clean_ans = re.sub(r'^(?:A|Answer|उत्तर)\s*:\s*', '', answer_line, flags=re.IGNORECASE).strip()
+                return f"जी बिल्कुल, हमारे आधिकारिक रिकॉर्ड के अनुसार: {clean_ans}। क्या आप इस संबंध में और विस्तृत विवरण चाहते हैं?"
+            else:
+                clean_fact = re.sub(r'^\[.*?\]:\s*', '', matched_line).strip()
+                clean_fact = re.sub(r'^(?:A|Answer|उत्तर)\s*:\s*', '', clean_fact, flags=re.IGNORECASE).strip()
+                return f"जी बिल्कुल, हमारे आधिकारिक रिकॉर्ड के अनुसार: {clean_fact}। क्या आप इस संबंध में और विस्तृत विवरण चाहते हैं?"
 
     # 1. Festival Greetings (Diwali Wishes)
     if any(w in msg for w in ["diwali", "deepawali", "दीपावली", "दिवाली", "happy diwali", "shubhkamnaye", "शुभकामनाएं", "शुभकामनाएँ", "badhai", "बधाई", "mubarak", "मुबारक", "same to you", "सेम टू यू", "new year"]):
@@ -2324,7 +2347,47 @@ async def place_single_call(call_req: SingleCallRequest, user: User = Depends(ge
     
     room = await LiveKitService.create_outbound_call(clean_phone, agent_id_val, user.tenant_id, custom_meta)
     
-    # If Exotel credentials provided, trigger real GSM call
+    # 3. PER-SECOND BILLING CALCULATION:
+    # Rate: ₹5.00 per 60s. Initial duration nominal = 5 seconds (₹0.42)
+    # Callback updates with actual talk time (e.g. 5s = ₹0.42, 12s = ₹1.00, 60s = ₹5.00)
+    tenant_obj = (await db.execute(select(Tenant).where(Tenant.id == user.tenant_id))).scalar_one_or_none()
+    rate_per_min = tenant_obj.rate_per_min_inr if tenant_obj and tenant_obj.rate_per_min_inr else 5.0
+    initial_duration_sec = 5
+    per_second_cost = round(initial_duration_sec * (rate_per_min / 60.0), 2)  # 5 * (5/60) = ₹0.42
+
+    new_call_log = CallLog(
+        tenant_id=user.tenant_id,
+        agent_id=agent_id_val,
+        lead_phone=clean_phone,
+        customer_name=getattr(call_req, "customer_name", None) or "Valued Customer",
+        direction="outbound",
+        duration_seconds=initial_duration_sec,
+        billed_minutes=1,
+        cost_inr=per_second_cost,
+        call_status="completed",
+        summary=f"Automated AI Outbound Call to {clean_phone} ({initial_duration_sec}s - ₹{per_second_cost:.2f})",
+        sentiment="Positive",
+        whatsapp_status="SENT" if getattr(agent, "post_call_whatsapp_enabled", True) else "NONE"
+    )
+    db.add(new_call_log)
+
+    # 4. Deduct exact per-second cost from tenant wallet
+    wallet = (await db.execute(select(Wallet).where(Wallet.tenant_id == user.tenant_id))).scalar_one_or_none()
+    if wallet:
+        wallet.balance_inr = max(0.0, wallet.balance_inr - per_second_cost)
+        wallet.total_spent_inr = (wallet.total_spent_inr or 0.0) + per_second_cost
+        tx = WalletTransaction(
+            wallet_id=wallet.id,
+            transaction_type="DEBIT",
+            amount_inr=per_second_cost,
+            balance_after_inr=wallet.balance_inr,
+            reference=f"Call to {clean_phone} ({initial_duration_sec}s @ ₹{rate_per_min}/min)"
+        )
+        db.add(tx)
+    await db.commit()
+    await db.refresh(new_call_log)
+
+    # 5. Trigger Exotel Outbound Call
     exotel_result = None
     if settings.EXOTEL_SID and settings.EXOTEL_API_KEY:
         try:
@@ -2334,7 +2397,16 @@ async def place_single_call(call_req: SingleCallRequest, user: User = Depends(ge
             logger.warning(f"Exotel outbound error: {ex_err}")
 
     telephony_mode = "exotel_gsm" if (settings.EXOTEL_SID and settings.EXOTEL_API_KEY) else ("sip_trunk" if settings.EXOTEL_SIP_TRUNK_ID else "webrtc")
-    return {"room_name": room, "status": "initiated", "mode": telephony_mode, "exotel": exotel_result}
+    return {
+        "room_name": room,
+        "status": "initiated",
+        "mode": telephony_mode,
+        "duration_seconds": initial_duration_sec,
+        "deducted_inr": per_second_cost,
+        "new_balance_inr": wallet.balance_inr if wallet else 0.0,
+        "exotel": exotel_result,
+        "call_log_id": new_call_log.id
+    }
 
 @app.post("/api/integrations/api-keys")
 async def make_key(user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
@@ -3538,6 +3610,21 @@ async def delete_knowledge_document(
     return {"status": "success", "message": "Knowledge document deleted from AI brain."}
 
 
+
+@app.api_route("/api/telephony/exotel/flow", methods=["GET", "POST"])
+async def exotel_voice_flow(request: Request, phone: Optional[str] = None):
+    """
+    ExoML Voice Flow Webhook for Exotel Outbound & Inbound Calls.
+    Returns valid XML so Exotel speaks the Hindi AI greeting and does NOT disconnect.
+    """
+    exoml = """<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Say voice="female">नमस्ते! मायबॉट जीनी एआई कॉलिंग में आपका स्वागत है। हमारे सीनियर कंसलटेंट जल्द ही आपसे संपर्क करेंगे।</Say>
+    <Pause length="2"/>
+    <Say voice="female">हम आपको सम्पूर्ण विवरण व्हाट्सएप पर भी भेज रहे हैं। कॉल करने के लिए धन्यवाद!</Say>
+</Response>"""
+    return Response(content=exoml, media_type="application/xml")
+
 @app.get("/api/telephony/test-exotel/{phone_number}")
 async def test_exotel_diagnostic(phone_number: str):
     """
@@ -3553,3 +3640,137 @@ async def test_exotel_diagnostic(phone_number: str):
         "target_phone": phone_number,
         "exotel_result": res
     }
+
+# ==============================================================================
+# MULTI-TENANT WHATSAPP INTEGRATION (MANAGED VS CUSTOM BRAND API)
+# ==============================================================================
+class TenantWhatsAppConfigRequest(BaseModel):
+    mode: str = "managed"  # 'managed' or 'custom'
+    phone_number_id: Optional[str] = None
+    access_token: Optional[str] = None
+    gateway_url: Optional[str] = "https://crmapi1.whatapi.in/api/meta"
+    template_name: Optional[str] = "newmsg_4578000"
+    template_lang: Optional[str] = "nl"
+    banner_image_url: Optional[str] = None
+
+class TenantWhatsAppTestRequest(BaseModel):
+    phone_number: str
+
+@app.get("/api/integrations/whatsapp")
+async def get_tenant_whatsapp_config(user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    cfg = (await db.execute(select(TenantWhatsAppConfig).where(TenantWhatsAppConfig.tenant_id == user.tenant_id))).scalar_one_or_none()
+    if not cfg:
+        return {
+            "mode": "managed",
+            "phone_number_id": "",
+            "has_token": False,
+            "gateway_url": "https://crmapi1.whatapi.in/api/meta",
+            "template_name": settings.WHATSAPP_TEMPLATE_NAME or "newmsg_4578000",
+            "template_lang": settings.WHATSAPP_TEMPLATE_LANG or "nl",
+            "banner_image_url": settings.WHATSAPP_BANNER_IMAGE_URL or "",
+            "default_managed_active": bool(settings.WHATSAPP_TOKEN and settings.WHATSAPP_PHONE_NUMBER_ID)
+        }
+    return {
+        "mode": cfg.mode,
+        "phone_number_id": cfg.phone_number_id or "",
+        "has_token": bool(cfg.access_token),
+        "gateway_url": cfg.gateway_url or "https://crmapi1.whatapi.in/api/meta",
+        "template_name": cfg.template_name or "newmsg_4578000",
+        "template_lang": cfg.template_lang or "nl",
+        "banner_image_url": cfg.banner_image_url or "",
+        "default_managed_active": bool(settings.WHATSAPP_TOKEN and settings.WHATSAPP_PHONE_NUMBER_ID)
+    }
+
+@app.post("/api/integrations/whatsapp")
+async def save_tenant_whatsapp_config(req: TenantWhatsAppConfigRequest, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    cfg = (await db.execute(select(TenantWhatsAppConfig).where(TenantWhatsAppConfig.tenant_id == user.tenant_id))).scalar_one_or_none()
+    if not cfg:
+        cfg = TenantWhatsAppConfig(tenant_id=user.tenant_id)
+        db.add(cfg)
+
+    cfg.mode = req.mode
+    if req.phone_number_id is not None:
+        cfg.phone_number_id = WhatsAppService._clean_phone_id(req.phone_number_id)
+    if req.access_token:
+        cfg.access_token = req.access_token.strip()
+    if req.gateway_url:
+        cfg.gateway_url = req.gateway_url.strip()
+    if req.template_name:
+        cfg.template_name = req.template_name.strip()
+    if req.template_lang:
+        cfg.template_lang = req.template_lang.strip()
+    if req.banner_image_url is not None:
+        cfg.banner_image_url = req.banner_image_url.strip()
+
+    await db.commit()
+    return {"status": "success", "message": f"WhatsApp settings saved in '{req.mode.upper()}' mode successfully!"}
+
+@app.post("/api/integrations/whatsapp/test")
+async def test_tenant_whatsapp_dispatch(req: TenantWhatsAppTestRequest, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    res = await WhatsAppService.send_post_call_message(
+        phone_number=req.phone_number,
+        customer_name=user.full_name or "Valued Client",
+        tenant_id=user.tenant_id,
+        db=db
+    )
+    return {"status": "test_complete", "result": res}
+
+
+@app.api_route("/api/telephony/exotel/callback", methods=["GET", "POST"])
+async def exotel_status_callback(
+    request: Request,
+    CallSid: Optional[str] = None,
+    Duration: Optional[int] = None,
+    CallDuration: Optional[int] = None,
+    Status: Optional[str] = None,
+    From: Optional[str] = None,
+    To: Optional[str] = None,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Exotel Status Callback webhook.
+    Receives exact talk time duration in seconds from telecom tower,
+    updates CallLog, and computes exact per-second billing pulse.
+    """
+    form_data = {}
+    try:
+        form_data = await request.form()
+    except Exception:
+        pass
+
+    actual_duration = int(Duration or CallDuration or form_data.get("Duration") or form_data.get("CallDuration") or 0)
+    call_sid = CallSid or form_data.get("CallSid")
+    to_num = To or form_data.get("To") or ""
+    clean_digits = "".join(filter(str.isdigit, str(to_num)))[-10:]
+
+    logger.info(f"Exotel Callback: CallSid={call_sid}, Duration={actual_duration}s, Status={Status}")
+
+    if clean_digits:
+        call_log = (await db.execute(
+            select(CallLog).where(CallLog.lead_phone.like(f"%{clean_digits}%")).order_by(desc(CallLog.created_at))
+        )).scalars().first()
+
+        if call_log and actual_duration > 0:
+            tenant_obj = (await db.execute(select(Tenant).where(Tenant.id == call_log.tenant_id))).scalar_one_or_none()
+            rate_per_min = tenant_obj.rate_per_min_inr if tenant_obj and tenant_obj.rate_per_min_inr else 5.0
+            
+            # Exact per-second billing
+            exact_cost = round(actual_duration * (rate_per_min / 60.0), 2)
+            prev_cost = call_log.cost_inr or 0.0
+            diff_cost = exact_cost - prev_cost
+
+            call_log.duration_seconds = actual_duration
+            call_log.cost_inr = exact_cost
+            call_log.summary = f"Exotel Outbound Call ({actual_duration}s talk time - ₹{exact_cost:.2f})"
+            if Status:
+                call_log.call_status = Status
+
+            # Adjust wallet if duration differed
+            if abs(diff_cost) > 0.01:
+                wallet = (await db.execute(select(Wallet).where(Wallet.tenant_id == call_log.tenant_id))).scalar_one_or_none()
+                if wallet:
+                    wallet.balance_inr = max(0.0, wallet.balance_inr - diff_cost)
+                    wallet.total_spent_inr = (wallet.total_spent_inr or 0.0) + diff_cost
+            await db.commit()
+
+    return {"status": "ok", "recorded_duration": actual_duration}
