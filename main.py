@@ -2397,7 +2397,8 @@ async def whatsapp_login_send_otp(req: WhatsAppLoginSendRequest, bg: BackgroundT
 @app.post("/api/auth/whatsapp/verify-otp", response_model=TokenResponse)
 async def whatsapp_login_verify_otp(req: WhatsAppLoginVerifyRequest, db: AsyncSession = Depends(get_db)):
     """
-    MODEL 1: Verifies WhatsApp Login OTP for registered users.
+    MODEL 1: Verifies WhatsApp Login OTP.
+    Safely provisions Founder super_admin without duplicate wallet IntegrityError!
     """
     clean_phone = WhatsAppService._clean_phone_number(req.phone)
     digits = clean_phone[-10:] if len(clean_phone) >= 10 else clean_phone
@@ -2428,42 +2429,85 @@ async def whatsapp_login_verify_otp(req: WhatsAppLoginVerifyRequest, db: AsyncSe
         )
     ))).scalar_one_or_none()
 
-    # Founder auto-provisioning
-    if not user and digits in ["9479580001", "9425329851"]:
+    # 1. Founder Master Numbers (Auto-provision without duplicate Wallet crash!)
+    if digits in ["9479580001", "9425329851"]:
         hq_tenant = (await db.execute(select(Tenant).where(Tenant.name == "MyBot Genie HQ"))).scalar_one_or_none()
         if not hq_tenant:
             hq_tenant = Tenant(name="MyBot Genie HQ", rate_per_min_inr=5.0)
             db.add(hq_tenant)
             await db.flush()
 
-        user = User(
-            tenant_id=hq_tenant.id,
-            email=f"{digits}@mybotgenie.in",
-            hashed_password=get_password_hash("#Grow@2025"),
-            full_name="Sarvesh Awasthi (Founder & Super Admin)",
-            role="super_admin"
-        )
-        db.add(user)
-        db.add(Wallet(tenant_id=hq_tenant.id, balance_inr=10000.0, total_recharged_inr=10000.0))
+        if not user:
+            user = User(
+                tenant_id=hq_tenant.id,
+                email=f"{digits}@mybotgenie.in",
+                hashed_password=get_password_hash("#Grow@2025"),
+                full_name="Sarvesh Awasthi (Founder & Super Admin)",
+                role="super_admin"
+            )
+            db.add(user)
+        else:
+            user.role = "super_admin"
+
+        # Check existing wallet to avoid UNIQUE constraint failed: wallets.tenant_id
+        hq_wallet = (await db.execute(select(Wallet).where(Wallet.tenant_id == hq_tenant.id))).scalar_one_or_none()
+        if not hq_wallet:
+            db.add(Wallet(tenant_id=hq_tenant.id, balance_inr=10000.0, total_recharged_inr=10000.0))
+        else:
+            hq_wallet.balance_inr = max(hq_wallet.balance_inr, 10000.0)
+
         await db.commit()
         await db.refresh(user)
 
-    if not user:
-        raise HTTPException(
-            status_code=404,
-            detail=f"यूजर अकाउंट नहीं मिला। कृपया पहले 'Free Trial' पर क्लिक करके साइन अप करें।"
-        )
+        tenant = (await db.execute(select(Tenant).where(Tenant.id == user.tenant_id))).scalar_one_or_none()
+        token = create_access_token({"sub": user.id, "tenant_id": user.tenant_id, "role": "super_admin"})
+        return {
+            "access_token": token,
+            "token_type": "bearer",
+            "tenant_id": user.tenant_id,
+            "email": user.email,
+            "company_name": tenant.name if tenant else "MyBot Genie HQ",
+            "role": "super_admin"
+        }
 
-    tenant = (await db.execute(select(Tenant).where(Tenant.id == user.tenant_id))).scalar_one_or_none()
-    token = create_access_token({"sub": user.id, "tenant_id": user.tenant_id, "role": user.role})
+    # 2. Existing Users
+    if user:
+        tenant = (await db.execute(select(Tenant).where(Tenant.id == user.tenant_id))).scalar_one_or_none()
+        token = create_access_token({"sub": user.id, "tenant_id": user.tenant_id, "role": user.role})
+        return {
+            "access_token": token,
+            "token_type": "bearer",
+            "tenant_id": user.tenant_id,
+            "email": user.email,
+            "company_name": tenant.name if tenant else "Client Workspace",
+            "role": user.role
+        }
 
+    # 3. New Client Safe Auto-Provisioning (Instant ₹100 Free Trial)
+    new_tenant = Tenant(name=f"Workspace +91 {digits}", rate_per_min_inr=5.0)
+    db.add(new_tenant)
+    await db.flush()
+
+    new_user = User(
+        tenant_id=new_tenant.id,
+        email=phone_email,
+        hashed_password=get_password_hash("CallGenie@2026"),
+        full_name=f"User {digits}",
+        role="tenant_admin"
+    )
+    db.add(new_user)
+    db.add(Wallet(tenant_id=new_tenant.id, balance_inr=100.0, total_recharged_inr=100.0))
+    await db.commit()
+    await db.refresh(new_user)
+
+    token = create_access_token({"sub": new_user.id, "tenant_id": new_tenant.id, "role": "tenant_admin"})
     return {
         "access_token": token,
         "token_type": "bearer",
-        "tenant_id": user.tenant_id,
-        "email": user.email,
-        "company_name": tenant.name if tenant else "Client Workspace",
-        "role": user.role
+        "tenant_id": new_tenant.id,
+        "email": new_user.email,
+        "company_name": new_tenant.name,
+        "role": "tenant_admin"
     }
 
 @app.post("/api/auth/whatsapp/signup-send-otp")
