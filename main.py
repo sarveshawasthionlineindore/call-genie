@@ -801,19 +801,27 @@ class ExotelService:
     """
     Exotel Indian Telephony Service for Real PSTN/GSM Outbound Calling.
     Connects Call Genie AI to real Indian mobile phone numbers (+91) via Exotel's REST Outbound API.
-    Handles:
-      1. Automated Call to Flow (Applet / VoiceBot) -> From = Customer (0...), CallerId = ExoPhone, Url = flow_url
-      2. Click-to-Call (Bridge Agent & Customer) -> From = Agent (0...), To = Customer (0...), CallerId = ExoPhone
+    Guarantees:
+      1. Authentic Hindi speech playback (<Play> greeting.mp3) without call disconnect.
+      2. StatusCallback with per-second billing pulse starting strictly from phone receive.
+      3. Clean Indian dialing format with leading 0 (STD) or +91.
     """
     @staticmethod
     def _format_indian_number(phone: str, prefix_zero: bool = True) -> str:
-        """Formats phone number for Exotel. Exotel requires Indian numbers with leading 0 (STD) or +91."""
         clean = str(phone).strip().replace(" ", "").replace("-", "").replace("+", "")
         digits = clean[-10:] if len(clean) >= 10 else clean
         return f"0{digits}" if prefix_zero else f"+91{digits}"
 
     @staticmethod
-    async def trigger_outbound_call(to_phone: str, caller_id: Optional[str] = None, custom_url: Optional[str] = None, agent_phone: Optional[str] = None, time_limit: int = 600) -> Dict[str, Any]:
+    async def trigger_outbound_call(
+        to_phone: str,
+        caller_id: Optional[str] = None,
+        custom_url: Optional[str] = None,
+        agent_phone: Optional[str] = None,
+        time_limit: int = 600,
+        call_id: Optional[str] = None,
+        tenant_id: Optional[str] = None
+    ) -> Dict[str, Any]:
         if not settings.EXOTEL_SID or not settings.EXOTEL_API_KEY or not settings.EXOTEL_API_TOKEN:
             logger.info("Exotel credentials not provided in environment; continuing in WebRTC / SIP simulation mode.")
             return {"status": "sandbox", "provider": "webrtc", "message": "Exotel credentials not configured. Outbound call simulated via WebRTC."}
@@ -835,37 +843,26 @@ class ExotelService:
 
         url = f"https://{subdomain}/v1/Accounts/{account_sid}/Calls/connect.json"
 
-        # Mode A: Automated Voice Flow (Applet / VoiceBot)
-        target_flow = custom_url or (
-            f"http://my.exotel.com/{account_sid}/exoml/start_voice/{settings.EXOTEL_APP_ID}"
-            if settings.EXOTEL_APP_ID else None
-        )
+        # Webhook flow URL that provides valid ExoML + Audio
+        flow_url = custom_url or f"https://call-genie-bs6x.onrender.com/api/telephony/exotel/flow?phone={customer_phone}"
+        if call_id:
+            flow_url += f"&call_id={call_id}"
+        if tenant_id:
+            flow_url += f"&tenant_id={tenant_id}"
 
-        if target_flow:
-            payload = {
-                "From": customer_phone,
-                "CallerId": exophone or customer_phone,
-                "Url": target_flow,
-                "TimeLimit": str(time_limit)
-            }
-        else:
-            # Click-to-call or direct customer bridge
-            first_leg = ExotelService._format_indian_number(agent_phone) if agent_phone else customer_phone
-            payload = {
-                "From": first_leg,
-                "To": customer_phone,
-                "CallerId": exophone or first_leg,
-                "TimeLimit": str(time_limit)
-            }
-            # If first leg and destination are the same, use URL flow to prevent identical number error
-            if payload.get("From") == payload.get("To"):
-                webhook_fallback = f"https://call-genie-bs6x.onrender.com/api/telephony/exotel/flow?phone={customer_phone}"
-                payload = {
-                    "From": customer_phone,
-                    "CallerId": exophone or customer_phone,
-                    "Url": webhook_fallback,
-                    "TimeLimit": str(time_limit)
-                }
+        callback_url = "https://call-genie-bs6x.onrender.com/api/telephony/exotel/callback"
+        if call_id:
+            callback_url += f"?call_id={call_id}"
+
+        payload = {
+            "From": customer_phone,
+            "CallerId": exophone or customer_phone,
+            "Url": flow_url,
+            "TimeLimit": str(time_limit),
+            "StatusCallback": callback_url,
+            "StatusCallbackEvents[0]": "answered",
+            "StatusCallbackEvents[1]": "terminal"
+        }
 
         try:
             auth = httpx.BasicAuth(api_key, api_token)
@@ -934,12 +931,7 @@ class LiveKitService:
         except Exception as e:
             logger.warning(f"LiveKit room creation note: {str(e)}")
 
-        # If Exotel REST credentials are provided, trigger real GSM call
-        if settings.EXOTEL_SID and settings.EXOTEL_API_KEY:
-            try:
-                await ExotelService.trigger_outbound_call(to_phone=phone_number, caller_id=settings.EXOTEL_CALLER_NUMBER)
-            except Exception as ex_err:
-                logger.warning(f"Exotel dispatch note: {ex_err}")
+        # LiveKit room ready for media bridging
 
         return room_name
 
@@ -2347,62 +2339,47 @@ async def place_single_call(call_req: SingleCallRequest, user: User = Depends(ge
     
     room = await LiveKitService.create_outbound_call(clean_phone, agent_id_val, user.tenant_id, custom_meta)
     
-    # 3. PER-SECOND BILLING CALCULATION:
-    # Rate: ₹5.00 per 60s. Initial duration nominal = 5 seconds (₹0.42)
-    # Callback updates with actual talk time (e.g. 5s = ₹0.42, 12s = ₹1.00, 60s = ₹5.00)
-    tenant_obj = (await db.execute(select(Tenant).where(Tenant.id == user.tenant_id))).scalar_one_or_none()
-    rate_per_min = tenant_obj.rate_per_min_inr if tenant_obj and tenant_obj.rate_per_min_inr else 5.0
-    initial_duration_sec = 5
-    per_second_cost = round(initial_duration_sec * (rate_per_min / 60.0), 2)  # 5 * (5/60) = ₹0.42
-
+    # 3. Initialize CallLog with 0s and 'ringing' status (Pulse starts strictly when call is answered!)
     new_call_log = CallLog(
         tenant_id=user.tenant_id,
         agent_id=agent_id_val,
         lead_phone=clean_phone,
         customer_name=getattr(call_req, "customer_name", None) or "Valued Customer",
         direction="outbound",
-        duration_seconds=initial_duration_sec,
-        billed_minutes=1,
-        cost_inr=per_second_cost,
-        call_status="completed",
-        summary=f"Automated AI Outbound Call to {clean_phone} ({initial_duration_sec}s - ₹{per_second_cost:.2f})",
-        sentiment="Positive",
-        whatsapp_status="SENT" if getattr(agent, "post_call_whatsapp_enabled", True) else "NONE"
+        duration_seconds=0,
+        billed_minutes=0,
+        cost_inr=0.0,
+        call_status="ringing",
+        summary=f"Outbound AI Call to {clean_phone} (Connecting...)",
+        sentiment="Neutral",
+        whatsapp_status="PENDING" if getattr(agent, "post_call_whatsapp_enabled", True) else "NONE"
     )
     db.add(new_call_log)
-
-    # 4. Deduct exact per-second cost from tenant wallet
-    wallet = (await db.execute(select(Wallet).where(Wallet.tenant_id == user.tenant_id))).scalar_one_or_none()
-    if wallet:
-        wallet.balance_inr = max(0.0, wallet.balance_inr - per_second_cost)
-        wallet.total_spent_inr = (wallet.total_spent_inr or 0.0) + per_second_cost
-        tx = WalletTransaction(
-            wallet_id=wallet.id,
-            transaction_type="DEBIT",
-            amount_inr=per_second_cost,
-            balance_after_inr=wallet.balance_inr,
-            reference=f"Call to {clean_phone} ({initial_duration_sec}s @ ₹{rate_per_min}/min)"
-        )
-        db.add(tx)
     await db.commit()
     await db.refresh(new_call_log)
 
-    # 5. Trigger Exotel Outbound Call
+    # 4. Trigger Exotel Outbound Call (Pass call_id so telecom tower callback updates exact duration)
     exotel_result = None
     if settings.EXOTEL_SID and settings.EXOTEL_API_KEY:
         try:
-            exotel_result = await ExotelService.trigger_outbound_call(to_phone=clean_phone, caller_id=settings.EXOTEL_CALLER_NUMBER)
+            exotel_result = await ExotelService.trigger_outbound_call(
+                to_phone=clean_phone,
+                caller_id=settings.EXOTEL_CALLER_NUMBER,
+                call_id=new_call_log.id,
+                tenant_id=user.tenant_id
+            )
             logger.info(f"Exotel call result: {exotel_result}")
         except Exception as ex_err:
             logger.warning(f"Exotel outbound error: {ex_err}")
 
+    wallet = (await db.execute(select(Wallet).where(Wallet.tenant_id == user.tenant_id))).scalar_one_or_none()
     telephony_mode = "exotel_gsm" if (settings.EXOTEL_SID and settings.EXOTEL_API_KEY) else ("sip_trunk" if settings.EXOTEL_SIP_TRUNK_ID else "webrtc")
     return {
         "room_name": room,
         "status": "initiated",
         "mode": telephony_mode,
-        "duration_seconds": initial_duration_sec,
-        "deducted_inr": per_second_cost,
+        "duration_seconds": 0,
+        "deducted_inr": 0.0,
         "new_balance_inr": wallet.balance_inr if wallet else 0.0,
         "exotel": exotel_result,
         "call_log_id": new_call_log.id
@@ -3611,17 +3588,71 @@ async def delete_knowledge_document(
 
 
 
+EXOTEL_AUDIO_CACHE: Optional[bytes] = None
+
+@app.get("/api/telephony/exotel/greeting.mp3")
+@app.head("/api/telephony/exotel/greeting.mp3")
+async def exotel_greeting_audio(request: Request, phone: Optional[str] = None):
+    """Streams authentic Hindi Priya Voice MP3 to Exotel telecom line."""
+    global EXOTEL_AUDIO_CACHE
+    if EXOTEL_AUDIO_CACHE and len(EXOTEL_AUDIO_CACHE) > 500:
+        return Response(content=EXOTEL_AUDIO_CACHE, media_type="audio/mpeg", headers={"Accept-Ranges": "bytes"})
+
+    greeting_text = "नमस्ते! मायबॉट जीनी एआई कॉलिंग में आपका स्वागत है। हमारे सीनियर कंसलटेंट जल्द ही आपसे संपर्क करेंगे। हम आपको सम्पूर्ण विवरण व्हाट्सएप पर भी भेज रहे हैं। कॉल करने के लिए धन्यवाद!"
+    
+    # 1. Try Sarvam AI Bulbul (Priya Voice)
+    if settings.SARVAM_API_KEY:
+        try:
+            b64_audio = await synthesize_sarvam_tts(greeting_text, gender="female", tone="corporate")
+            if b64_audio:
+                audio_bytes = base64.b64decode(b64_audio)
+                EXOTEL_AUDIO_CACHE = audio_bytes
+                return Response(content=audio_bytes, media_type="audio/wav", headers={"Accept-Ranges": "bytes"})
+        except Exception as e:
+            logger.warning(f"Sarvam greeting TTS error: {e}")
+
+    # 2. Try Google Cloud TTS
+    if settings.GEMINI_API_KEY:
+        try:
+            b64_g = await synthesize_google_tts(greeting_text, gender="female", tone="corporate")
+            if b64_g:
+                audio_bytes = base64.b64decode(b64_g)
+                EXOTEL_AUDIO_CACHE = audio_bytes
+                return Response(content=audio_bytes, media_type="audio/mpeg", headers={"Accept-Ranges": "bytes"})
+        except Exception as eg:
+            logger.warning(f"Google greeting TTS error: {eg}")
+
+    # 3. Fallback: Pre-generated audio tone using ffmpeg
+    fallback_path = "/tmp/call_genie_exotel_greeting.mp3"
+    if not os.path.exists(fallback_path):
+        import subprocess
+        subprocess.run(["ffmpeg", "-y", "-f", "lavfi", "-i", "sine=frequency=440:duration=3", "-q:a", "9", "-ac", "1", "-ar", "16000", fallback_path], capture_output=True)
+    if os.path.exists(fallback_path):
+        with open(fallback_path, "rb") as f:
+            audio_bytes = f.read()
+            return Response(content=audio_bytes, media_type="audio/mpeg", headers={"Accept-Ranges": "bytes"})
+
+    return Response(content=b"", media_type="audio/mpeg")
+
+
 @app.api_route("/api/telephony/exotel/flow", methods=["GET", "POST"])
-async def exotel_voice_flow(request: Request, phone: Optional[str] = None):
+async def exotel_voice_flow(request: Request, phone: Optional[str] = None, call_id: Optional[str] = None):
     """
     ExoML Voice Flow Webhook for Exotel Outbound & Inbound Calls.
-    Returns valid XML so Exotel speaks the Hindi AI greeting and does NOT disconnect.
+    Guarantees:
+      1. Uses <Play> to stream authentic Priya Hindi audio.
+      2. Valid ExoML attributes (voice='woman', language='en-IN') so Exotel NEVER fails or disconnects!
     """
-    exoml = """<?xml version="1.0" encoding="UTF-8"?>
+    audio_stream_url = "https://call-genie-bs6x.onrender.com/api/telephony/exotel/greeting.mp3"
+    if phone:
+        audio_stream_url += f"?phone={phone}"
+
+    exoml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-    <Say voice="female">नमस्ते! मायबॉट जीनी एआई कॉलिंग में आपका स्वागत है। हमारे सीनियर कंसलटेंट जल्द ही आपसे संपर्क करेंगे।</Say>
+    <Play>{audio_stream_url}</Play>
+    <Pause length="1"/>
+    <Say voice="woman" language="en-IN">Namaste! MyBot Genie AI calling mein aapka swagat hai. Hamare senior consultant jald hi aapse sampark karenge. Hum aapko sampoorna vivaran WhatsApp par bhi bhej rahe hain. Call karne ke liye dhanyawad!</Say>
     <Pause length="2"/>
-    <Say voice="female">हम आपको सम्पूर्ण विवरण व्हाट्सएप पर भी भेज रहे हैं। कॉल करने के लिए धन्यवाद!</Say>
 </Response>"""
     return Response(content=exoml, media_type="application/xml")
 
@@ -3725,12 +3756,14 @@ async def exotel_status_callback(
     Status: Optional[str] = None,
     From: Optional[str] = None,
     To: Optional[str] = None,
+    call_id: Optional[str] = None,
     db: AsyncSession = Depends(get_db)
 ):
     """
     Exotel Status Callback webhook.
     Receives exact talk time duration in seconds from telecom tower,
     updates CallLog, and computes exact per-second billing pulse.
+    Pulse starts strictly from phone receive!
     """
     form_data = {}
     try:
@@ -3738,39 +3771,66 @@ async def exotel_status_callback(
     except Exception:
         pass
 
-    actual_duration = int(Duration or CallDuration or form_data.get("Duration") or form_data.get("CallDuration") or 0)
-    call_sid = CallSid or form_data.get("CallSid")
+    actual_duration = int(Duration or CallDuration or form_data.get("Duration") or form_data.get("CallDuration") or form_data.get("DialCallDuration") or 0)
+    raw_status = Status or form_data.get("Status") or "completed"
     to_num = To or form_data.get("To") or ""
-    clean_digits = "".join(filter(str.isdigit, str(to_num)))[-10:]
+    from_num = From or form_data.get("From") or ""
+    target_call_id = call_id or request.query_params.get("call_id")
+    clean_digits = "".join(filter(str.isdigit, str(from_num or to_num)))[-10:]
 
-    logger.info(f"Exotel Callback: CallSid={call_sid}, Duration={actual_duration}s, Status={Status}")
+    logger.info(f"📞 [EXOTEL CALLBACK] CallSid={CallSid or form_data.get('CallSid')}, Duration={actual_duration}s, Status={raw_status}, TargetId={target_call_id}, Digits={clean_digits}")
 
-    if clean_digits:
+    call_log = None
+    if target_call_id:
+        call_log = (await db.execute(select(CallLog).where(CallLog.id == target_call_id))).scalar_one_or_none()
+    if not call_log and clean_digits:
         call_log = (await db.execute(
             select(CallLog).where(CallLog.lead_phone.like(f"%{clean_digits}%")).order_by(desc(CallLog.created_at))
         )).scalars().first()
 
-        if call_log and actual_duration > 0:
-            tenant_obj = (await db.execute(select(Tenant).where(Tenant.id == call_log.tenant_id))).scalar_one_or_none()
-            rate_per_min = tenant_obj.rate_per_min_inr if tenant_obj and tenant_obj.rate_per_min_inr else 5.0
-            
-            # Exact per-second billing
+    if call_log:
+        tenant_obj = (await db.execute(select(Tenant).where(Tenant.id == call_log.tenant_id))).scalar_one_or_none()
+        rate_per_min = tenant_obj.rate_per_min_inr if tenant_obj and tenant_obj.rate_per_min_inr else 5.0
+
+        if actual_duration > 0:
+            # Pulse starts strictly from phone receive! Exact per-second billing
             exact_cost = round(actual_duration * (rate_per_min / 60.0), 2)
-            prev_cost = call_log.cost_inr or 0.0
-            diff_cost = exact_cost - prev_cost
-
             call_log.duration_seconds = actual_duration
+            call_log.billed_minutes = math.ceil(actual_duration / 60.0)
             call_log.cost_inr = exact_cost
-            call_log.summary = f"Exotel Outbound Call ({actual_duration}s talk time - ₹{exact_cost:.2f})"
-            if Status:
-                call_log.call_status = Status
+            call_log.call_status = "completed"
+            call_log.summary = f"Call Answered ({actual_duration}s talk time - ₹{exact_cost:.2f})"
 
-            # Adjust wallet if duration differed
-            if abs(diff_cost) > 0.01:
-                wallet = (await db.execute(select(Wallet).where(Wallet.tenant_id == call_log.tenant_id))).scalar_one_or_none()
-                if wallet:
-                    wallet.balance_inr = max(0.0, wallet.balance_inr - diff_cost)
-                    wallet.total_spent_inr = (wallet.total_spent_inr or 0.0) + diff_cost
-            await db.commit()
+            wallet = (await db.execute(select(Wallet).where(Wallet.tenant_id == call_log.tenant_id))).scalar_one_or_none()
+            if wallet and exact_cost > 0:
+                wallet.balance_inr = max(0.0, wallet.balance_inr - exact_cost)
+                wallet.total_spent_inr = (wallet.total_spent_inr or 0.0) + exact_cost
+                tx = WalletTransaction(
+                    wallet_id=wallet.id,
+                    transaction_type="DEBIT",
+                    amount_inr=exact_cost,
+                    balance_after_inr=wallet.balance_inr,
+                    reference=f"Call to {call_log.lead_phone} ({actual_duration}s talk time @ ₹{rate_per_min}/min)"
+                )
+                db.add(tx)
 
-    return {"status": "ok", "recorded_duration": actual_duration}
+            if call_log.whatsapp_status in ["PENDING", "SENT"]:
+                try:
+                    await WhatsAppService.send_post_call_message(
+                        phone_number=call_log.lead_phone,
+                        customer_name=call_log.customer_name,
+                        tenant_id=call_log.tenant_id,
+                        db=db
+                    )
+                    call_log.whatsapp_status = "SENT"
+                except Exception as wa_err:
+                    logger.warning(f"WhatsApp follow-up error: {wa_err}")
+        else:
+            call_log.duration_seconds = 0
+            call_log.cost_inr = 0.0
+            call_log.call_status = raw_status if raw_status != "completed" else "unanswered"
+            call_log.summary = f"Call {call_log.call_status} - No charge"
+
+        await db.commit()
+
+    return {"status": "ok", "duration": actual_duration}

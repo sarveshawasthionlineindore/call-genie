@@ -63,7 +63,7 @@ Each registered business user has full self-service control over their WhatsApp 
 
 If a client wants to generate their own credentials:
 
-1. Go to [developers.facebook.com](https://developers.facebook.com/) and create a Business App.
+1. Go to [developers.facebook.com](https://www.google.com/search?q=https%3A%2F%2Fdevelopers.facebook.com%2F) and create a Business App.
 2. Under **WhatsApp -> API Setup**:
    - Copy the **Phone Number ID**.
 3. Under **Business Settings -> System Users**:
