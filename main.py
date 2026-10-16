@@ -2322,86 +2322,130 @@ async def personalized_demo(demo_in: PersonalizedDemoRequest, bg: BackgroundTask
     return {"status": "initiated", "message": f"Demo call queued for {clean_phone}"}
 
 @app.post("/api/campaigns/single-call")
-async def place_single_call(call_req: SingleCallRequest, user: User = Depends(get_current_user), bg: BackgroundTasks = None, db: AsyncSession = Depends(get_db)):
-    clean_phone = call_req.phone_number.strip().replace(" ", "").replace("-", "")
-    
-    # 1. Fetch Agent details
-    agent = (await db.execute(select(Agent).where(Agent.id == call_req.agent_id, Agent.tenant_id == user.tenant_id))).scalar_one_or_none()
-    if not agent:
-        agent = (await db.execute(select(Agent).where(Agent.tenant_id == user.tenant_id))).scalars().first()
-    
-    # 2. Fetch Knowledge Documents for this Tenant
-    docs = (await db.execute(select(KnowledgeDocument).where(KnowledgeDocument.tenant_id == user.tenant_id).order_by(desc(KnowledgeDocument.created_at)).limit(5))).scalars().all()
-    k_snippet = '\n\n'.join([f'[{d.title}]: ' + (d.raw_content[:2000] if d.raw_content else '') for d in docs])
-    
-    agent_prompt = getattr(agent, "system_prompt", "Speak like an articulate corporate executive.")
-    if k_snippet:
-        agent_prompt += "\n\n--- OFFICIAL BUSINESS KNOWLEDGE BASE ---\n" + k_snippet[:3500]
+async def place_single_call(
+    call_req: SingleCallRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    try:
+        raw_phone = call_req.phone_number.strip().replace(" ", "").replace("-", "")
+        clean_phone = raw_phone.lstrip("+")
+        if clean_phone.startswith("91") and len(clean_phone) == 12:
+            clean_phone = clean_phone[2:]
+        if len(clean_phone) == 10:
+            formatted_dest = f"+91{clean_phone}"
+        else:
+            formatted_dest = f"+{clean_phone}"
 
-    agent_id_val = getattr(agent, "id", call_req.agent_id)
-    agent_name_val = getattr(agent, "name", "AI Telecaller")
-    voice_prov = getattr(agent, "tts_provider", "sarvam")
-    custom_vid = getattr(agent, "custom_voice_id", None)
-    greeting_val = getattr(agent, "greeting_message", "Namaste! Main AI Consultant baat kar rahi hoon. Kya main aapki koi madad kar sakti hoon?")
+        # 1. Fetch Agent details safely (Prevent PostgreSQL Foreign Key Violation!)
+        agent = None
+        if call_req.agent_id and call_req.agent_id != "default":
+            agent = (await db.execute(
+                select(Agent).where(Agent.id == call_req.agent_id, Agent.tenant_id == user.tenant_id)
+            )).scalar_one_or_none()
 
-    custom_meta = {
-        **(call_req.custom_variables or {}),
-        "tenant_id": user.tenant_id,
-        "agent_id": agent_id_val,
-        "agent_name": agent_name_val,
-        "voice_provider": voice_prov,
-        "custom_voice_id": custom_vid,
-        "first_message": greeting_val,
-        "system_prompt": agent_prompt
-    }
-    
-    room = await LiveKitService.create_outbound_call(clean_phone, agent_id_val, user.tenant_id, custom_meta)
-    
-    # 3. Initialize CallLog with 0s and 'ringing' status (Pulse starts strictly when call is answered!)
-    new_call_log = CallLog(
-        tenant_id=user.tenant_id,
-        agent_id=agent_id_val,
-        lead_phone=clean_phone,
-        customer_name=getattr(call_req, "customer_name", None) or "Valued Customer",
-        direction="outbound",
-        duration_seconds=0,
-        billed_minutes=0,
-        cost_inr=0.0,
-        call_status="ringing",
-        summary=f"Outbound AI Call to {clean_phone} (Connecting...)",
-        sentiment="Neutral",
-        whatsapp_status="PENDING" if getattr(agent, "post_call_whatsapp_enabled", True) else "NONE"
-    )
-    db.add(new_call_log)
-    await db.commit()
-    await db.refresh(new_call_log)
+        if not agent:
+            agent = (await db.execute(
+                select(Agent).where(Agent.tenant_id == user.tenant_id)
+            )).scalars().first()
 
-    # 4. Trigger Exotel Outbound Call (Pass call_id so telecom tower callback updates exact duration)
-    exotel_result = None
-    if settings.EXOTEL_SID and settings.EXOTEL_API_KEY:
-        try:
-            exotel_result = await ExotelService.trigger_outbound_call(
-                to_phone=clean_phone,
-                caller_id=settings.EXOTEL_CALLER_NUMBER,
-                call_id=new_call_log.id,
-                tenant_id=user.tenant_id
+        # If tenant has no agents at all, auto-create a default agent so agent_id foreign key constraint is 100% satisfied!
+        if not agent:
+            agent = Agent(
+                tenant_id=user.tenant_id,
+                name="Priya (AI Telecaller)",
+                system_prompt="Aap ek professional corporate telecaller hain. Customer se polite Hindi me baat karein.",
+                greeting_message="Namaste! Main Call Genie AI se baat kar rahi hoon. Kya main aapki koi madad kar sakti hoon?",
+                tts_provider="sarvam",
+                tts_voice="priya",
+                post_call_whatsapp_enabled=True
             )
-            logger.info(f"Exotel call result: {exotel_result}")
-        except Exception as ex_err:
-            logger.warning(f"Exotel outbound error: {ex_err}")
+            db.add(agent)
+            await db.commit()
+            await db.refresh(agent)
 
-    wallet = (await db.execute(select(Wallet).where(Wallet.tenant_id == user.tenant_id))).scalar_one_or_none()
-    telephony_mode = "exotel_gsm" if (settings.EXOTEL_SID and settings.EXOTEL_API_KEY) else ("sip_trunk" if settings.EXOTEL_SIP_TRUNK_ID else "webrtc")
-    return {
-        "room_name": room,
-        "status": "initiated",
-        "mode": telephony_mode,
-        "duration_seconds": 0,
-        "deducted_inr": 0.0,
-        "new_balance_inr": wallet.balance_inr if wallet else 0.0,
-        "exotel": exotel_result,
-        "call_log_id": new_call_log.id
-    }
+        agent_id_val = agent.id
+
+        # 2. Fetch Knowledge Documents for this Tenant
+        docs = (await db.execute(
+            select(KnowledgeDocument).where(KnowledgeDocument.tenant_id == user.tenant_id).order_by(desc(KnowledgeDocument.created_at)).limit(5)
+        )).scalars().all()
+        k_snippet = '\n\n'.join([f'[{d.title}]: ' + (d.raw_content[:2000] if d.raw_content else '') for d in docs])
+
+        agent_prompt = getattr(agent, "system_prompt", "Speak like an articulate corporate executive.")
+        if k_snippet:
+            agent_prompt += "\n\n--- OFFICIAL BUSINESS KNOWLEDGE BASE ---\n" + k_snippet[:3500]
+
+        agent_name_val = getattr(agent, "name", "AI Telecaller")
+        voice_prov = getattr(agent, "tts_provider", "sarvam")
+        custom_vid = getattr(agent, "custom_voice_id", None)
+        greeting_val = getattr(agent, "greeting_message", "Namaste! Main AI Consultant baat kar rahi hoon. Kya main aapki koi madad kar sakti hoon?")
+
+        custom_meta = {
+            **(call_req.custom_variables or {}),
+            "tenant_id": user.tenant_id,
+            "agent_id": agent_id_val,
+            "agent_name": agent_name_val,
+            "voice_provider": voice_prov,
+            "custom_voice_id": custom_vid,
+            "first_message": greeting_val,
+            "system_prompt": agent_prompt
+        }
+
+        # 3. Create LiveKit Room
+        room = await LiveKitService.create_outbound_call(formatted_dest, agent_id_val, user.tenant_id, custom_meta)
+
+        # 4. Initialize CallLog in DB with valid agent foreign key!
+        new_call_log = CallLog(
+            tenant_id=user.tenant_id,
+            agent_id=agent_id_val,
+            lead_phone=formatted_dest,
+            customer_name=getattr(call_req, "customer_name", None) or "Valued Customer",
+            direction="outbound",
+            duration_seconds=0,
+            billed_minutes=0,
+            cost_inr=0.0,
+            call_status="ringing",
+            summary=f"Outbound AI Call to {formatted_dest} (Connecting...)",
+            sentiment="Neutral",
+            whatsapp_status="PENDING" if getattr(agent, "post_call_whatsapp_enabled", True) else "NONE"
+        )
+        db.add(new_call_log)
+        await db.commit()
+        await db.refresh(new_call_log)
+
+        # 5. Trigger Exotel Outbound Call
+        exotel_result = None
+        if settings.EXOTEL_SID and settings.EXOTEL_API_KEY:
+            try:
+                exotel_result = await ExotelService.trigger_outbound_call(
+                    to_phone=formatted_dest,
+                    caller_id=settings.EXOTEL_CALLER_NUMBER,
+                    call_id=new_call_log.id,
+                    tenant_id=user.tenant_id
+                )
+                logger.info(f"Exotel call result: {exotel_result}")
+            except Exception as ex_err:
+                logger.warning(f"Exotel outbound error: {ex_err}")
+
+        wallet = (await db.execute(select(Wallet).where(Wallet.tenant_id == user.tenant_id))).scalar_one_or_none()
+        telephony_mode = "exotel_gsm" if (settings.EXOTEL_SID and settings.EXOTEL_API_KEY) else ("sip_trunk" if settings.EXOTEL_SIP_TRUNK_ID else "webrtc")
+        return {
+            "status": "success",
+            "room_name": room,
+            "mode": telephony_mode,
+            "duration_seconds": 0,
+            "deducted_inr": 0.0,
+            "new_balance_inr": wallet.balance_inr if wallet else 0.0,
+            "exotel": exotel_result,
+            "call_log_id": new_call_log.id
+        }
+    except Exception as e:
+        logger.error(f"Error in place_single_call: {e}", exc_info=True)
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "detail": f"Call initiation note: {str(e)}"}
+        )
 
 @app.post("/api/integrations/api-keys")
 async def make_key(user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
@@ -2507,7 +2551,7 @@ async def whatsapp_login_send_otp(req: WhatsAppLoginSendRequest, bg: BackgroundT
     ))).scalar_one_or_none()
 
     # Founder master numbers always permitted
-    is_founder = digits in ["9479580001", "9425329851"]
+    is_founder = (digits == "9425329851")
     if not user and not is_founder:
         raise HTTPException(
             status_code=404,
@@ -2556,7 +2600,7 @@ async def whatsapp_login_verify_otp(req: WhatsAppLoginVerifyRequest, db: AsyncSe
     entry = OTP_STORE.get(key) or OTP_STORE.get(f"wa_{clean_phone}") or OTP_STORE.get(clean_phone)
     clean_otp = req.otp.strip()
 
-    is_master = (clean_otp in ["999999", "123456", "969695"] and digits in ["9479580001", "9425329851"])
+    is_master = (clean_otp in ["999999", "123456", "969695"] and digits in ["9425329851"])
     if not is_master and (not entry or entry["otp"] != clean_otp):
         raise HTTPException(status_code=400, detail="गलत या एक्सपायर्ड WhatsApp OTP कोड। कृपया पुनः प्रयास करें।")
 
@@ -2580,7 +2624,7 @@ async def whatsapp_login_verify_otp(req: WhatsAppLoginVerifyRequest, db: AsyncSe
     ))).scalar_one_or_none()
 
     # 1. Founder Master Numbers (Auto-provision without duplicate Wallet crash!)
-    if digits in ["9479580001", "9425329851"]:
+    if digits == "9425329851":
         hq_tenant = (await db.execute(select(Tenant).where(Tenant.name == "MyBot Genie HQ"))).scalar_one_or_none()
         if not hq_tenant:
             hq_tenant = Tenant(name="MyBot Genie HQ", rate_per_min_inr=5.0)
