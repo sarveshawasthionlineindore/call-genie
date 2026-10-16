@@ -1,3 +1,4 @@
+import base64
 import os
 import sys
 import uuid
@@ -3655,24 +3656,67 @@ async def delete_knowledge_document(
 
 EXOTEL_AUDIO_CACHE: Optional[bytes] = None
 
+def get_builtin_fallback_wav() -> bytes:
+    """Generates a valid, non-empty 16kHz PCM WAV audio chime to guarantee Exotel never receives 0 bytes."""
+    import io, wave, math, struct
+    buf = io.BytesIO()
+    with wave.open(buf, 'wb') as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(16000)
+        duration = 3.0
+        num_samples = int(16000 * duration)
+        samples = []
+        for i in range(num_samples):
+            t = i / 16000.0
+            env = min(1.0, t * 5.0) * max(0.0, 1.0 - (t / duration) ** 2)
+            val = int(env * 12000 * (0.6 * math.sin(2 * math.pi * 523.25 * t) + 0.4 * math.sin(2 * math.pi * 659.25 * t)))
+            samples.append(struct.pack('<h', max(-32768, min(32767, val))))
+        wav.writeframes(b''.join(samples))
+    return buf.getvalue()
+
+@app.get("/api/telephony/exotel/greeting.wav")
 @app.get("/api/telephony/exotel/greeting.mp3")
+@app.head("/api/telephony/exotel/greeting.wav")
 @app.head("/api/telephony/exotel/greeting.mp3")
 async def exotel_greeting_audio(request: Request, phone: Optional[str] = None):
-    """Streams authentic Hindi Priya Voice MP3 to Exotel telecom line."""
+    """
+    Streams authentic Hindi Priya Voice WAV/MP3 to Exotel telecom line.
+    Returns immediately with verified audio bytes and strict Content-Length headers,
+    guaranteeing Exotel never encounters empty data or drops the call!
+    """
     global EXOTEL_AUDIO_CACHE
     if EXOTEL_AUDIO_CACHE and len(EXOTEL_AUDIO_CACHE) > 500:
-        return Response(content=EXOTEL_AUDIO_CACHE, media_type="audio/mpeg", headers={"Accept-Ranges": "bytes"})
+        return Response(
+            content=EXOTEL_AUDIO_CACHE,
+            media_type="audio/wav",
+            headers={
+                "Content-Type": "audio/wav",
+                "Accept-Ranges": "bytes",
+                "Content-Length": str(len(EXOTEL_AUDIO_CACHE))
+            }
+        )
 
     greeting_text = "नमस्ते! मायबॉट जीनी एआई कॉलिंग में आपका स्वागत है। हमारे सीनियर कंसलटेंट जल्द ही आपसे संपर्क करेंगे। हम आपको सम्पूर्ण विवरण व्हाट्सएप पर भी भेज रहे हैं। कॉल करने के लिए धन्यवाद!"
-    
-    # 1. Try Sarvam AI Bulbul (Priya Voice)
+
+    # 1. Try Sarvam AI Bulbul (Priya Voice - authentic Hindi telecalling)
     if settings.SARVAM_API_KEY:
         try:
             b64_audio = await synthesize_sarvam_tts(greeting_text, gender="female", tone="corporate")
             if b64_audio:
                 audio_bytes = base64.b64decode(b64_audio)
-                EXOTEL_AUDIO_CACHE = audio_bytes
-                return Response(content=audio_bytes, media_type="audio/wav", headers={"Accept-Ranges": "bytes"})
+                if len(audio_bytes) > 500:
+                    EXOTEL_AUDIO_CACHE = audio_bytes
+                    logger.info(f"✓ Sarvam Priya greeting audio cached ({len(audio_bytes)} bytes)")
+                    return Response(
+                        content=audio_bytes,
+                        media_type="audio/wav",
+                        headers={
+                            "Content-Type": "audio/wav",
+                            "Accept-Ranges": "bytes",
+                            "Content-Length": str(len(audio_bytes))
+                        }
+                    )
         except Exception as e:
             logger.warning(f"Sarvam greeting TTS error: {e}")
 
@@ -3682,22 +3726,31 @@ async def exotel_greeting_audio(request: Request, phone: Optional[str] = None):
             b64_g = await synthesize_google_tts(greeting_text, gender="female", tone="corporate")
             if b64_g:
                 audio_bytes = base64.b64decode(b64_g)
-                EXOTEL_AUDIO_CACHE = audio_bytes
-                return Response(content=audio_bytes, media_type="audio/mpeg", headers={"Accept-Ranges": "bytes"})
+                if len(audio_bytes) > 500:
+                    EXOTEL_AUDIO_CACHE = audio_bytes
+                    return Response(
+                        content=audio_bytes,
+                        media_type="audio/mpeg",
+                        headers={
+                            "Content-Type": "audio/mpeg",
+                            "Accept-Ranges": "bytes",
+                            "Content-Length": str(len(audio_bytes))
+                        }
+                    )
         except Exception as eg:
             logger.warning(f"Google greeting TTS error: {eg}")
 
-    # 3. Fallback: Pre-generated audio tone using ffmpeg
-    fallback_path = "/tmp/call_genie_exotel_greeting.mp3"
-    if not os.path.exists(fallback_path):
-        import subprocess
-        subprocess.run(["ffmpeg", "-y", "-f", "lavfi", "-i", "sine=frequency=440:duration=3", "-q:a", "9", "-ac", "1", "-ar", "16000", fallback_path], capture_output=True)
-    if os.path.exists(fallback_path):
-        with open(fallback_path, "rb") as f:
-            audio_bytes = f.read()
-            return Response(content=audio_bytes, media_type="audio/mpeg", headers={"Accept-Ranges": "bytes"})
-
-    return Response(content=b"", media_type="audio/mpeg")
+    # 3. Guaranteed valid fallback audio (Never return empty bytes!)
+    fallback_wav = get_builtin_fallback_wav()
+    return Response(
+        content=fallback_wav,
+        media_type="audio/wav",
+        headers={
+            "Content-Type": "audio/wav",
+            "Accept-Ranges": "bytes",
+            "Content-Length": str(len(fallback_wav))
+        }
+    )
 
 
 @app.api_route("/api/telephony/exotel/flow", methods=["GET", "POST"])
@@ -3705,19 +3758,19 @@ async def exotel_voice_flow(request: Request, phone: Optional[str] = None, call_
     """
     ExoML Voice Flow Webhook for Exotel Outbound & Inbound Calls.
     Guarantees:
-      1. Uses <Play> to stream authentic Priya Hindi audio.
-      2. Valid ExoML attributes (voice='woman', language='en-IN') so Exotel NEVER fails or disconnects!
+      1. Uses <Play> to stream authentic Priya Hindi audio with zero delay.
+      2. Valid ExoML attributes so Exotel NEVER drops the call upon answer!
     """
-    audio_stream_url = "https://call-genie-bs6x.onrender.com/api/telephony/exotel/greeting.mp3"
+    audio_stream_url = "https://call-genie-bs6x.onrender.com/api/telephony/exotel/greeting.wav"
     if phone:
         audio_stream_url += f"?phone={phone}"
 
     exoml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Play>{audio_stream_url}</Play>
-    <Pause length="1"/>
-    <Say voice="woman" language="en-IN">Namaste! MyBot Genie AI calling mein aapka swagat hai. Hamare senior consultant jald hi aapse sampark karenge. Hum aapko sampoorna vivaran WhatsApp par bhi bhej rahe hain. Call karne ke liye dhanyawad!</Say>
     <Pause length="2"/>
+    <Say>Namaste! MyBot Genie AI calling mein aapka swagat hai. Hamare senior consultant jald hi aapse sampark karenge. Hum aapko sampoorna vivaran WhatsApp par bhi bhej rahe hain. Call karne ke liye dhanyawad!</Say>
+    <Pause length="3"/>
 </Response>"""
     return Response(content=exoml, media_type="application/xml")
 
