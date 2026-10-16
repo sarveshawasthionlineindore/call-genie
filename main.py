@@ -864,12 +864,10 @@ class ExotelService:
 
         url = f"https://{subdomain}/v1/Accounts/{account_sid}/Calls/connect.json"
 
-        # Webhook flow URL that provides valid ExoML + Audio
-        flow_url = custom_url or f"https://call-genie-bs6x.onrender.com/api/telephony/exotel/flow?phone={customer_phone}"
-        if call_id:
-            flow_url += f"&call_id={call_id}"
-        if tenant_id:
-            flow_url += f"&tenant_id={tenant_id}"
+        # Official Exotel Connect-Number-to-Flow format:
+        # http://my.exotel.com/{account_sid}/exoml/start_voice/{app_id}
+        app_id = (settings.EXOTEL_APP_ID or "1361419").strip()
+        flow_url = custom_url or f"http://my.exotel.com/{account_sid}/exoml/start_voice/{app_id}"
 
         callback_url = "https://call-genie-bs6x.onrender.com/api/telephony/exotel/callback"
         if call_id:
@@ -879,9 +877,12 @@ class ExotelService:
             "From": customer_phone,
             "CallerId": exophone or customer_phone,
             "Url": flow_url,
+            "CallType": "trans",
             "TimeLimit": str(time_limit),
             "StatusCallback": callback_url
         }
+        if call_id:
+            payload["CustomField"] = f"call_id={call_id}&phone={customer_phone}"
 
         try:
             auth = httpx.BasicAuth(api_key, api_token)
@@ -3786,6 +3787,7 @@ async def test_exotel_diagnostic(phone_number: str):
         "configured_sid": (settings.EXOTEL_SID[:4] + "***") if settings.EXOTEL_SID else "MISSING (Set in Render)",
         "configured_caller_id": settings.EXOTEL_CALLER_NUMBER or "MISSING (Set in Render)",
         "subdomain": settings.EXOTEL_SUBDOMAIN,
+        "app_id": settings.EXOTEL_APP_ID or "1361419",
         "target_phone": phone_number,
         "exotel_result": res
     }
