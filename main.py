@@ -19,7 +19,7 @@ from typing import Optional, List, Dict, Any
 from fastapi import (
     Header, Query,
     FastAPI, APIRouter, Depends, HTTPException, status,
-    UploadFile, File, Form, BackgroundTasks, Request, Security, Response
+    UploadFile, File, Form, BackgroundTasks, Request, Security, Response, WebSocket, WebSocketDisconnect
 )
 import smtplib
 import ssl
@@ -1694,6 +1694,256 @@ async def voice_chat_endpoint(chat_in: VoiceChatRequest, request: Request, db: A
 # ==============================================================================
 # 8. AUDIO SAMPLES & DIAGNOSTIC APIS
 # ==============================================================================
+# =============================================================================
+# EXOTEL BIDIRECTIONAL VOICEBOT WEBSOCKET
+# Exotel sends JSON events containing base64 Linear16 PCM, 8 kHz, mono.
+# Uses Deepgram REST STT, existing /api/voice/chat (Gemini/Groq + KB + Sarvam),
+# and returns the generated WAV as 8 kHz mono PCM media events.
+# =============================================================================
+def _pcm16_rms(pcm: bytes) -> float:
+    """RMS amplitude for little-endian signed 16-bit PCM without extra dependencies."""
+    if len(pcm) < 2:
+        return 0.0
+    usable = len(pcm) - (len(pcm) % 2)
+    total = 0.0
+    count = usable // 2
+    for i in range(0, usable, 2):
+        sample = int.from_bytes(pcm[i:i + 2], byteorder="little", signed=True)
+        total += sample * sample
+    return math.sqrt(total / max(1, count))
+
+
+def _wav_to_pcm8k_mono(audio_bytes: bytes) -> bytes:
+    """Convert a standard PCM WAV response to 8 kHz mono PCM16 for Exotel."""
+    import io
+    import wave
+    with wave.open(io.BytesIO(audio_bytes), "rb") as wf:
+        channels = wf.getnchannels()
+        sample_width = wf.getsampwidth()
+        sample_rate = wf.getframerate()
+        frames = wf.readframes(wf.getnframes())
+    if sample_width != 2:
+        raise ValueError(f"Sarvam WAV must be 16-bit PCM; got {sample_width * 8}-bit")
+    if channels > 1:
+        mono = bytearray()
+        stride = 2 * channels
+        for i in range(0, len(frames) - (len(frames) % stride), stride):
+            vals = [int.from_bytes(frames[i + 2*j:i + 2*j + 2], "little", signed=True) for j in range(channels)]
+            val = max(-32768, min(32767, int(sum(vals) / channels)))
+            mono.extend(val.to_bytes(2, "little", signed=True))
+        frames = bytes(mono)
+    if sample_rate == 8000:
+        return frames
+    if sample_rate <= 0:
+        raise ValueError("Invalid WAV sample rate")
+    source_count = len(frames) // 2
+    target_count = int(source_count * 8000 / sample_rate)
+    out = bytearray()
+    for target_idx in range(target_count):
+        source_pos = target_idx * sample_rate / 8000
+        left = min(int(source_pos), max(0, source_count - 1))
+        right = min(left + 1, max(0, source_count - 1))
+        frac = source_pos - left
+        a = int.from_bytes(frames[left*2:left*2+2], "little", signed=True) if source_count else 0
+        b = int.from_bytes(frames[right*2:right*2+2], "little", signed=True) if source_count else 0
+        val = max(-32768, min(32767, int(a + (b - a) * frac)))
+        out.extend(val.to_bytes(2, "little", signed=True))
+    return bytes(out)
+
+
+async def _exotel_transcribe_pcm(pcm: bytes) -> str:
+    """Transcribe one caller utterance with Deepgram's prerecorded-audio endpoint."""
+    if not settings.DEEPGRAM_API_KEY:
+        logger.error("Exotel Voicebot: DEEPGRAM_API_KEY is missing; cannot transcribe caller audio")
+        return ""
+    if len(pcm) < 3200:
+        return ""
+    url = "https://api.deepgram.com/v1/listen?model=nova-3&language=hi&encoding=linear16&sample_rate=8000&channels=1&smart_format=true"
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            res = await client.post(url, content=pcm, headers={
+                "Authorization": f"Token {settings.DEEPGRAM_API_KEY}",
+                "Content-Type": "audio/raw",
+            })
+        if res.status_code != 200:
+            logger.warning("Exotel Voicebot Deepgram status %s: %s", res.status_code, res.text[:300])
+            return ""
+        data = res.json()
+        alternatives = data.get("results", {}).get("channels", [{}])[0].get("alternatives", [])
+        transcript = alternatives[0].get("transcript", "").strip() if alternatives else ""
+        logger.info("Exotel Voicebot transcription chars=%s", len(transcript))
+        return transcript
+    except Exception as exc:
+        logger.exception("Exotel Voicebot transcription failed: %s", exc)
+        return ""
+
+
+async def _exotel_get_ai_audio(transcript: str, business_name: str = "MyBot Genie", business_type: str = "AI Calling Solution", conversation_history: Optional[List[Dict[str, str]]] = None) -> tuple[str, bytes]:
+    """Reuse the deployed HTTP voice-chat API and convert Sarvam WAV to Exotel PCM."""
+    api_url = "https://call-genie-bs6x.onrender.com/api/voice/chat"
+    payload = {
+        "message": transcript,
+        "client_name": "सर",
+        "business_name": business_name,
+        "business_type": business_type,
+        "conversation_history": (conversation_history or [])[-6:],
+    }
+    try:
+        async with httpx.AsyncClient(timeout=25.0) as client:
+            res = await client.post(api_url, json=payload)
+        if res.status_code != 200:
+            logger.warning("Exotel Voicebot /api/voice/chat status %s: %s", res.status_code, res.text[:300])
+            return "", b""
+        data = res.json()
+        reply = str(data.get("reply") or "").strip()
+        audio_b64 = data.get("audio_base64")
+        if not audio_b64:
+            logger.warning("Exotel Voicebot AI returned no audio_base64")
+            return reply, b""
+        raw_audio = base64.b64decode(audio_b64)
+        if raw_audio[:4] != b"RIFF":
+            logger.warning("Exotel Voicebot: Sarvam audio is not WAV/RIFF; cannot safely convert to Exotel PCM")
+            return reply, b""
+        return reply, _wav_to_pcm8k_mono(raw_audio)
+    except Exception as exc:
+        logger.exception("Exotel Voicebot AI/TTS request failed: %s", exc)
+        return "", b""
+
+
+async def _exotel_send_pcm(websocket: WebSocket, stream_sid: str, pcm: bytes) -> None:
+    """Send aligned PCM16 audio packets to Exotel."""
+    if not pcm:
+        return
+    chunk_size = 3200
+    for offset in range(0, len(pcm), chunk_size):
+        chunk = pcm[offset:offset + chunk_size]
+        if len(chunk) % 320:
+            chunk += b"\x00" * (320 - (len(chunk) % 320))
+        if len(chunk) < 3200:
+            chunk += b"\x00" * (3200 - len(chunk))
+        await websocket.send_json({
+            "event": "media",
+            "stream_sid": stream_sid,
+            "media": {"payload": base64.b64encode(chunk).decode("ascii")},
+        })
+        await asyncio.sleep(0.01)
+
+
+@app.websocket("/api/telephony/exotel/voicebot")
+async def exotel_voicebot_websocket(websocket: WebSocket):
+    """Exotel Voicebot bidirectional media endpoint (PCM16 8 kHz mono)."""
+    await websocket.accept()
+    stream_sid = ""
+    utterance = bytearray()
+    speech_started = False
+    silence_bytes = 0
+    silence_threshold = 900.0
+    silence_limit_bytes = 12_800  # 800 ms at 8 kHz PCM16 mono
+    max_utterance_bytes = 160_000  # cap one utterance at about 10 seconds
+    bot_busy = False
+    active_turn_task = None
+    conversation_history: List[Dict[str, str]] = []
+    playback_done = asyncio.Event()
+
+    async def process_caller_turn(caller_audio: bytes, active_stream_sid: str):
+        nonlocal bot_busy
+        try:
+            transcript = await _exotel_transcribe_pcm(caller_audio)
+            if not transcript:
+                logger.info("Exotel Voicebot: no transcript produced for this turn")
+                return
+            logger.info("Exotel Voicebot caller said: %s", transcript[:250])
+            reply, response_pcm = await _exotel_get_ai_audio(transcript, conversation_history=conversation_history)
+            conversation_history.extend([{"role": "user", "content": transcript}, {"role": "assistant", "content": reply}])
+            del conversation_history[:-6]
+            if response_pcm and active_stream_sid:
+                playback_done.clear()
+                await _exotel_send_pcm(websocket, active_stream_sid, response_pcm)
+                await websocket.send_json({
+                    "event": "mark",
+                    "stream_sid": active_stream_sid,
+                    "mark": {"name": "ai-turn-complete"},
+                })
+                try:
+                    await asyncio.wait_for(playback_done.wait(), timeout=120.0)
+                except asyncio.TimeoutError:
+                    logger.warning("Exotel Voicebot playback mark timed out sid=%s", active_stream_sid)
+            else:
+                logger.warning("Exotel Voicebot could not create playable reply audio; reply_chars=%s", len(reply))
+        except Exception as turn_exc:
+            logger.exception("Exotel Voicebot turn processing failed: %s", turn_exc)
+        finally:
+            bot_busy = False
+
+    try:
+        while True:
+            raw_msg = await websocket.receive_text()
+            try:
+                event = json.loads(raw_msg)
+            except json.JSONDecodeError:
+                logger.warning("Exotel Voicebot received invalid JSON")
+                continue
+            event_type = event.get("event")
+            if event_type == "connected":
+                logger.info("Exotel Voicebot WebSocket connected")
+            elif event_type == "start":
+                start_data = event.get("start") or {}
+                stream_sid = str(start_data.get("stream_sid") or event.get("stream_sid") or "")
+                logger.info("Exotel Voicebot stream started sid=%s from=%s", stream_sid, start_data.get("from", ""))
+            elif event_type == "media":
+                if bot_busy:
+                    continue
+                media = event.get("media") or {}
+                payload_b64 = media.get("payload")
+                if not payload_b64:
+                    continue
+                try:
+                    pcm = base64.b64decode(payload_b64)
+                except Exception:
+                    continue
+                if not pcm:
+                    continue
+                rms = _pcm16_rms(pcm)
+                if rms >= silence_threshold:
+                    speech_started = True
+                    silence_bytes = 0
+                    utterance.extend(pcm)
+                elif speech_started:
+                    utterance.extend(pcm)
+                    silence_bytes += len(pcm)
+                if speech_started and (silence_bytes >= silence_limit_bytes or len(utterance) >= max_utterance_bytes):
+                    caller_audio = bytes(utterance)
+                    utterance.clear()
+                    speech_started = False
+                    silence_bytes = 0
+                    if len(caller_audio) < 6400:
+                        continue
+                    bot_busy = True
+                    active_turn_task = asyncio.create_task(process_caller_turn(caller_audio, stream_sid))
+            elif event_type == "stop":
+                logger.info("Exotel Voicebot stream stopped sid=%s reason=%s", stream_sid, (event.get("stop") or {}).get("reason", ""))
+                break
+            elif event_type == "dtmf":
+                logger.info("Exotel Voicebot DTMF received: %s", (event.get("dtmf") or {}).get("digit"))
+            elif event_type == "mark":
+                mark_name = (event.get("mark") or {}).get("name", "")
+                logger.debug("Exotel Voicebot playback mark received: %s", mark_name)
+                if mark_name == "ai-turn-complete":
+                    playback_done.set()
+    except WebSocketDisconnect:
+        logger.info("Exotel Voicebot WebSocket disconnected sid=%s", stream_sid)
+        if active_turn_task and not active_turn_task.done():
+            active_turn_task.cancel()
+    except Exception as exc:
+        logger.exception("Exotel Voicebot WebSocket error sid=%s: %s", stream_sid, exc)
+        if active_turn_task and not active_turn_task.done():
+            active_turn_task.cancel()
+        try:
+            await websocket.close(code=1011)
+        except Exception:
+            pass
+
+
 SAMPLE_RECORDINGS = {
     "automotive": {
         "name": "रोहन (Rohan)",
