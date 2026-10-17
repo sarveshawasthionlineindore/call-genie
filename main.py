@@ -13,6 +13,8 @@ import hmac
 import re
 import time
 import random
+import io
+import wave
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
 
@@ -691,7 +693,10 @@ class WhatsAppService:
         customer_name: Optional[str] = None,
         custom_message: Optional[str] = None,
         tenant_id: Optional[str] = None,
-        db: Optional[AsyncSession] = None
+        db: Optional[AsyncSession] = None,
+        template_parameters: Optional[List[str]] = None,
+        template_name_override: Optional[str] = None,
+        template_lang_override: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Sends post-call WhatsApp follow-up.
@@ -724,6 +729,14 @@ class WhatsAppService:
             except Exception as e:
                 logger.warning(f"Error reading tenant whatsapp config: {e}")
 
+        if template_name_override:
+            target_template = template_name_override
+        if template_lang_override:
+            target_lang = template_lang_override
+        normalized_lang = (target_lang or "").strip().lower().replace("-", "_")
+        if normalized_lang in {"english us", "english (us)", "english_us", "en_us"}:
+            target_lang = "en_US"
+
         if not target_token or not target_phone_id:
             logger.warning("WhatsApp credentials not set in environment or tenant config.")
             return {"success": False, "error": "Missing WhatsApp credentials"}
@@ -741,6 +754,19 @@ class WhatsAppService:
         }
 
         # Approved Template Components
+        body_values = template_parameters or [
+            display_name,
+            "Automated AI Calls — Handle customer calls 24/7.",
+            "Instant Lead Follow-ups — Connect with leads faster.",
+            "Human-Like Conversations — Engage customers naturally with AI.",
+            "More Conversions — Never miss an opportunity to follow up.",
+            "Save Time & Costs — Reduce manual calling efforts.",
+            "Smart Lead Management — Streamline your calling workflow.",
+            "Scale Your Business with intelligent AI-powered calling!",
+            "Team MyBot Genie, Indore 💜",
+        ]
+        if template_parameters is not None and len(body_values) != 9:
+            return {"success": False, "error": "Voice WhatsApp template requires exactly 9 body parameters"}
         payload_template = {
             "messaging_product": "whatsapp",
             "recipient_type": "individual",
@@ -750,23 +776,13 @@ class WhatsAppService:
                 "name": target_template.strip().replace(" ", "_"),
                 "language": {"code": target_lang},
                 "components": [
-                    {
+                    *([] if template_parameters is not None else [{
                         "type": "header",
                         "parameters": [{"type": "image", "image": {"link": target_banner}}]
-                    },
+                    }]),
                     {
                         "type": "body",
-                        "parameters": [
-                            {"type": "text", "text": display_name},
-                            {"type": "text", "text": "Automated AI Calls — Handle customer calls 24/7."},
-                            {"type": "text", "text": "Instant Lead Follow-ups — Connect with leads faster."},
-                            {"type": "text", "text": "Human-Like Conversations — Engage customers naturally with AI."},
-                            {"type": "text", "text": "More Conversions — Never miss an opportunity to follow up."},
-                            {"type": "text", "text": "Save Time & Costs — Reduce manual calling efforts."},
-                            {"type": "text", "text": "Smart Lead Management — Streamline your calling workflow."},
-                            {"type": "text", "text": "Scale Your Business with intelligent AI-powered calling!"},
-                            {"type": "text", "text": "Team MyBot Genie, Indore 💜"}
-                        ]
+                        "parameters": [{"type": "text", "text": str(value)} for value in body_values]
                     }
                 ]
             }
@@ -779,6 +795,16 @@ class WhatsAppService:
                     logger.info(f"WhatsApp template delivered successfully to {clean_number}")
                     return {"success": True, "mode": "template_9_params", "status_code": res.status_code, "response": res.json()}
                 
+                # A voice-requested approved template must not be replaced with a
+                # different template or free-form text outside WhatsApp's window.
+                if template_parameters is not None:
+                    return {
+                        "success": False,
+                        "mode": "template_9_params",
+                        "status_code": res.status_code,
+                        "error": res.text[:1000],
+                    }
+
                 # Single variable fallback
                 payload_single = {
                     "messaging_product": "whatsapp",
@@ -1447,12 +1473,49 @@ def check_rate_limit(ip: str, max_requests: int = 20, window_seconds: int = 60) 
 class VoiceChatRequest(BaseModel):
     message: str
     client_name: Optional[str] = "ji"
-    business_name: Optional[str] = "MyBot Genie"
-    business_type: Optional[str] = "AI Calling Solution"
+    business_name: Optional[str] = None
+    business_type: Optional[str] = None
     conversation_history: Optional[List[Dict[str, str]]] = None
     agent_id: Optional[str] = None
     tenant_id: Optional[str] = None
     knowledge_context: Optional[str] = None
+    phone_number: Optional[str] = None
+    business_phone: Optional[str] = None
+    language_code: Optional[str] = None
+
+
+# Saaras can detect 22 Indian languages; Bulbul v3 can synthesize 10 Indian
+# languages plus Indian English. Keep these sets separate so unsupported TTS
+# languages fall back transparently rather than sending an invalid API request.
+_VOICE_LANGUAGE_NAMES = {
+    "hi-IN": "Hindi", "bn-IN": "Bengali", "kn-IN": "Kannada",
+    "ml-IN": "Malayalam", "mr-IN": "Marathi", "od-IN": "Odia",
+    "pa-IN": "Punjabi", "ta-IN": "Tamil", "te-IN": "Telugu",
+    "en-IN": "Indian English", "gu-IN": "Gujarati", "as-IN": "Assamese",
+    "ur-IN": "Urdu", "ne-IN": "Nepali", "kok-IN": "Konkani",
+    "ks-IN": "Kashmiri", "sd-IN": "Sindhi", "sa-IN": "Sanskrit",
+    "sat-IN": "Santali", "mni-IN": "Manipuri", "brx-IN": "Bodo",
+    "mai-IN": "Maithili", "doi-IN": "Dogri",
+}
+_BULBUL_V3_SPEAKERS = {
+    "hi-IN": "priya", "bn-IN": "roopa", "kn-IN": "neha",
+    "ml-IN": "pooja", "mr-IN": "priya", "od-IN": "ritu",
+    "pa-IN": "roopa", "ta-IN": "ishita", "te-IN": "priya",
+    "en-IN": "ishita", "gu-IN": "priya",
+}
+
+
+def _voice_language_settings(language_code: Optional[str]) -> tuple[str, str, bool]:
+    """Return (normalized code, v3 speaker, native TTS support)."""
+    code = (language_code or "hi-IN").strip()
+    if code.lower() in {"en", "en-in", "english"}:
+        code = "en-IN"
+    elif len(code) == 2:
+        code = code.lower() + "-IN"
+    elif len(code) > 3:
+        code = code[:2].lower() + code[2:]
+    supported = code in _BULBUL_V3_SPEAKERS
+    return (code if supported else "hi-IN", _BULBUL_V3_SPEAKERS.get(code, "priya"), supported)
 
 def discover_caller_name(user_text: str) -> Optional[str]:
     """
@@ -1519,8 +1582,101 @@ def generate_dynamic_hindi_reply(user_msg: str, client_name: str, biz_name: str,
     # 5. Safe fallback when the caller's words were not understood.
     return f"मैं {b_name} की वॉइस असिस्टेंट हूँ। आपका सवाल मुझे साफ़ सुनाई नहीं दिया; कृपया एक बार छोटे शब्दों में दोहराएँ."
 
+async def _send_voice_requested_whatsapp(
+    phone_number: str,
+    customer_name: str,
+    tenant_id: str,
+    template_parameters: List[str],
+) -> None:
+    """Send the caller-requested, approved nine-variable WhatsApp template."""
+    try:
+        async with AsyncSessionLocal() as wa_db:
+            result = await WhatsAppService.send_post_call_message(
+                phone_number=phone_number,
+                customer_name=customer_name,
+                tenant_id=tenant_id,
+                db=wa_db,
+                template_parameters=template_parameters,
+                template_name_override="alert_reminder_5555555999999",
+                template_lang_override="en_US",
+            )
+        if result.get("success"):
+            logger.info("Caller-requested WhatsApp template sent to %s", WhatsAppService._clean_phone_number(phone_number))
+        else:
+            logger.warning("Caller-requested WhatsApp template failed: %s", result.get("error", result))
+    except Exception as exc:
+        logger.exception("Caller-requested WhatsApp dispatch failed: %s", exc)
+
+
+def _caller_requested_whatsapp(text: str) -> bool:
+    normalized = (text or "").lower()
+    mentions_whatsapp = any(term in normalized for term in ("whatsapp", "व्हाट्सऐप", "व्हाट्सएप", "वॉट्सऐप"))
+    asks_to_send = any(term in normalized for term in ("भेज", "कर दो", "कर देना", "कर दीजिए", "bhej", "send", "share", "detail"))
+    return mentions_whatsapp and asks_to_send
+
+
+def _build_voice_whatsapp_values(
+    customer_name: str,
+    ai_reply: str,
+    question: str,
+    knowledge_context: str,
+    business_phone: Optional[str],
+) -> List[str]:
+    """Fill the approved template from the answer and relevant KB facts only."""
+    values = [customer_name or "Customer", " ".join((ai_reply or "").split())]
+    question_terms = {
+        word.lower() for word in re.findall(r"[A-Za-z0-9\u0900-\u097F]+", question or "")
+        if len(word) > 2 and word.lower() not in {"kya", "hai", "hain", "mujhe", "please", "whatsapp", "detail", "batao", "कर", "दो"}
+    }
+    facts: List[str] = []
+    blocks = re.split(r"\n\s*\n", knowledge_context or "")
+    for block in blocks:
+        title_match = re.match(r"\s*\[([^\]]+)\]\s*:\s*(.*)", block, flags=re.S)
+        if title_match:
+            title, content = title_match.group(1), title_match.group(2)
+            if re.search(r"fictional|imaginary|demo|sample only|काल्पनिक", title + " " + content[:500], re.I):
+                logger.warning("Excluding fictional/demo KB content from WhatsApp details: %s", title[:120])
+                continue
+        else:
+            content = block
+        for sentence in re.split(r"(?<=[.!?।])\s+|[;\n]+", content):
+            cleaned = re.sub(r"\s+", " ", sentence).strip(" -•\t")
+            if len(cleaned) >= 12:
+                facts.append(cleaned[:450])
+
+    ranked = []
+    for index, fact in enumerate(facts):
+        low = fact.lower()
+        score = sum(1 for term in question_terms if term in low)
+        ranked.append((score, index, fact))
+    selected = [fact for score, _, fact in sorted(ranked, key=lambda item: (-item[0], item[1])) if score > 0][:6]
+    if not selected:
+        selected = facts[:6]
+    values.extend(selected)
+
+    safe_fillers = [
+        "Please confirm today's stock before ordering.",
+        "Please confirm the current price with our team.",
+        "Reply here if you need more product information.",
+        "Our team can help with your query.",
+        "Thank you for your interest.",
+        "We will be happy to assist you.",
+    ]
+    fill_index = 0
+    while len(values) < 8:
+        values.append(safe_fillers[fill_index % len(safe_fillers)])
+        fill_index += 1
+    values.append((business_phone or "Reply here for assistance")[:450])
+    return values[:9]
+
+
 @app.post("/api/voice/chat")
-async def voice_chat_endpoint(chat_in: VoiceChatRequest, request: Request, db: AsyncSession = Depends(get_db)):
+async def voice_chat_endpoint(
+    chat_in: VoiceChatRequest,
+    request: Request,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
+):
     """
     High-Class Corporate AI Telecaller powered by Google Gemini and Sarvam AI Bulbul with Voice RAG 2.0.
     Adapts dynamically to any universal business and strictly cites trained knowledge base facts.
@@ -1532,20 +1688,20 @@ async def voice_chat_endpoint(chat_in: VoiceChatRequest, request: Request, db: A
     discovered = discover_caller_name(chat_in.message)
     active_name = discovered or chat_in.client_name or "सर"
 
-    system_prompt = (
-        f"You are the helpful Hindi/Hinglish voice assistant for {chat_in.business_name or 'the business'}. "
-        f"The caller is {active_name}. Answer the caller's latest question directly and accurately. "
-        "Use recent conversation for context. Do not repeat greetings or give a sales pitch unless asked. "
-        "If the question is understandable, do not ask the caller to explain it again. "
-        "Use supplied business knowledge for product details and prices; never invent facts or prices. "
-        "If a requested fact is not in the knowledge, briefly say you do not have that confirmed information. "
-        "Speak naturally in the caller's language, preferably simple Hindi, in one or two short sentences."
-    )
-
-    
     # DYNAMIC ENTERPRISE KNOWLEDGE INJECTION (Voice RAG 2.0)
     k_context = (chat_in.knowledge_context or "").strip()
     active_tenant = chat_in.tenant_id
+    agent_row = None
+
+    if chat_in.agent_id:
+        try:
+            agent_row = (await db.execute(select(Agent).where(Agent.id == chat_in.agent_id))).scalar_one_or_none()
+            if agent_row:
+                if active_tenant and str(active_tenant) != str(agent_row.tenant_id):
+                    logger.warning("Voice request tenant did not match agent tenant; using the agent's tenant")
+                active_tenant = agent_row.tenant_id
+        except Exception as agent_err:
+            logger.warning("Could not load voice agent settings: %s", agent_err)
 
     # Auto-extract tenant_id from Bearer token if not explicitly passed in body
     if not active_tenant:
@@ -1558,6 +1714,46 @@ async def voice_chat_endpoint(chat_in: VoiceChatRequest, request: Request, db: A
             except Exception:
                 pass
 
+    tenant_row = None
+    if active_tenant:
+        try:
+            tenant_row = (await db.execute(select(Tenant).where(Tenant.id == active_tenant))).scalar_one_or_none()
+        except Exception as tenant_err:
+            logger.warning("Could not load voice tenant profile: %s", tenant_err)
+
+    supplied_business_name = (chat_in.business_name or "").strip()
+    business_name = supplied_business_name if supplied_business_name and supplied_business_name.lower() not in {"mybot genie", "the business"} else ""
+    if not business_name:
+        tenant_name = (tenant_row.name if tenant_row else "") or ""
+        if tenant_name.strip().lower() in {"mybot genie", "mybot genie hq"}:
+            tenant_name = ""
+        business_name = tenant_name or (agent_row.name if agent_row else "") or "your business"
+    supplied_business_type = (chat_in.business_type or "").strip()
+    business_type = supplied_business_type if supplied_business_type and supplied_business_type.lower() not in {"ai calling solution", "business"} else ""
+    if not business_type:
+        business_type = ((tenant_row.industry if tenant_row else None) or (agent_row.description if agent_row else None) or "")
+    agent_instructions = (agent_row.system_prompt or "").strip()[:3000] if agent_row else ""
+
+    detected_language = (chat_in.language_code or "hi-IN").strip()
+    language_name = _VOICE_LANGUAGE_NAMES.get(detected_language, "the caller's detected language")
+    speech_language_code, speech_speaker, supports_detected_tts = _voice_language_settings(detected_language)
+    reply_language = language_name if supports_detected_tts else "simple Hindi"
+    if not supports_detected_tts:
+        logger.warning("Detected %s, but Bulbul v3 has no voice for it; speaking Hindi until another TTS provider is configured", detected_language)
+
+    system_prompt = (
+        f"You are the helpful {reply_language} voice assistant for {business_name}. "
+        f"The caller is {active_name}. Answer the caller's latest question directly and accurately. "
+        "Use recent conversation for context. Do not repeat greetings or give a sales pitch unless asked. "
+        "If the question is understandable, do not ask the caller to explain it again. "
+        "Use this business's supplied knowledge for products, prices, availability, dealer/contact details, property listings, and services; never invent facts. "
+        "If a requested fact is not in the knowledge, briefly say it is not confirmed and offer to send only the available information. "
+        f"Speak naturally in {reply_language}; do not switch to another language unless the caller does. "
+        "Use one or two short, conversational sentences."
+    )
+    if agent_instructions:
+        system_prompt += "\n\nBusiness-specific agent instructions (apply only when consistent with verified knowledge):\n" + agent_instructions
+
     if not k_context and (active_tenant or chat_in.agent_id):
         try:
             stmt = select(KnowledgeDocument)
@@ -1567,22 +1763,70 @@ async def voice_chat_endpoint(chat_in: VoiceChatRequest, request: Request, db: A
                 ag = (await db.execute(select(Agent).where(Agent.id == chat_in.agent_id))).scalar_one_or_none()
                 if ag:
                     stmt = stmt.where(KnowledgeDocument.tenant_id == ag.tenant_id)
-            docs = (await db.execute(stmt.order_by(desc(KnowledgeDocument.created_at)).limit(5))).scalars().all()
+            docs = (await db.execute(stmt.order_by(desc(KnowledgeDocument.created_at)).limit(100))).scalars().all()
             if docs:
-                k_context = '\n\n'.join([f'[{d.title}]: ' + (d.raw_content[:2000] if d.raw_content else '') for d in docs])
+                query_terms = {
+                    word.lower() for word in re.findall(r"[A-Za-z0-9\u0900-\u097F]+", chat_in.message or "")
+                    if len(word) > 2 and word.lower() not in {"kya", "hai", "hain", "mujhe", "please", "whatsapp", "detail", "batao"}
+                }
+                ranked_docs = []
+                for index, doc in enumerate(docs):
+                    source_text = f"{doc.title or ''} {doc.raw_content or ''}".lower()
+                    score = sum(1 for term in query_terms if term in source_text)
+                    ranked_docs.append((score, index, doc))
+                selected_docs = [item[2] for item in sorted(ranked_docs, key=lambda item: (-item[0], item[1]))[:5]]
+                k_context = '\n\n'.join([f'[{d.title}]: ' + (d.raw_content[:2000] if d.raw_content else '') for d in selected_docs])
         except Exception as k_err:
             logger.warning(f"Knowledge context fetch note: {k_err}")
 
+    if k_context:
+        kb_blocks = re.split(r"\n\s*\n", k_context)
+        safe_blocks = []
+        for block in kb_blocks:
+            title_match = re.match(r"\s*\[([^\]]+)\]\s*:", block)
+            title = title_match.group(1) if title_match else ""
+            if re.search(r"fictional|imaginary|demo|sample only|काल्पनिक", title + " " + block[:500], re.I):
+                logger.warning("Ignoring fictional/demo knowledge document in voice context: %s", title[:120])
+                continue
+            safe_blocks.append(block)
+        k_context = "\n\n".join(safe_blocks).strip()
     if k_context:
         system_prompt += "\n\n--- OFFICIAL BUSINESS KNOWLEDGE BASE & FACTS (Strict Truth - Cite accurately, do not invent prices or schedules) ---\n" + k_context[:4000]
 
     ai_reply = None
 
-    # Priority 1: Google Gemini (With clean system_instruction and multi-turn context)
+    # Priority 1: Fast Groq response; Gemini is used if this request fails
+    if not ai_reply and settings.GROQ_API_KEY:
+        try:
+            messages = [{"role": "system", "content": system_prompt}]
+            if chat_in.conversation_history:
+                for msg in chat_in.conversation_history[-4:]:
+                    messages.append({"role": msg.get("role", "user"), "content": msg.get("content", "")})
+            messages.append({"role": "user", "content": chat_in.message})
+            async with httpx.AsyncClient(timeout=3.5) as client:
+                res = await client.post(
+                    "https://api.groq.com/openai/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {settings.GROQ_API_KEY}", "Content-Type": "application/json"},
+                    json={
+                        "model": "openai/gpt-oss-20b",
+                        "messages": messages,
+                        "reasoning_effort": "low",
+                        "max_completion_tokens": 160
+                    }
+                )
+                if res.status_code == 200:
+                    ai_reply = res.json()["choices"][0]["message"]["content"].strip()
+                else:
+                    logger.warning("Groq chat status %s: %s", res.status_code, res.text[:500])
+        except Exception as e:
+            logger.warning(f"Groq chat error: {e}")
+
+
+    # Fallback: Google Gemini (With clean system_instruction and multi-turn context)
     if settings.GEMINI_API_KEY:
         for model_name in ["gemini-3.6-flash"]:
             try:
-                async with httpx.AsyncClient(timeout=8.0) as client:
+                async with httpx.AsyncClient(timeout=5.0) as client:
                     gemini_url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent"
                     
                     contents = []
@@ -1619,42 +1863,34 @@ async def voice_chat_endpoint(chat_in: VoiceChatRequest, request: Request, db: A
             if ai_reply:
                 break
 
-    # Priority 2: Groq Llama 3.3
-    if not ai_reply and settings.GROQ_API_KEY:
-        try:
-            messages = [{"role": "system", "content": system_prompt}]
-            if chat_in.conversation_history:
-                for msg in chat_in.conversation_history[-4:]:
-                    messages.append({"role": msg.get("role", "user"), "content": msg.get("content", "")})
-            messages.append({"role": "user", "content": chat_in.message})
-            async with httpx.AsyncClient(timeout=6.0) as client:
-                res = await client.post(
-                    "https://api.groq.com/openai/v1/chat/completions",
-                    headers={"Authorization": f"Bearer {settings.GROQ_API_KEY}", "Content-Type": "application/json"},
-                    json={
-                        "model": "openai/gpt-oss-20b",
-                        "messages": messages,
-                        "reasoning_effort": "low",
-                        "max_completion_tokens": 160
-                    }
-                )
-                if res.status_code == 200:
-                    ai_reply = res.json()["choices"][0]["message"]["content"].strip()
-                else:
-                    logger.warning("Groq chat status %s: %s", res.status_code, res.text[:500])
-        except Exception as e:
-            logger.warning(f"Groq chat error: {e}")
-
     # Priority 3: Universal Corporate Dynamic Hindi Engine
     if not ai_reply:
         ai_reply = generate_dynamic_hindi_reply(
             chat_in.message,
             active_name,
-            chat_in.business_name or "MyBot Genie",
-            chat_in.business_type or "AI Calling Solution",
+            business_name,
+            business_type or "business",
             chat_in.conversation_history,
             knowledge_context=k_context
         )
+
+    if _caller_requested_whatsapp(chat_in.message):
+        if chat_in.phone_number and active_tenant:
+            safe_name = active_name if active_name.lower() not in ("सर", "sir", "ji", "customer") else "Customer"
+            wa_values = _build_voice_whatsapp_values(
+                safe_name, ai_reply, chat_in.message, k_context, chat_in.business_phone
+            )
+            background_tasks.add_task(
+                _send_voice_requested_whatsapp,
+                chat_in.phone_number,
+                safe_name,
+                str(active_tenant),
+                wa_values,
+            )
+        elif not chat_in.phone_number:
+            logger.warning("Caller requested WhatsApp but Exotel did not provide caller phone number")
+        else:
+            logger.warning("Caller requested WhatsApp but the tenant could not be resolved")
 
     clean_speech_text = ai_reply.replace("*", "").replace("#", "").replace("_", "").strip()
 
@@ -1664,12 +1900,12 @@ async def voice_chat_endpoint(chat_in: VoiceChatRequest, request: Request, db: A
             async with httpx.AsyncClient(timeout=12.0) as client:
                 payload_sarvam = {
                     "inputs": [clean_speech_text],
-                    "target_language_code": "hi-IN",
-                    "speaker": "ishita",
+                    "language_code": speech_language_code,
+                    "speaker": speech_speaker,
                     "model": "bulbul:v3",
                     "pace": 1.0,
-                    "speech_sample_rate": 8000,
-                    "temperature": 0.4,
+                    "speech_sample_rate": 16000,
+                    "temperature": 0.6,
                     "enable_preprocessing": True
                 }
                 sarvam_res = await client.post(
@@ -1681,7 +1917,7 @@ async def voice_chat_endpoint(chat_in: VoiceChatRequest, request: Request, db: A
                     audio_base64 = sarvam_res.json().get("audios", [None])[0]
                 else:
                     payload_sarvam["model"] = "bulbul:v3"
-                    payload_sarvam["speaker"] = "ishita"
+                    payload_sarvam["speaker"] = "priya"
                     fb_res = await client.post(
                         "https://api.sarvam.ai/text-to-speech",
                         headers={"api-subscription-key": settings.SARVAM_API_KEY, "Content-Type": "application/json"},
@@ -1721,8 +1957,8 @@ def _pcm16_rms(pcm: bytes) -> float:
     return math.sqrt(total / max(1, count))
 
 
-def _wav_to_pcm8k_mono(audio_bytes: bytes) -> bytes:
-    """Convert a standard PCM WAV response to 8 kHz mono PCM16 for Exotel."""
+def _wav_to_pcm_mono(audio_bytes: bytes, target_sample_rate: int = 8000) -> bytes:
+    """Convert a PCM WAV response to mono PCM16 at Exotel’s negotiated rate."""
     import io
     import wave
     with wave.open(io.BytesIO(audio_bytes), "rb") as wf:
@@ -1740,15 +1976,17 @@ def _wav_to_pcm8k_mono(audio_bytes: bytes) -> bytes:
             val = max(-32768, min(32767, int(sum(vals) / channels)))
             mono.extend(val.to_bytes(2, "little", signed=True))
         frames = bytes(mono)
-    if sample_rate == 8000:
+    if target_sample_rate not in (8000, 16000, 24000):
+        raise ValueError(f"Unsupported Exotel sample rate: {target_sample_rate}")
+    if sample_rate == target_sample_rate:
         return frames
     if sample_rate <= 0:
         raise ValueError("Invalid WAV sample rate")
     source_count = len(frames) // 2
-    target_count = int(source_count * 8000 / sample_rate)
+    target_count = int(source_count * target_sample_rate / sample_rate)
     out = bytearray()
     for target_idx in range(target_count):
-        source_pos = target_idx * sample_rate / 8000
+        source_pos = target_idx * sample_rate / target_sample_rate
         left = min(int(source_pos), max(0, source_count - 1))
         right = min(left + 1, max(0, source_count - 1))
         frac = source_pos - left
@@ -1759,14 +1997,46 @@ def _wav_to_pcm8k_mono(audio_bytes: bytes) -> bytes:
     return bytes(out)
 
 
-async def _exotel_transcribe_pcm(pcm: bytes) -> str:
-    """Transcribe one caller utterance with Deepgram's prerecorded-audio endpoint."""
+async def _exotel_transcribe_pcm(pcm: bytes, sample_rate: int = 8000) -> tuple[str, str]:
+    """Transcribe caller audio with automatic Indian-language detection."""
+    if len(pcm) < int(sample_rate * 2 * 0.2):
+        return "", "hi-IN"
+    if settings.SARVAM_API_KEY:
+        try:
+            # Saaras REST accepts a WAV container; Exotel already supplies
+            # mono signed 16-bit PCM, so wrap it without changing the samples.
+            wav_buffer = io.BytesIO()
+            with wave.open(wav_buffer, "wb") as wav_file:
+                wav_file.setnchannels(1)
+                wav_file.setsampwidth(2)
+                wav_file.setframerate(sample_rate)
+                wav_file.writeframes(pcm)
+            async with httpx.AsyncClient(timeout=20.0) as client:
+                res = await client.post(
+                    "https://api.sarvam.ai/speech-to-text",
+                    headers={"api-subscription-key": settings.SARVAM_API_KEY},
+                    data={"model": "saaras:v4", "mode": "transcribe", "language_code": "unknown"},
+                    files={"file": ("caller.wav", wav_buffer.getvalue(), "audio/wav")},
+                )
+            if res.status_code == 200:
+                result = res.json()
+                transcript = str(result.get("transcript") or "").strip()
+                detected_code = str(result.get("language_code") or "hi-IN").strip()
+                logger.info("Exotel Voicebot Saaras transcription chars=%s detected_language=%s", len(transcript), detected_code)
+                if transcript:
+                    return transcript, detected_code
+            else:
+                logger.warning("Exotel Voicebot Saaras status %s: %s", res.status_code, res.text[:300])
+        except Exception as exc:
+            logger.warning("Exotel Voicebot Saaras transcription failed; trying Deepgram fallback: %s", exc)
+
     if not settings.DEEPGRAM_API_KEY:
-        logger.error("Exotel Voicebot: DEEPGRAM_API_KEY is missing; cannot transcribe caller audio")
-        return ""
-    if len(pcm) < 3200:
-        return ""
-    url = "https://api.deepgram.com/v1/listen?model=nova-3&language=hi&encoding=linear16&sample_rate=8000&channels=1&smart_format=true&keyterm=%E0%A4%AC%E0%A5%80%E0%A4%9C&keyterm=%E0%A4%AC%E0%A5%80%E0%A4%9C%20%E0%A4%95%E0%A4%BE%20%E0%A4%AD%E0%A4%BE%E0%A4%B5&keyterm=%E0%A4%97%E0%A5%87%E0%A4%B9%E0%A5%82%E0%A4%82&keyterm=%E0%A4%B8%E0%A4%B0%E0%A4%B8%E0%A5%8B%E0%A4%82"
+        logger.error("Exotel Voicebot: STT failed and DEEPGRAM_API_KEY is missing")
+        return "", "hi-IN"
+    # Keep STT business-neutral: per-business vocabulary is in each tenant's
+    # knowledge base, so one client's seed terms must not bias another client's call.
+    url = (f"https://api.deepgram.com/v1/listen?model=nova-3&language=hi&encoding=linear16"
+           f"&sample_rate={sample_rate}&channels=1&smart_format=true")
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
             res = await client.post(url, content=pcm, headers={
@@ -1775,18 +2045,18 @@ async def _exotel_transcribe_pcm(pcm: bytes) -> str:
             })
         if res.status_code != 200:
             logger.warning("Exotel Voicebot Deepgram status %s: %s", res.status_code, res.text[:300])
-            return ""
+            return "", "hi-IN"
         data = res.json()
         alternatives = data.get("results", {}).get("channels", [{}])[0].get("alternatives", [])
         transcript = alternatives[0].get("transcript", "").strip() if alternatives else ""
         logger.info("Exotel Voicebot transcription chars=%s", len(transcript))
-        return transcript
+        return transcript, "hi-IN"
     except Exception as exc:
         logger.exception("Exotel Voicebot transcription failed: %s", exc)
-        return ""
+        return "", "hi-IN"
 
 
-async def _exotel_get_ai_audio(transcript: str, business_name: str = "MyBot Genie", business_type: str = "AI Calling Solution", conversation_history: Optional[List[Dict[str, str]]] = None, tenant_id: Optional[str] = None, agent_id: Optional[str] = None) -> tuple[str, bytes]:
+async def _exotel_get_ai_audio(transcript: str, business_name: str = "", business_type: str = "", conversation_history: Optional[List[Dict[str, str]]] = None, tenant_id: Optional[str] = None, agent_id: Optional[str] = None, sample_rate: int = 8000, phone_number: Optional[str] = None, business_phone: Optional[str] = None, language_code: str = "hi-IN") -> tuple[str, bytes]:
     """Reuse the deployed HTTP voice-chat API and convert Sarvam WAV to Exotel PCM."""
     api_url = "https://call-genie-bs6x.onrender.com/api/voice/chat"
     payload = {
@@ -1797,6 +2067,9 @@ async def _exotel_get_ai_audio(transcript: str, business_name: str = "MyBot Geni
         "conversation_history": (conversation_history or [])[-6:],
         "tenant_id": tenant_id,
         "agent_id": agent_id,
+        "phone_number": phone_number,
+        "business_phone": business_phone,
+        "language_code": language_code,
     }
     try:
         async with httpx.AsyncClient(timeout=25.0) as client:
@@ -1814,17 +2087,19 @@ async def _exotel_get_ai_audio(transcript: str, business_name: str = "MyBot Geni
         if raw_audio[:4] != b"RIFF":
             logger.warning("Exotel Voicebot: Sarvam audio is not WAV/RIFF; cannot safely convert to Exotel PCM")
             return reply, b""
-        return reply, _wav_to_pcm8k_mono(raw_audio)
+        return reply, _wav_to_pcm_mono(raw_audio, target_sample_rate=sample_rate)
     except Exception as exc:
         logger.exception("Exotel Voicebot AI/TTS request failed: %s", exc)
         return "", b""
 
 
-async def _exotel_send_pcm(websocket: WebSocket, stream_sid: str, pcm: bytes) -> None:
+async def _exotel_send_pcm(websocket: WebSocket, stream_sid: str, pcm: bytes, sample_rate: int = 8000) -> None:
     """Send aligned PCM16 audio packets to Exotel."""
     if not pcm:
         return
-    chunk_size = 3200
+    # About 200 ms per packet at 8/16/24 kHz, with Exotel's minimum packet size.
+    chunk_size = max(3200, int(sample_rate * 2 * 0.2))
+    chunk_size = ((chunk_size + 319) // 320) * 320
     for offset in range(0, len(pcm), chunk_size):
         chunk = pcm[offset:offset + chunk_size]
         if len(chunk) % 320:
@@ -1841,15 +2116,16 @@ async def _exotel_send_pcm(websocket: WebSocket, stream_sid: str, pcm: bytes) ->
 
 @app.websocket("/api/telephony/exotel/voicebot")
 async def exotel_voicebot_websocket(websocket: WebSocket):
-    """Exotel Voicebot bidirectional media endpoint (PCM16 8 kHz mono)."""
+    """Exotel Voicebot bidirectional media endpoint (PCM16 mono, negotiated 8/16/24 kHz)."""
     await websocket.accept()
     stream_sid = ""
+    sample_rate = 8000
     utterance = bytearray()
     speech_started = False
     silence_bytes = 0
     silence_threshold = 900.0
-    silence_limit_bytes = 12_800  # 800 ms at 8 kHz PCM16 mono
-    max_utterance_bytes = 160_000  # cap one utterance at about 10 seconds
+    silence_limit_bytes = int(sample_rate * 2 * 0.8)
+    max_utterance_bytes = int(sample_rate * 2 * 10)  # cap one utterance at about 10 seconds
     bot_busy = False
     active_turn_task = None
     conversation_history: List[Dict[str, str]] = []
@@ -1859,24 +2135,28 @@ async def exotel_voicebot_websocket(websocket: WebSocket):
     async def process_caller_turn(caller_audio: bytes, active_stream_sid: str):
         nonlocal bot_busy
         try:
-            transcript = await _exotel_transcribe_pcm(caller_audio)
+            transcript, detected_language = await _exotel_transcribe_pcm(caller_audio, sample_rate=sample_rate)
             if not transcript:
                 logger.info("Exotel Voicebot: no transcript produced for this turn")
                 return
             logger.info("Exotel Voicebot caller said: %s", transcript[:250])
             reply, response_pcm = await _exotel_get_ai_audio(
                 transcript,
-                business_name=voice_context.get("business_name", "MyBot Genie"),
-                business_type=voice_context.get("business_type", "AI Calling Solution"),
+                business_name=voice_context.get("business_name", ""),
+                business_type=voice_context.get("business_type", ""),
                 conversation_history=conversation_history,
                 tenant_id=voice_context.get("tenant_id"),
                 agent_id=voice_context.get("agent_id"),
+                sample_rate=sample_rate,
+                phone_number=voice_context.get("phone_number"),
+                business_phone=voice_context.get("business_phone"),
+                language_code=detected_language,
             )
             conversation_history.extend([{"role": "user", "content": transcript}, {"role": "assistant", "content": reply}])
             del conversation_history[:-6]
             if response_pcm and active_stream_sid:
                 playback_done.clear()
-                await _exotel_send_pcm(websocket, active_stream_sid, response_pcm)
+                await _exotel_send_pcm(websocket, active_stream_sid, response_pcm, sample_rate=sample_rate)
                 await websocket.send_json({
                     "event": "mark",
                     "stream_sid": active_stream_sid,
@@ -1907,14 +2187,26 @@ async def exotel_voicebot_websocket(websocket: WebSocket):
             elif event_type == "start":
                 start_data = event.get("start") or {}
                 stream_sid = str(start_data.get("stream_sid") or event.get("stream_sid") or "")
+                if start_data.get("from"):
+                    voice_context["phone_number"] = str(start_data["from"]).strip()
+                if start_data.get("to"):
+                    voice_context["business_phone"] = str(start_data["to"]).strip()
+                media_format = start_data.get("media_format") or {}
+                try:
+                    requested_rate = int(media_format.get("sample_rate") or sample_rate)
+                    sample_rate = requested_rate if requested_rate in (8000, 16000, 24000) else 8000
+                except (TypeError, ValueError):
+                    sample_rate = 8000
+                silence_limit_bytes = int(sample_rate * 2 * 0.8)
+                max_utterance_bytes = int(sample_rate * 2 * 10)
                 custom = start_data.get("custom_parameters") or {}
                 if isinstance(custom, dict):
                     for key in ("tenant_id", "agent_id", "business_name", "business_type"):
                         value = custom.get(key)
                         if value:
                             voice_context[key] = str(value)
-                logger.info("Exotel Voicebot stream started sid=%s from=%s context=%s",
-                            stream_sid, start_data.get("from", ""),
+                logger.info("Exotel Voicebot stream started sid=%s from=%s rate=%s context=%s",
+                            stream_sid, start_data.get("from", ""), sample_rate,
                             ",".join(sorted(voice_context.keys())))
             elif event_type == "media":
                 if bot_busy:
@@ -1948,6 +2240,9 @@ async def exotel_voicebot_websocket(websocket: WebSocket):
                     active_turn_task = asyncio.create_task(process_caller_turn(caller_audio, stream_sid))
             elif event_type == "stop":
                 logger.info("Exotel Voicebot stream stopped sid=%s reason=%s", stream_sid, (event.get("stop") or {}).get("reason", ""))
+                if active_turn_task and not active_turn_task.done():
+                    active_turn_task.cancel()
+                    await asyncio.gather(active_turn_task, return_exceptions=True)
                 break
             elif event_type == "dtmf":
                 logger.info("Exotel Voicebot DTMF received: %s", (event.get("dtmf") or {}).get("digit"))
@@ -3976,7 +4271,7 @@ async def exotel_greeting_audio(request: Request, phone: Optional[str] = None):
 
     greeting_text = "नमस्ते! मायबॉट जीनी एआई कॉलिंग में आपका स्वागत है। हमारे सीनियर कंसलटेंट जल्द ही आपसे संपर्क करेंगे। हम आपको सम्पूर्ण विवरण व्हाट्सएप पर भी भेज रहे हैं। कॉल करने के लिए धन्यवाद!"
 
-    # 1. Try Sarvam AI Bulbul (Priya Voice - authentic Hindi telecalling, 8000Hz Telecom Mono)
+    # 1. Try Sarvam AI Bulbul Ishita voice for the 8 kHz Exotel greeting.
     if settings.SARVAM_API_KEY:
         try:
             payload_priya = {
