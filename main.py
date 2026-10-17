@@ -1510,10 +1510,14 @@ def generate_dynamic_hindi_reply(user_msg: str, client_name: str, biz_name: str,
     if any(w in msg for w in ["price", "rate", "cost", "kharcha", "kitna lagega", "fees", "रुपये", "रेट", "भाव", "दाम", "कीमत", "seeds", "बीज", "वैरायटी", "वैराइटी"]):
         if knowledge_context:
             return f"जी {c_name}, हमारे पास {b_name} के सभी उत्पादों व सेवाओं की प्रमाणित दरें उपलब्ध हैं। कृपया विशिष्ट वैरायटी या आइटम का नाम बताएं ताकि मैं सही भाव बता सकूँ।"
-        return f"जी बिल्कुल {c_name}, हमारे {b_name} के उत्पादों और दरों की पूरी जानकारी उपलब्ध है। आप किस विशिष्ट उत्पाद के भाव के बारे में जानना चाहते हैं?"
+        return f"जी {c_name}, इस समय मेरे पास {b_name} के उत्पादों का सत्यापित भाव उपलब्ध नहीं है। सही भाव के लिए उत्पाद या वैरायटी का नाम बताइए।"
 
-    # 4. Universal contextual discovery
-    return f"जी बिल्कुल {c_name}, {b_name} में हम ग्राहकों की आवश्यकता के अनुसार पूरी जानकारी और सेवा प्रदान करते हैं। कृपया अपना प्रश्न थोड़ा विस्तार से बताएं ताकि मैं आपको सही जानकारी दे सकूँ।"
+    # 4. Answer common identity questions directly instead of asking the caller to repeat.
+    if any(w in msg for w in ["कहाँ से", "कहां से", "where are you calling", "where are you from"]):
+        return f"मैं {b_name} की ओर से बात कर रही हूँ। बताइए, मैं आपके किस सवाल में मदद करूँ?"
+
+    # 5. Safe fallback when the caller's words were not understood.
+    return f"मैं {b_name} की वॉइस असिस्टेंट हूँ। आपका सवाल मुझे साफ़ सुनाई नहीं दिया; कृपया एक बार छोटे शब्दों में दोहराएँ."
 
 @app.post("/api/voice/chat")
 async def voice_chat_endpoint(chat_in: VoiceChatRequest, request: Request, db: AsyncSession = Depends(get_db)):
@@ -1529,18 +1533,13 @@ async def voice_chat_endpoint(chat_in: VoiceChatRequest, request: Request, db: A
     active_name = discovered or chat_in.client_name or "सर"
 
     system_prompt = (
-        f"You are a sophisticated, high-class corporate telecalling executive representing '{chat_in.business_name}' by MyBot Genie. "
-        f"You are speaking with {active_name} on a live enterprise consultation call. "
-        "STRICT EXECUTIVE PERSONA GUIDELINES: "
-        "1. TONE & ETIQUETTE: Speak like an articulate, high-class corporate woman or executive man from a premium Indian MNC. "
-        "2. FORBIDDEN WORDS: NEVER say repetitive colloquial cliches like 'जी सर जी', 'जी सर जी', 'अरे वाह', 'जी मैंने समझ लिया'. "
-        "3. ELEGANT VOCABULARY: Use dignified, refined corporate Hindi/Hinglish like 'सादर नमस्कार', 'बिल्कुल', 'ज़रूर', 'निश्चित रूप से', 'शानदार'. "
-        "4. UNIVERSAL BUSINESS MASTERY: Adapt immediately to ANY industry the caller mentions (Seeds/Agriculture, Real Estate, Clinics, Coaching, CA, Manufacturing, Solar, Retail, Jewellery). "
-        "5. SHOW, DON'T TELL: If the user mentions their business (e.g. seeds), immediately demonstrate an actual realistic, polished phone pitch calling their customers. "
-        "6. NUMBERS & METRICS: If the caller mentions volume (e.g. 10 to 15 calls), acknowledge it with executive professionalism and discuss instant WhatsApp follow-up. "
-        "7. LENGTH: Keep responses crisp and impactful (20 to 30 words max). "
-        "8. SCRIPT: Write in clean Devanagari Hindi (हिंदी) so speech synthesis sounds natural and human. "
-        "9. FESTIVAL & OCCASION BROADCAST MODE: If the call is a Festival Greeting (e.g. Diwali/New Year Wishes), wish the customer with warmth. If they say 'Happy Diwali / Same to you', reciprocate gracefully with blessings. If they ask a business question during the greeting call, answer politely and offer to share full details over WhatsApp post-call so the festive spirit is preserved."
+        f"You are the helpful Hindi/Hinglish voice assistant for {chat_in.business_name or 'the business'}. "
+        f"The caller is {active_name}. Answer the caller's latest question directly and accurately. "
+        "Use recent conversation for context. Do not repeat greetings or give a sales pitch unless asked. "
+        "If the question is understandable, do not ask the caller to explain it again. "
+        "Use supplied business knowledge for product details and prices; never invent facts or prices. "
+        "If a requested fact is not in the knowledge, briefly say you do not have that confirmed information. "
+        "Speak naturally in the caller's language, preferably simple Hindi, in one or two short sentences."
     )
 
     
@@ -1581,7 +1580,7 @@ async def voice_chat_endpoint(chat_in: VoiceChatRequest, request: Request, db: A
 
     # Priority 1: Google Gemini (With clean system_instruction and multi-turn context)
     if settings.GEMINI_API_KEY:
-        for model_name in ["gemini-3.8-flash", "gemini-3.6-flash"]:
+        for model_name in ["gemini-3.6-flash"]:
             try:
                 async with httpx.AsyncClient(timeout=8.0) as client:
                     gemini_url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent"
@@ -1598,14 +1597,20 @@ async def voice_chat_endpoint(chat_in: VoiceChatRequest, request: Request, db: A
                             "parts": [{"text": system_prompt}]
                         },
                         "contents": contents,
-                        "generationConfig": {"temperature": 0.6, "maxOutputTokens": 100}
+                        "generationConfig": {"temperature": 0.3, "maxOutputTokens": 180, "thinkingConfig": {"thinkingLevel": "minimal"}}
                     }
                     res = await client.post(gemini_url, headers={"x-goog-api-key": settings.GEMINI_API_KEY}, json=payload)
                     if res.status_code == 200:
                         cand = res.json().get("candidates", [])
                         if cand:
-                            ai_reply = cand[0].get("content", {}).get("parts", [{}])[0].get("text", "").strip()
-                            if ai_reply:
+                            parts = cand[0].get("content", {}).get("parts", [])
+                            visible_text = [part.get("text", "").strip() for part in parts
+                                            if part.get("text") and not part.get("thought")]
+                            ai_reply = " ".join(text for text in visible_text if text).strip()
+                            if not ai_reply:
+                                logger.warning("Gemini %s returned no visible text; finishReason=%s",
+                                               model_name, cand[0].get("finishReason"))
+                            else:
                                 break
                     else:
                         logger.warning(f"Gemini {model_name} status {res.status_code}: {res.text}")
@@ -1627,10 +1632,10 @@ async def voice_chat_endpoint(chat_in: VoiceChatRequest, request: Request, db: A
                     "https://api.groq.com/openai/v1/chat/completions",
                     headers={"Authorization": f"Bearer {settings.GROQ_API_KEY}", "Content-Type": "application/json"},
                     json={
-                        "model": "llama-3.3-70b-versatile",
+                        "model": "openai/gpt-oss-20b",
                         "messages": messages,
-                        "temperature": 0.6,
-                        "max_tokens": 80
+                        "reasoning_effort": "low",
+                        "max_completion_tokens": 160
                     }
                 )
                 if res.status_code == 200:
@@ -1660,10 +1665,11 @@ async def voice_chat_endpoint(chat_in: VoiceChatRequest, request: Request, db: A
                 payload_sarvam = {
                     "inputs": [clean_speech_text],
                     "target_language_code": "hi-IN",
-                    "speaker": "priya",
+                    "speaker": "ishita",
                     "model": "bulbul:v3",
-                    "pace": 1.08,
-                    "speech_sample_rate": 16000,
+                    "pace": 1.0,
+                    "speech_sample_rate": 8000,
+                    "temperature": 0.4,
                     "enable_preprocessing": True
                 }
                 sarvam_res = await client.post(
@@ -1675,7 +1681,7 @@ async def voice_chat_endpoint(chat_in: VoiceChatRequest, request: Request, db: A
                     audio_base64 = sarvam_res.json().get("audios", [None])[0]
                 else:
                     payload_sarvam["model"] = "bulbul:v3"
-                    payload_sarvam["speaker"] = "priya"
+                    payload_sarvam["speaker"] = "ishita"
                     fb_res = await client.post(
                         "https://api.sarvam.ai/text-to-speech",
                         headers={"api-subscription-key": settings.SARVAM_API_KEY, "Content-Type": "application/json"},
@@ -1760,7 +1766,7 @@ async def _exotel_transcribe_pcm(pcm: bytes) -> str:
         return ""
     if len(pcm) < 3200:
         return ""
-    url = "https://api.deepgram.com/v1/listen?model=nova-3&language=hi&encoding=linear16&sample_rate=8000&channels=1&smart_format=true"
+    url = "https://api.deepgram.com/v1/listen?model=nova-3&language=hi&encoding=linear16&sample_rate=8000&channels=1&smart_format=true&keyterm=%E0%A4%AC%E0%A5%80%E0%A4%9C&keyterm=%E0%A4%AC%E0%A5%80%E0%A4%9C%20%E0%A4%95%E0%A4%BE%20%E0%A4%AD%E0%A4%BE%E0%A4%B5&keyterm=%E0%A4%97%E0%A5%87%E0%A4%B9%E0%A5%82%E0%A4%82&keyterm=%E0%A4%B8%E0%A4%B0%E0%A4%B8%E0%A5%8B%E0%A4%82"
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
             res = await client.post(url, content=pcm, headers={
@@ -1780,7 +1786,7 @@ async def _exotel_transcribe_pcm(pcm: bytes) -> str:
         return ""
 
 
-async def _exotel_get_ai_audio(transcript: str, business_name: str = "MyBot Genie", business_type: str = "AI Calling Solution", conversation_history: Optional[List[Dict[str, str]]] = None) -> tuple[str, bytes]:
+async def _exotel_get_ai_audio(transcript: str, business_name: str = "MyBot Genie", business_type: str = "AI Calling Solution", conversation_history: Optional[List[Dict[str, str]]] = None, tenant_id: Optional[str] = None, agent_id: Optional[str] = None) -> tuple[str, bytes]:
     """Reuse the deployed HTTP voice-chat API and convert Sarvam WAV to Exotel PCM."""
     api_url = "https://call-genie-bs6x.onrender.com/api/voice/chat"
     payload = {
@@ -1789,6 +1795,8 @@ async def _exotel_get_ai_audio(transcript: str, business_name: str = "MyBot Geni
         "business_name": business_name,
         "business_type": business_type,
         "conversation_history": (conversation_history or [])[-6:],
+        "tenant_id": tenant_id,
+        "agent_id": agent_id,
     }
     try:
         async with httpx.AsyncClient(timeout=25.0) as client:
@@ -1845,6 +1853,7 @@ async def exotel_voicebot_websocket(websocket: WebSocket):
     bot_busy = False
     active_turn_task = None
     conversation_history: List[Dict[str, str]] = []
+    voice_context: Dict[str, str] = {}
     playback_done = asyncio.Event()
 
     async def process_caller_turn(caller_audio: bytes, active_stream_sid: str):
@@ -1855,7 +1864,14 @@ async def exotel_voicebot_websocket(websocket: WebSocket):
                 logger.info("Exotel Voicebot: no transcript produced for this turn")
                 return
             logger.info("Exotel Voicebot caller said: %s", transcript[:250])
-            reply, response_pcm = await _exotel_get_ai_audio(transcript, conversation_history=conversation_history)
+            reply, response_pcm = await _exotel_get_ai_audio(
+                transcript,
+                business_name=voice_context.get("business_name", "MyBot Genie"),
+                business_type=voice_context.get("business_type", "AI Calling Solution"),
+                conversation_history=conversation_history,
+                tenant_id=voice_context.get("tenant_id"),
+                agent_id=voice_context.get("agent_id"),
+            )
             conversation_history.extend([{"role": "user", "content": transcript}, {"role": "assistant", "content": reply}])
             del conversation_history[:-6]
             if response_pcm and active_stream_sid:
@@ -1891,7 +1907,15 @@ async def exotel_voicebot_websocket(websocket: WebSocket):
             elif event_type == "start":
                 start_data = event.get("start") or {}
                 stream_sid = str(start_data.get("stream_sid") or event.get("stream_sid") or "")
-                logger.info("Exotel Voicebot stream started sid=%s from=%s", stream_sid, start_data.get("from", ""))
+                custom = start_data.get("custom_parameters") or {}
+                if isinstance(custom, dict):
+                    for key in ("tenant_id", "agent_id", "business_name", "business_type"):
+                        value = custom.get(key)
+                        if value:
+                            voice_context[key] = str(value)
+                logger.info("Exotel Voicebot stream started sid=%s from=%s context=%s",
+                            stream_sid, start_data.get("from", ""),
+                            ",".join(sorted(voice_context.keys())))
             elif event_type == "media":
                 if bot_busy:
                     continue
