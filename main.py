@@ -17,6 +17,7 @@ import io
 import wave
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
+from urllib.parse import parse_qs, urlencode
 
 from fastapi import (
     Header, Query,
@@ -108,7 +109,7 @@ class Settings(BaseSettings):
     WHATSAPP_OTP_TEMPLATE_NAME: str = os.getenv("WHATSAPP_OTP_TEMPLATE_NAME", "mybotgenie_otp")
     WHATSAPP_OTP_TEMPLATE_LANG: str = os.getenv("WHATSAPP_OTP_TEMPLATE_LANG", "en_US")
     WHATSAPP_TEMPLATE_LANG: str = os.getenv("WHATSAPP_TEMPLATE_LANG", "nl")
-    WHATSAPP_BANNER_IMAGE_URL: str = os.getenv("WHATSAPP_BANNER_IMAGE_URL", "https://call.mybotgenie.in/assets/banner.png")
+    WHATSAPP_BANNER_IMAGE_URL: str = os.getenv("WHATSAPP_BANNER_IMAGE_URL", "https://call.mybotgenie.in/assets/logo.jpg")
 
         # Hostinger Business Email SMTP (bot@mybotgenie.in)
     SMTP_HOST: str = os.getenv("SMTP_HOST", "smtp.hostinger.com")
@@ -712,7 +713,7 @@ class WhatsAppService:
         target_api_url = settings.WHATSAPP_API_URL or "https://crmapi1.whatapi.in/api/meta"
         target_template = settings.WHATSAPP_TEMPLATE_NAME or "newmsg_4578000"
         target_lang = settings.WHATSAPP_TEMPLATE_LANG or "nl"
-        target_banner = settings.WHATSAPP_BANNER_IMAGE_URL or "https://call.mybotgenie.in/assets/banner.png"
+        target_banner = settings.WHATSAPP_BANNER_IMAGE_URL or "https://call.mybotgenie.in/assets/logo.jpg"
 
         if tenant_id and db:
             try:
@@ -776,10 +777,10 @@ class WhatsAppService:
                 "name": target_template.strip().replace(" ", "_"),
                 "language": {"code": target_lang},
                 "components": [
-                    *([] if template_parameters is not None else [{
+                    {
                         "type": "header",
                         "parameters": [{"type": "image", "image": {"link": target_banner}}]
-                    }]),
+                    },
                     {
                         "type": "body",
                         "parameters": [{"type": "text", "text": str(value)} for value in body_values]
@@ -867,7 +868,8 @@ class ExotelService:
         agent_phone: Optional[str] = None,
         time_limit: int = 600,
         call_id: Optional[str] = None,
-        tenant_id: Optional[str] = None
+        tenant_id: Optional[str] = None,
+        agent_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         if not settings.EXOTEL_SID or not settings.EXOTEL_API_KEY or not settings.EXOTEL_API_TOKEN:
             logger.info("Exotel credentials not provided in environment; continuing in WebRTC / SIP simulation mode.")
@@ -907,8 +909,14 @@ class ExotelService:
             "TimeLimit": str(time_limit),
             "StatusCallback": callback_url
         }
+        custom_fields = {"phone": customer_phone}
         if call_id:
-            payload["CustomField"] = f"call_id={call_id}&phone={customer_phone}"
+            custom_fields["call_id"] = str(call_id)
+        if tenant_id:
+            custom_fields["tenant_id"] = str(tenant_id)
+        if agent_id:
+            custom_fields["agent_id"] = str(agent_id)
+        payload["CustomField"] = urlencode(custom_fields)
 
         try:
             auth = httpx.BasicAuth(api_key, api_token)
@@ -1482,6 +1490,7 @@ class VoiceChatRequest(BaseModel):
     phone_number: Optional[str] = None
     business_phone: Optional[str] = None
     language_code: Optional[str] = None
+    stream_tts: bool = False
 
 
 # Saaras can detect 22 Indian languages; Bulbul v3 can synthesize 10 Indian
@@ -1516,6 +1525,26 @@ def _voice_language_settings(language_code: Optional[str]) -> tuple[str, str, bo
         code = code[:2].lower() + code[2:]
     supported = code in _BULBUL_V3_SPEAKERS
     return (code if supported else "hi-IN", _BULBUL_V3_SPEAKERS.get(code, "priya"), supported)
+
+
+def _refine_devanagari_language(transcript: str, detected_code: str, preferred_code: Optional[str] = None) -> str:
+    """Correct common short-turn Hindi/Marathi auto-detection confusion."""
+    if detected_code not in {"hi-IN", "mr-IN"}:
+        return detected_code
+    words = set(re.findall(r"[\u0900-\u097F]+", (transcript or "").lower()))
+    hindi_markers = {"है", "हैं", "था", "थी", "मुझे", "आप", "आपको", "क्या", "कहाँ", "कहां", "कितना", "कितने", "बताइए", "बताओ", "करो", "दो", "चाहिए", "में", "से", "का", "की", "को"}
+    marathi_markers = {"आहे", "आहेत", "आणि", "मला", "तुम्ही", "तुम्हाला", "काय", "कुठे", "किती", "सांगा", "करा", "द्या", "माझे", "माझा", "माझी", "यांच्या", "मध्ये"}
+    hindi_score = len(words & hindi_markers)
+    marathi_score = len(words & marathi_markers)
+    if hindi_score > marathi_score:
+        return "hi-IN"
+    if marathi_score > hindi_score:
+        return "mr-IN"
+    if detected_code == "mr-IN" and preferred_code == "hi-IN" and marathi_score == 0:
+        return "hi-IN"
+    if detected_code == "hi-IN" and preferred_code == "mr-IN" and hindi_score == 0:
+        return "mr-IN"
+    return detected_code
 
 def discover_caller_name(user_text: str) -> Optional[str]:
     """
@@ -1601,7 +1630,15 @@ async def _send_voice_requested_whatsapp(
                 template_lang_override="en_US",
             )
         if result.get("success"):
-            logger.info("Caller-requested WhatsApp template sent to %s", WhatsAppService._clean_phone_number(phone_number))
+            provider_data = result.get("response") if isinstance(result.get("response"), dict) else {}
+            provider_messages = provider_data.get("messages") or []
+            provider_message = provider_messages[0] if provider_messages and isinstance(provider_messages[0], dict) else {}
+            logger.info(
+                "Caller-requested WhatsApp template accepted by gateway recipient=%s message_id=%s provider_status=%s; delivery requires provider status callback",
+                WhatsAppService._clean_phone_number(phone_number),
+                provider_message.get("id", "unavailable"),
+                provider_message.get("message_status", "accepted"),
+            )
         else:
             logger.warning("Caller-requested WhatsApp template failed: %s", result.get("error", result))
     except Exception as exc:
@@ -1735,6 +1772,8 @@ async def voice_chat_endpoint(
     agent_instructions = (agent_row.system_prompt or "").strip()[:3000] if agent_row else ""
 
     detected_language = (chat_in.language_code or "hi-IN").strip()
+    configured_language = getattr(agent_row, "language", None) if agent_row else None
+    detected_language = _refine_devanagari_language(chat_in.message, detected_language, configured_language)
     language_name = _VOICE_LANGUAGE_NAMES.get(detected_language, "the caller's detected language")
     speech_language_code, speech_speaker, supports_detected_tts = _voice_language_settings(detected_language)
     reply_language = language_name if supports_detected_tts else "simple Hindi"
@@ -1823,7 +1862,7 @@ async def voice_chat_endpoint(
 
 
     # Fallback: Google Gemini (With clean system_instruction and multi-turn context)
-    if settings.GEMINI_API_KEY:
+    if not ai_reply and settings.GEMINI_API_KEY:
         for model_name in ["gemini-3.6-flash"]:
             try:
                 async with httpx.AsyncClient(timeout=5.0) as client:
@@ -1895,7 +1934,7 @@ async def voice_chat_endpoint(
     clean_speech_text = ai_reply.replace("*", "").replace("#", "").replace("_", "").strip()
 
     audio_base64 = None
-    if settings.SARVAM_API_KEY:
+    if settings.SARVAM_API_KEY and not chat_in.stream_tts:
         try:
             async with httpx.AsyncClient(timeout=12.0) as client:
                 payload_sarvam = {
@@ -1917,7 +1956,7 @@ async def voice_chat_endpoint(
                     audio_base64 = sarvam_res.json().get("audios", [None])[0]
                 else:
                     payload_sarvam["model"] = "bulbul:v3"
-                    payload_sarvam["speaker"] = "priya"
+                    payload_sarvam["speaker"] = speech_speaker
                     fb_res = await client.post(
                         "https://api.sarvam.ai/text-to-speech",
                         headers={"api-subscription-key": settings.SARVAM_API_KEY, "Content-Type": "application/json"},
@@ -2056,7 +2095,7 @@ async def _exotel_transcribe_pcm(pcm: bytes, sample_rate: int = 8000) -> tuple[s
         return "", "hi-IN"
 
 
-async def _exotel_get_ai_audio(transcript: str, business_name: str = "", business_type: str = "", conversation_history: Optional[List[Dict[str, str]]] = None, tenant_id: Optional[str] = None, agent_id: Optional[str] = None, sample_rate: int = 8000, phone_number: Optional[str] = None, business_phone: Optional[str] = None, language_code: str = "hi-IN") -> tuple[str, bytes]:
+async def _exotel_get_ai_audio(transcript: str, business_name: str = "", business_type: str = "", conversation_history: Optional[List[Dict[str, str]]] = None, tenant_id: Optional[str] = None, agent_id: Optional[str] = None, sample_rate: int = 8000, phone_number: Optional[str] = None, business_phone: Optional[str] = None, language_code: str = "hi-IN", stream_tts: bool = False) -> tuple[str, bytes]:
     """Reuse the deployed HTTP voice-chat API and convert Sarvam WAV to Exotel PCM."""
     api_url = "https://call-genie-bs6x.onrender.com/api/voice/chat"
     payload = {
@@ -2070,6 +2109,7 @@ async def _exotel_get_ai_audio(transcript: str, business_name: str = "", busines
         "phone_number": phone_number,
         "business_phone": business_phone,
         "language_code": language_code,
+        "stream_tts": stream_tts,
     }
     try:
         async with httpx.AsyncClient(timeout=25.0) as client:
@@ -2080,8 +2120,9 @@ async def _exotel_get_ai_audio(transcript: str, business_name: str = "", busines
         data = res.json()
         reply = str(data.get("reply") or "").strip()
         audio_b64 = data.get("audio_base64")
-        if not audio_b64:
+        if not audio_b64 and not stream_tts:
             logger.warning("Exotel Voicebot AI returned no audio_base64")
+        if not audio_b64:
             return reply, b""
         raw_audio = base64.b64decode(audio_b64)
         if raw_audio[:4] != b"RIFF":
@@ -2114,6 +2155,106 @@ async def _exotel_send_pcm(websocket: WebSocket, stream_sid: str, pcm: bytes, sa
         await asyncio.sleep(0.01)
 
 
+async def _exotel_stream_tts_to_exotel(
+    websocket: WebSocket, stream_sid: str, text: str, language_code: str, sample_rate: int = 8000
+) -> bool:
+    """Stream Sarvam audio chunks directly to Exotel instead of waiting for a full WAV."""
+    if not settings.SARVAM_API_KEY or not text.strip():
+        return False
+    language_code, v3_speaker, supported = _voice_language_settings(language_code)
+    if not supported:
+        language_code, v3_speaker = "hi-IN", "priya"
+    # Use a verified warm customer-care persona for Hindi/English; retain v3
+    # elsewhere so the other currently supported languages keep working.
+    if language_code == "hi-IN":
+        model, speaker = "bulbul:v4-flash", "aparna_hi_customer"
+    elif language_code == "en-IN":
+        model, speaker = "bulbul:v4-flash", "simran_en_customer"
+    else:
+        model, speaker = "bulbul:v3", v3_speaker
+    payload = {
+        "text": text[:3500], "model": model, "language_code": language_code,
+        "speaker": speaker, "speech_sample_rate": 8000,
+        "output_audio_codec": "linear16", "pace": 1.0,
+    }
+    if model == "bulbul:v3":
+        payload["temperature"] = 0.72
+    pending = bytearray()
+    sent_packets = 0
+    packet_size = 3200  # Exotel's 200 ms packet at mono PCM16/8 kHz.
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, read=25.0)) as client:
+            async with client.stream(
+                "POST", "https://api.sarvam.ai/text-to-speech/stream",
+                headers={"api-subscription-key": settings.SARVAM_API_KEY,
+                         "Content-Type": "application/json"},
+                json=payload,
+            ) as response:
+                if response.status_code != 200:
+                    detail = (await response.aread()).decode("utf-8", "replace")[:300]
+                    logger.warning("Sarvam streaming TTS returned %s: %s", response.status_code, detail)
+                    return False
+                async for audio_chunk in response.aiter_bytes():
+                    if audio_chunk:
+                        pending.extend(audio_chunk)
+                    while len(pending) >= packet_size:
+                        packet = bytes(pending[:packet_size])
+                        del pending[:packet_size]
+                        await websocket.send_json({
+                            "event": "media", "stream_sid": stream_sid,
+                            "media": {"payload": base64.b64encode(packet).decode("ascii")},
+                        })
+                        sent_packets += 1
+    except Exception as exc:
+        logger.warning("Exotel streaming TTS failed after %s packets: %s", sent_packets, exc)
+        return sent_packets > 0
+
+    if pending:
+        if len(pending) % 2:
+            pending.append(0)
+        if len(pending) < packet_size:
+            pending.extend(b"\x00" * (packet_size - len(pending)))
+        await websocket.send_json({
+            "event": "media", "stream_sid": stream_sid,
+            "media": {"payload": base64.b64encode(bytes(pending)).decode("ascii")},
+        })
+        sent_packets += 1
+    return sent_packets > 0
+
+
+async def _exotel_rest_tts_fallback(text: str, language_code: str, sample_rate: int = 8000) -> bytes:
+    """Fallback to complete v3 audio if the live HTTP stream cannot start."""
+    if not settings.SARVAM_API_KEY or not text.strip():
+        return b""
+    language_code, speaker, supported = _voice_language_settings(language_code)
+    if not supported:
+        language_code, speaker = "hi-IN", "priya"
+    payload = {
+        "inputs": [text[:2500]], "model": "bulbul:v3",
+        "language_code": language_code, "speaker": speaker,
+        "speech_sample_rate": sample_rate, "pace": 1.0,
+        "temperature": 0.72,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            response = await client.post(
+                "https://api.sarvam.ai/text-to-speech",
+                headers={"api-subscription-key": settings.SARVAM_API_KEY,
+                         "Content-Type": "application/json"},
+                json=payload,
+            )
+        if response.status_code == 200:
+            audio_b64 = response.json().get("audios", [None])[0]
+            if audio_b64:
+                wav_bytes = base64.b64decode(audio_b64)
+                if wav_bytes[:4] == b"RIFF":
+                    return _wav_to_pcm_mono(wav_bytes, target_sample_rate=sample_rate)
+        logger.warning("Exotel REST TTS fallback returned %s: %s", response.status_code, response.text[:250])
+    except Exception as exc:
+        logger.warning("Exotel REST TTS fallback failed: %s", exc)
+    return b""
+
+
 @app.websocket("/api/telephony/exotel/voicebot")
 async def exotel_voicebot_websocket(websocket: WebSocket):
     """Exotel Voicebot bidirectional media endpoint (PCM16 mono, negotiated 8/16/24 kHz)."""
@@ -2136,6 +2277,7 @@ async def exotel_voicebot_websocket(websocket: WebSocket):
         nonlocal bot_busy
         try:
             transcript, detected_language = await _exotel_transcribe_pcm(caller_audio, sample_rate=sample_rate)
+            detected_language = _refine_devanagari_language(transcript, detected_language)
             if not transcript:
                 logger.info("Exotel Voicebot: no transcript produced for this turn")
                 return
@@ -2151,12 +2293,27 @@ async def exotel_voicebot_websocket(websocket: WebSocket):
                 phone_number=voice_context.get("phone_number"),
                 business_phone=voice_context.get("business_phone"),
                 language_code=detected_language,
+                stream_tts=True,
             )
             conversation_history.extend([{"role": "user", "content": transcript}, {"role": "assistant", "content": reply}])
             del conversation_history[:-6]
-            if response_pcm and active_stream_sid:
+            audio_started = False
+            if active_stream_sid and reply:
                 playback_done.clear()
-                await _exotel_send_pcm(websocket, active_stream_sid, response_pcm, sample_rate=sample_rate)
+                if response_pcm:
+                    await _exotel_send_pcm(websocket, active_stream_sid, response_pcm, sample_rate=sample_rate)
+                    audio_started = True
+                else:
+                    audio_started = await _exotel_stream_tts_to_exotel(
+                        websocket, active_stream_sid, reply, detected_language, sample_rate=sample_rate
+                    )
+                    if not audio_started:
+                        logger.warning("Streaming TTS unavailable; using complete-audio fallback")
+                        fallback_pcm = await _exotel_rest_tts_fallback(reply, detected_language, sample_rate)
+                        if fallback_pcm:
+                            await _exotel_send_pcm(websocket, active_stream_sid, fallback_pcm, sample_rate=sample_rate)
+                            audio_started = True
+            if audio_started and active_stream_sid:
                 await websocket.send_json({
                     "event": "mark",
                     "stream_sid": active_stream_sid,
@@ -2995,7 +3152,8 @@ async def place_single_call(
                     to_phone=formatted_dest,
                     caller_id=settings.EXOTEL_CALLER_NUMBER,
                     call_id=new_call_log.id,
-                    tenant_id=user.tenant_id
+                    tenant_id=user.tenant_id,
+                    agent_id=agent_id_val,
                 )
                 logger.info(f"Exotel call result: {exotel_result}")
             except Exception as ex_err:
@@ -4226,7 +4384,7 @@ async def delete_knowledge_document(
 
 
 
-EXOTEL_AUDIO_CACHE: Optional[bytes] = None
+EXOTEL_AUDIO_CACHE: Dict[str, bytes] = {}
 
 def get_builtin_fallback_wav() -> bytes:
     """Generates a valid, non-empty 16kHz PCM WAV audio chime to guarantee Exotel never receives 0 bytes."""
@@ -4251,33 +4409,69 @@ def get_builtin_fallback_wav() -> bytes:
 @app.get("/api/telephony/exotel/greeting.mp3")
 @app.head("/api/telephony/exotel/greeting.wav")
 @app.head("/api/telephony/exotel/greeting.mp3")
-async def exotel_greeting_audio(request: Request, phone: Optional[str] = None):
+async def exotel_greeting_audio(
+    request: Request, phone: Optional[str] = None,
+    tenant_id: Optional[str] = None, agent_id: Optional[str] = None,
+):
     """
     Streams authentic Hindi Priya Voice WAV/MP3 to Exotel telecom line.
     Returns immediately with verified audio bytes and strict Content-Length headers,
     guaranteeing Exotel never encounters empty data or drops the call!
     """
-    global EXOTEL_AUDIO_CACHE
-    if EXOTEL_AUDIO_CACHE and len(EXOTEL_AUDIO_CACHE) > 500:
+    greeting_text = ""
+    greeting_language = "hi-IN"
+    greeting_voice = "priya"
+    try:
+        async with AsyncSessionLocal() as greeting_db:
+            agent_row = None
+            if agent_id:
+                agent_stmt = select(Agent).where(Agent.id == agent_id)
+                if tenant_id:
+                    agent_stmt = agent_stmt.where(Agent.tenant_id == tenant_id)
+                agent_row = (await greeting_db.execute(agent_stmt)).scalar_one_or_none()
+            elif tenant_id:
+                agent_row = (await greeting_db.execute(
+                    select(Agent).where(Agent.tenant_id == tenant_id).order_by(Agent.created_at.asc())
+                )).scalars().first()
+            if agent_row:
+                greeting_text = (getattr(agent_row, "greeting_message", None) or getattr(agent_row, "first_message", None) or "").strip()
+                greeting_language = getattr(agent_row, "language", None) or "hi-IN"
+                _, mapped_voice, _ = _voice_language_settings(greeting_language)
+                configured_voice = getattr(agent_row, "tts_voice", None)
+                allowed_voices = {"shubh", "aditya", "ritu", "priya", "neha", "rahul", "pooja", "rohan", "simran", "kavya", "amit", "dev", "ishita", "shreya", "ratan", "varun", "manan", "sumit", "roopa", "kabir", "aayan", "ashutosh", "advait", "anand", "tanya", "tarun", "sunny", "mani", "gokul", "vijay", "shruti", "suhani", "mohit", "kavitha", "rehan", "soham", "rupali"}
+                greeting_voice = configured_voice if configured_voice in allowed_voices else mapped_voice
+                tenant_row = (await greeting_db.execute(select(Tenant).where(Tenant.id == agent_row.tenant_id))).scalar_one_or_none()
+                business = (getattr(tenant_row, "name", None) or "").strip()
+                if not greeting_text:
+                    agent_name = (getattr(agent_row, "name", None) or "हमारी टीम").strip()
+                    greeting_text = f"नमस्ते, मैं {agent_name} की ओर से बात कर रही हूँ। क्या अभी बात करने का सही समय है?"
+                    if business and business.lower() not in {"mybot genie", "mybot genie hq"}:
+                        greeting_text = f"नमस्ते, मैं {business} की ओर से बात कर रही हूँ। क्या अभी बात करने का सही समय है?"
+    except Exception as greeting_err:
+        logger.warning("Could not load agent-specific Exotel greeting: %s", greeting_err)
+    if not greeting_text:
+        greeting_text = "नमस्ते, क्या अभी बात करने का सही समय है?"
+
+    cache_key = hashlib.sha256(f"{greeting_language}|{greeting_voice}|{greeting_text}".encode("utf-8")).hexdigest()
+    cached_audio = EXOTEL_AUDIO_CACHE.get(cache_key)
+    if cached_audio and len(cached_audio) > 500:
         return Response(
-            content=EXOTEL_AUDIO_CACHE,
+            content=cached_audio,
             media_type="audio/wav",
             headers={
                 "Content-Type": "audio/wav",
                 "Accept-Ranges": "bytes",
-                "Content-Length": str(len(EXOTEL_AUDIO_CACHE))
+                "Content-Length": str(len(cached_audio))
             }
         )
-
-    greeting_text = "नमस्ते! मायबॉट जीनी एआई कॉलिंग में आपका स्वागत है। हमारे सीनियर कंसलटेंट जल्द ही आपसे संपर्क करेंगे। हम आपको सम्पूर्ण विवरण व्हाट्सएप पर भी भेज रहे हैं। कॉल करने के लिए धन्यवाद!"
 
     # 1. Try Sarvam AI Bulbul Ishita voice for the 8 kHz Exotel greeting.
     if settings.SARVAM_API_KEY:
         try:
             payload_priya = {
                 "inputs": [greeting_text],
-                "target_language_code": "hi-IN",
-                "speaker": "priya",
+                "language_code": greeting_language,
+                "speaker": greeting_voice,
                 "model": "bulbul:v3",
                 "pace": 1.0,
                 "speech_sample_rate": 8000,
@@ -4294,8 +4488,10 @@ async def exotel_greeting_audio(request: Request, phone: Optional[str] = None):
                     if audios and audios[0]:
                         audio_bytes = base64.b64decode(audios[0])
                         if len(audio_bytes) > 500:
-                            EXOTEL_AUDIO_CACHE = audio_bytes
-                            logger.info(f"✓ Sarvam Priya 8kHz Telecom greeting audio cached ({len(audio_bytes)} bytes)")
+                            if len(EXOTEL_AUDIO_CACHE) >= 100:
+                                EXOTEL_AUDIO_CACHE.clear()
+                            EXOTEL_AUDIO_CACHE[cache_key] = audio_bytes
+                            logger.info("Agent-specific Exotel greeting cached agent_id=%s bytes=%s", agent_id or "default", len(audio_bytes))
                             return Response(
                                 content=audio_bytes,
                                 media_type="audio/wav",
@@ -4315,7 +4511,9 @@ async def exotel_greeting_audio(request: Request, phone: Optional[str] = None):
             if b64_g:
                 audio_bytes = base64.b64decode(b64_g)
                 if len(audio_bytes) > 500:
-                    EXOTEL_AUDIO_CACHE = audio_bytes
+                    if len(EXOTEL_AUDIO_CACHE) >= 100:
+                        EXOTEL_AUDIO_CACHE.clear()
+                    EXOTEL_AUDIO_CACHE[cache_key] = audio_bytes
                     return Response(
                         content=audio_bytes,
                         media_type="audio/mpeg",
@@ -4348,7 +4546,21 @@ async def exotel_voice_flow(request: Request, phone: Optional[str] = None, call_
     Per Exotel documentation, dynamic audio webhooks MUST return Content-Type 'text/plain'
     with the direct audio URL in the response body.
     """
+    query = {key.lower(): value for key, value in request.query_params.items()}
+    custom_field = query.get("customfield", "")
+    parsed_custom = parse_qs(custom_field, keep_blank_values=False)
+    tenant_id = query.get("tenant_id") or (parsed_custom.get("tenant_id") or [None])[0]
+    agent_id = query.get("agent_id") or (parsed_custom.get("agent_id") or [None])[0]
+    audio_params = {}
+    if tenant_id:
+        audio_params["tenant_id"] = tenant_id
+    if agent_id:
+        audio_params["agent_id"] = agent_id
+    if phone or query.get("from"):
+        audio_params["phone"] = phone or query.get("from")
     audio_stream_url = "https://call-genie-bs6x.onrender.com/api/telephony/exotel/greeting.wav"
+    if audio_params:
+        audio_stream_url += "?" + urlencode(audio_params)
     return PlainTextResponse(content=audio_stream_url, media_type="text/plain")
 
 @app.get("/api/telephony/test-exotel/{phone_number}")
