@@ -1582,9 +1582,11 @@ async def voice_chat_endpoint(chat_in: VoiceChatRequest, request: Request, db: A
     # Priority 1: Google Gemini (With clean system_instruction and multi-turn context)
     if settings.GEMINI_API_KEY:
         for model_name in ["gemini-1.5-flash", "gemini-2.0-flash"]:
+        for model_name in ["gemini-3.8-flash", "gemini-3.6-flash"]:
             try:
                 async with httpx.AsyncClient(timeout=8.0) as client:
                     gemini_url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={settings.GEMINI_API_KEY}"
+                    gemini_url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent"
                     
                     contents = []
                     if chat_in.conversation_history:
@@ -1601,6 +1603,7 @@ async def voice_chat_endpoint(chat_in: VoiceChatRequest, request: Request, db: A
                         "generationConfig": {"temperature": 0.6, "maxOutputTokens": 100}
                     }
                     res = await client.post(gemini_url, json=payload)
+                    res = await client.post(gemini_url, headers={"x-goog-api-key": settings.GEMINI_API_KEY}, json=payload)
                     if res.status_code == 200:
                         cand = res.json().get("candidates", [])
                         if cand:
@@ -1635,6 +1638,8 @@ async def voice_chat_endpoint(chat_in: VoiceChatRequest, request: Request, db: A
                 )
                 if res.status_code == 200:
                     ai_reply = res.json()["choices"][0]["message"]["content"].strip()
+                else:
+                    logger.warning("Groq chat status %s: %s", res.status_code, res.text[:500])
         except Exception as e:
             logger.warning(f"Groq chat error: {e}")
 
@@ -2113,6 +2118,7 @@ async def synthesize_google_tts(text: str, gender: str = "female", tone: str = "
         cfg = tone_settings.get(tone.lower(), tone_settings["corporate"])
 
         url = f"https://texttospeech.googleapis.com/v1/text:synthesize?key={settings.GEMINI_API_KEY}"
+        url = "https://texttospeech.googleapis.com/v1/text:synthesize"
         payload = {
             "input": {"text": text},
             "voice": {"languageCode": "hi-IN", "name": voice_name},
@@ -2124,6 +2130,7 @@ async def synthesize_google_tts(text: str, gender: str = "female", tone: str = "
         }
         async with httpx.AsyncClient(timeout=12.0) as client:
             res = await client.post(url, json=payload)
+            res = await client.post(url, headers={"x-goog-api-key": settings.GEMINI_API_KEY}, json=payload)
             if res.status_code == 200:
                 return res.json().get("audioContent")
             else:
