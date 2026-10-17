@@ -1895,11 +1895,11 @@ async def synthesize_sarvam_tts(text: str, gender: str = "female", tone: str = "
         }
         pace_val = tone_paces.get(tone.lower(), 1.05)
 
-        # Female uses ultra-natural suman_hi_companion (bulbul:v4-flash)
+        # Female uses official Priya AI telecaller (bulbul:v3)
         # Male uses rohan / arvind (bulbul:v3)
         if gender == "female":
-            model = "bulbul:v4-flash"
-            speaker = "suman_hi_companion"
+            model = "bulbul:v3"
+            speaker = "priya"
         else:
             model = "bulbul:v3"
             speaker = "rohan"
@@ -3664,12 +3664,12 @@ def get_builtin_fallback_wav() -> bytes:
     with wave.open(buf, 'wb') as wav:
         wav.setnchannels(1)
         wav.setsampwidth(2)
-        wav.setframerate(16000)
+        wav.setframerate(8000)
         duration = 3.0
-        num_samples = int(16000 * duration)
+        num_samples = int(8000 * duration)
         samples = []
         for i in range(num_samples):
-            t = i / 16000.0
+            t = i / 8000.0
             env = min(1.0, t * 5.0) * max(0.0, 1.0 - (t / duration) ** 2)
             val = int(env * 12000 * (0.6 * math.sin(2 * math.pi * 523.25 * t) + 0.4 * math.sin(2 * math.pi * 659.25 * t)))
             samples.append(struct.pack('<h', max(-32768, min(32767, val))))
@@ -3700,26 +3700,42 @@ async def exotel_greeting_audio(request: Request, phone: Optional[str] = None):
 
     greeting_text = "नमस्ते! मायबॉट जीनी एआई कॉलिंग में आपका स्वागत है। हमारे सीनियर कंसलटेंट जल्द ही आपसे संपर्क करेंगे। हम आपको सम्पूर्ण विवरण व्हाट्सएप पर भी भेज रहे हैं। कॉल करने के लिए धन्यवाद!"
 
-    # 1. Try Sarvam AI Bulbul (Priya Voice - authentic Hindi telecalling)
+    # 1. Try Sarvam AI Bulbul (Priya Voice - authentic Hindi telecalling, 8000Hz Telecom Mono)
     if settings.SARVAM_API_KEY:
         try:
-            b64_audio = await synthesize_sarvam_tts(greeting_text, gender="female", tone="corporate")
-            if b64_audio:
-                audio_bytes = base64.b64decode(b64_audio)
-                if len(audio_bytes) > 500:
-                    EXOTEL_AUDIO_CACHE = audio_bytes
-                    logger.info(f"✓ Sarvam Priya greeting audio cached ({len(audio_bytes)} bytes)")
-                    return Response(
-                        content=audio_bytes,
-                        media_type="audio/wav",
-                        headers={
-                            "Content-Type": "audio/wav",
-                            "Accept-Ranges": "bytes",
-                            "Content-Length": str(len(audio_bytes))
-                        }
-                    )
+            payload_priya = {
+                "inputs": [greeting_text],
+                "target_language_code": "hi-IN",
+                "speaker": "priya",
+                "model": "bulbul:v3",
+                "pace": 1.0,
+                "speech_sample_rate": 8000,
+                "enable_preprocessing": True
+            }
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                res = await client.post(
+                    "https://api.sarvam.ai/text-to-speech",
+                    headers={"api-subscription-key": settings.SARVAM_API_KEY, "Content-Type": "application/json"},
+                    json=payload_priya
+                )
+                if res.status_code == 200:
+                    audios = res.json().get("audios", [])
+                    if audios and audios[0]:
+                        audio_bytes = base64.b64decode(audios[0])
+                        if len(audio_bytes) > 500:
+                            EXOTEL_AUDIO_CACHE = audio_bytes
+                            logger.info(f"✓ Sarvam Priya 8kHz Telecom greeting audio cached ({len(audio_bytes)} bytes)")
+                            return Response(
+                                content=audio_bytes,
+                                media_type="audio/wav",
+                                headers={
+                                    "Content-Type": "audio/wav",
+                                    "Accept-Ranges": "bytes",
+                                    "Content-Length": str(len(audio_bytes))
+                                }
+                            )
         except Exception as e:
-            logger.warning(f"Sarvam greeting TTS error: {e}")
+            logger.warning(f"Sarvam Priya greeting TTS error: {e}")
 
     # 2. Try Google Cloud TTS
     if settings.GEMINI_API_KEY:
@@ -3754,26 +3770,15 @@ async def exotel_greeting_audio(request: Request, phone: Optional[str] = None):
     )
 
 
-@app.api_route("/api/telephony/exotel/flow", methods=["GET", "POST"])
+@app.api_route("/api/telephony/exotel/flow", methods=["GET", "POST", "HEAD"])
 async def exotel_voice_flow(request: Request, phone: Optional[str] = None, call_id: Optional[str] = None):
     """
-    ExoML Voice Flow Webhook for Exotel Outbound & Inbound Calls.
-    Guarantees:
-      1. Uses <Play> to stream authentic Priya Hindi audio with zero delay.
-      2. Valid ExoML attributes so Exotel NEVER drops the call upon answer!
+    Dynamic audio URL endpoint for Exotel Greeting Applet.
+    Per Exotel documentation, dynamic audio webhooks MUST return Content-Type 'text/plain'
+    with the direct audio URL in the response body.
     """
     audio_stream_url = "https://call-genie-bs6x.onrender.com/api/telephony/exotel/greeting.wav"
-    if phone:
-        audio_stream_url += f"?phone={phone}"
-
-    exoml = f"""<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-    <Play>{audio_stream_url}</Play>
-    <Pause length="2"/>
-    <Say>Namaste! MyBot Genie AI calling mein aapka swagat hai. Hamare senior consultant jald hi aapse sampark karenge. Hum aapko sampoorna vivaran WhatsApp par bhi bhej rahe hain. Call karne ke liye dhanyawad!</Say>
-    <Pause length="3"/>
-</Response>"""
-    return Response(content=exoml, media_type="application/xml")
+    return PlainTextResponse(content=audio_stream_url, media_type="text/plain")
 
 @app.get("/api/telephony/test-exotel/{phone_number}")
 async def test_exotel_diagnostic(phone_number: str):
