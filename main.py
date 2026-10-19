@@ -29,7 +29,7 @@ import ssl
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from sqlalchemy import (
-    func, or_, and_,
+    func, or_, and_, inspect, text,
     Column, String, Boolean, DateTime, ForeignKey, Text, Float, Integer, JSON, select, desc
 )
 from fastapi.responses import PlainTextResponse, JSONResponse
@@ -333,6 +333,7 @@ class CallLog(Base):
     summary = Column(Text, nullable=True)
     sentiment = Column(String(50), nullable=True)
     whatsapp_status = Column(String(50), default="NONE")
+    recording_url = Column(String(1200), nullable=True)
     transfer_status = Column(String(50), default="NONE") # NONE, TRANSFERRED, FAILED
     transferred_to = Column(String(50), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -477,6 +478,7 @@ class CallLogOut(BaseModel):
     summary: Optional[str]
     sentiment: Optional[str]
     whatsapp_status: str
+    recording_url: Optional[str] = None
     created_at: datetime
     class Config: from_attributes = True
 
@@ -793,7 +795,7 @@ class WhatsAppService:
             try:
                 res = await client.post(endpoint_url, headers=headers, json=payload_template)
                 if res.status_code in [200, 201]:
-                    logger.info(f"WhatsApp template delivered successfully to {clean_number}")
+                    logger.info(f"WhatsApp template accepted by gateway for {clean_number}; delivery confirmation depends on provider status callback")
                     return {"success": True, "mode": "template_9_params", "status_code": res.status_code, "response": res.json()}
                 
                 # A voice-requested approved template must not be replaced with a
@@ -1398,6 +1400,15 @@ async def on_startup():
     async def _init_primary_db():
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
+            # create_all does not add columns to existing CallLog tables.
+            has_recording_url = await conn.run_sync(
+                lambda sync_conn: any(
+                    column["name"] == "recording_url"
+                    for column in inspect(sync_conn).get_columns("call_logs")
+                )
+            )
+            if not has_recording_url:
+                await conn.execute(text("ALTER TABLE call_logs ADD COLUMN recording_url VARCHAR(1200)"))
 
     try:
         # Strict 3-second timeout for primary database connection
@@ -1529,6 +1540,7 @@ def _voice_language_settings(language_code: Optional[str]) -> tuple[str, str, bo
 
 _BULBUL_V4_LEGACY_MAP = {
     "shubh": "shubh_hi_customer", "ritu": "ritu_hi_customer",
+    "suman_hi_companion": "ritu_hi_customer",
     "simran": "simran_enhi_customer", "ishita": "ishita_enhi_customer",
     "priya": "priya_hi_recovery", "rohan": "rohan_en_recovery",
     "dev": "dev_en_recovery", "sunny": "sunny_enhi_customer",
@@ -1549,6 +1561,9 @@ def _sarvam_tts_choice(language_code: Optional[str], configured_voice: Optional[
     """Return model, speaker and normalized language for the configured Sarvam voice."""
     language, v3_speaker, supported = _voice_language_settings(language_code)
     configured_voice = (configured_voice or "").strip()
+    # The deployed dashboard still stores this legacy value; force a known female Hindi voice.
+    if configured_voice.lower() == "suman_hi_companion":
+        configured_voice = "ritu_hi_customer"
     if language in {"ml-IN", "od-IN"}:
         return "bulbul:v3", configured_voice if configured_voice and "_" not in configured_voice else v3_speaker, language
     if configured_voice and re.fullmatch(r"[a-z0-9]+_(?:hi|en|enhi|bn|gu|kn|mr|pa|ta|te)_[a-z0-9_]+", configured_voice):
@@ -2394,6 +2409,7 @@ async def exotel_voicebot_websocket(websocket: WebSocket):
     """Exotel Voicebot bidirectional media endpoint (PCM16 mono, negotiated 8/16/24 kHz)."""
     await websocket.accept()
     stream_sid = ""
+    stream_started_monotonic = None
     sample_rate = 8000
     utterance = bytearray()
     speech_started = False
@@ -2481,6 +2497,7 @@ async def exotel_voicebot_websocket(websocket: WebSocket):
             if event_type == "connected":
                 logger.info("Exotel Voicebot WebSocket connected")
             elif event_type == "start":
+                stream_started_monotonic = time.monotonic()
                 start_data = event.get("start") or {}
                 stream_sid = str(start_data.get("stream_sid") or event.get("stream_sid") or "")
                 if start_data.get("from"):
@@ -2497,7 +2514,7 @@ async def exotel_voicebot_websocket(websocket: WebSocket):
                 max_utterance_bytes = int(sample_rate * 2 * 10)
                 custom = start_data.get("custom_parameters") or {}
                 if isinstance(custom, dict):
-                    for key in ("tenant_id", "agent_id", "business_name", "business_type"):
+                    for key in ("tenant_id", "agent_id", "business_name", "business_type", "call_id"):
                         value = custom.get(key)
                         if value:
                             voice_context[key] = str(value)
@@ -2536,6 +2553,30 @@ async def exotel_voicebot_websocket(websocket: WebSocket):
                     active_turn_task = asyncio.create_task(process_caller_turn(caller_audio, stream_sid))
             elif event_type == "stop":
                 logger.info("Exotel Voicebot stream stopped sid=%s reason=%s", stream_sid, (event.get("stop") or {}).get("reason", ""))
+                elapsed_seconds = max(0, int(round(time.monotonic() - stream_started_monotonic))) if stream_started_monotonic else 0
+                if elapsed_seconds:
+                    try:
+                        async with AsyncSessionLocal() as duration_db:
+                            call_id = voice_context.get("call_id")
+                            call_row = None
+                            if call_id:
+                                call_row = (await duration_db.execute(select(CallLog).where(CallLog.id == call_id))).scalar_one_or_none()
+                            if not call_row and voice_context.get("phone_number"):
+                                digits = "".join(filter(str.isdigit, voice_context["phone_number"]))[-10:]
+                                if digits:
+                                    q = select(CallLog).where(CallLog.lead_phone.like(f"%{digits}%"), CallLog.call_status.in_(["ringing", "in-progress", "completed"]))
+                                    if voice_context.get("tenant_id"):
+                                        q = q.where(CallLog.tenant_id == voice_context["tenant_id"])
+                                    call_row = (await duration_db.execute(q.order_by(desc(CallLog.created_at)).limit(1))).scalars().first()
+                            if call_row:
+                                call_row.duration_seconds = max(int(call_row.duration_seconds or 0), elapsed_seconds)
+                                if call_row.call_status in {"ringing", "in-progress"}:
+                                    call_row.call_status = "completed"
+                                call_row.summary = f"Call completed ({call_row.duration_seconds}s; awaiting Exotel final billing/recording data)"
+                                await duration_db.commit()
+                                logger.info("Exotel stream duration saved call_id=%s duration=%ss", call_row.id, call_row.duration_seconds)
+                    except Exception as duration_err:
+                        logger.warning("Could not save Exotel stream duration: %s", duration_err)
                 if active_turn_task and not active_turn_task.done():
                     active_turn_task.cancel()
                     await asyncio.gather(active_turn_task, return_exceptions=True)
@@ -4833,6 +4874,7 @@ async def exotel_status_callback(
     CallSid: Optional[str] = None,
     Duration: Optional[int] = None,
     CallDuration: Optional[int] = None,
+    RecordingUrl: Optional[str] = None,
     Status: Optional[str] = None,
     From: Optional[str] = None,
     To: Optional[str] = None,
@@ -4852,6 +4894,7 @@ async def exotel_status_callback(
         pass
 
     actual_duration = int(Duration or CallDuration or form_data.get("Duration") or form_data.get("CallDuration") or form_data.get("DialCallDuration") or 0)
+    recording_url = str(RecordingUrl or form_data.get("RecordingUrl") or form_data.get("recording_url") or "").strip() or None
     raw_status = Status or form_data.get("Status") or "completed"
     to_num = To or form_data.get("To") or ""
     from_num = From or form_data.get("From") or ""
@@ -4869,6 +4912,11 @@ async def exotel_status_callback(
         )).scalars().first()
 
     if call_log:
+        if recording_url:
+            call_log.recording_url = recording_url
+        # Exotel can send an early terminal callback with Duration=0. Keep the
+        # elapsed WebSocket duration already recorded for this call when present.
+        actual_duration = actual_duration or int(call_log.duration_seconds or 0)
         tenant_obj = (await db.execute(select(Tenant).where(Tenant.id == call_log.tenant_id))).scalar_one_or_none()
         rate_per_min = tenant_obj.rate_per_min_inr if tenant_obj and tenant_obj.rate_per_min_inr else 5.0
 
@@ -4877,18 +4925,20 @@ async def exotel_status_callback(
             exact_cost = round(actual_duration * (rate_per_min / 60.0), 2)
             call_log.duration_seconds = actual_duration
             call_log.billed_minutes = math.ceil(actual_duration / 60.0)
+            previous_cost = float(call_log.cost_inr or 0.0)
+            cost_delta = round(max(0.0, exact_cost - previous_cost), 2)
             call_log.cost_inr = exact_cost
             call_log.call_status = "completed"
             call_log.summary = f"Call Answered ({actual_duration}s talk time - ₹{exact_cost:.2f})"
 
             wallet = (await db.execute(select(Wallet).where(Wallet.tenant_id == call_log.tenant_id))).scalar_one_or_none()
-            if wallet and exact_cost > 0:
-                wallet.balance_inr = max(0.0, wallet.balance_inr - exact_cost)
-                wallet.total_spent_inr = (wallet.total_spent_inr or 0.0) + exact_cost
+            if wallet and cost_delta > 0:
+                wallet.balance_inr = max(0.0, wallet.balance_inr - cost_delta)
+                wallet.total_spent_inr = (wallet.total_spent_inr or 0.0) + cost_delta
                 tx = WalletTransaction(
                     wallet_id=wallet.id,
                     transaction_type="DEBIT",
-                    amount_inr=exact_cost,
+                    amount_inr=cost_delta,
                     balance_after_inr=wallet.balance_inr,
                     reference=f"Call to {call_log.lead_phone} ({actual_duration}s talk time @ ₹{rate_per_min}/min)"
                 )
@@ -4896,20 +4946,20 @@ async def exotel_status_callback(
 
             if call_log.whatsapp_status in ["PENDING", "SENT"]:
                 try:
-                    await WhatsAppService.send_post_call_message(
+                    wa_result = await WhatsAppService.send_post_call_message(
                         phone_number=call_log.lead_phone,
                         customer_name=call_log.customer_name,
                         tenant_id=call_log.tenant_id,
                         db=db
                     )
-                    call_log.whatsapp_status = "SENT"
+                    call_log.whatsapp_status = "ACCEPTED" if wa_result.get("success") else "FAILED"
                 except Exception as wa_err:
                     logger.warning(f"WhatsApp follow-up error: {wa_err}")
         else:
             call_log.duration_seconds = 0
             call_log.cost_inr = 0.0
-            call_log.call_status = raw_status if raw_status != "completed" else "unanswered"
-            call_log.summary = f"Call {call_log.call_status} - No charge"
+            call_log.call_status = raw_status if raw_status != "completed" else "completed"
+            call_log.summary = "Call completed; duration pending Exotel final data" if raw_status == "completed" else f"Call {call_log.call_status} - No charge"
 
         await db.commit()
 
