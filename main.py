@@ -1500,6 +1500,7 @@ class VoiceChatRequest(BaseModel):
     knowledge_context: Optional[str] = None
     phone_number: Optional[str] = None
     business_phone: Optional[str] = None
+    call_id: Optional[str] = None
     language_code: Optional[str] = None
     stream_tts: bool = False
 
@@ -1683,6 +1684,7 @@ async def _send_voice_requested_whatsapp(
     customer_name: str,
     tenant_id: str,
     template_parameters: List[str],
+    call_id: Optional[str] = None,
 ) -> None:
     """Send the caller-requested, approved nine-variable WhatsApp template."""
     try:
@@ -1697,6 +1699,22 @@ async def _send_voice_requested_whatsapp(
                 template_lang_override="en_US",
             )
         if result.get("success"):
+            call_row = None
+            if call_id:
+                call_row = (await wa_db.execute(select(CallLog).where(CallLog.id == call_id))).scalar_one_or_none()
+            if not call_row:
+                digits = "".join(filter(str.isdigit, phone_number))[-10:]
+                if digits:
+                    call_row = (await wa_db.execute(
+                        select(CallLog).where(
+                            CallLog.tenant_id == tenant_id,
+                            CallLog.lead_phone.like(f"%{digits}%"),
+                            CallLog.created_at >= datetime.utcnow() - timedelta(minutes=10),
+                        ).order_by(desc(CallLog.created_at)).limit(1)
+                    )).scalars().first()
+            if call_row:
+                call_row.whatsapp_status = "ACCEPTED"
+                await wa_db.commit()
             provider_data = result.get("response") if isinstance(result.get("response"), dict) else {}
             provider_messages = provider_data.get("messages") or []
             provider_message = provider_messages[0] if provider_messages and isinstance(provider_messages[0], dict) else {}
@@ -1710,6 +1728,27 @@ async def _send_voice_requested_whatsapp(
             logger.warning("Caller-requested WhatsApp template failed: %s", result.get("error", result))
     except Exception as exc:
         logger.exception("Caller-requested WhatsApp dispatch failed: %s", exc)
+
+
+def _normalize_female_hindi(text: str, language_code: Optional[str]) -> str:
+    """Keep first-person Hindi speech consistently feminine for this female agent."""
+    if (language_code or "").lower() not in {"hi", "hi-in", "hindi"}:
+        return text
+    replacements = {
+        "बताता हूँ": "बताती हूँ", "देता हूँ": "देती हूँ", "करता हूँ": "करती हूँ",
+        "भेजता हूँ": "भेजती हूँ", "बोलता हूँ": "बोलती हूँ", "कहता हूँ": "कहती हूँ",
+        "रखता हूँ": "रखती हूँ", "सकता हूँ": "सकती हूँ", "रहा हूँ": "रही हूँ",
+        "करूँगा": "करूँगी", "भेजूँगा": "भेजूँगी", "दूँगा": "दूँगी", "लूँगा": "लूँगी",
+        "bata deta hun": "bata deti hun", "bataata hun": "bataati hun",
+        "deta hun": "deti hun", "karta hun": "karti hun", "bhejta hun": "bhejti hun",
+        "sakta hun": "sakti hun", "raha hun": "rahi hun",
+    }
+    for masculine, feminine in replacements.items():
+        text = re.sub(re.escape(masculine), feminine, text, flags=re.IGNORECASE)
+    # If the model prints both alternatives, keep only the feminine form.
+    text = re.sub(r"(देता|देती)\s*/\s*(देता|देती)\s+हूँ", "देती हूँ", text)
+    text = re.sub(r"(करता|करती)\s*/\s*(करता|करती)\s+हूँ", "करती हूँ", text)
+    return text
 
 
 def _caller_requested_whatsapp(text: str) -> bool:
@@ -1837,6 +1876,7 @@ async def voice_chat_endpoint(
     if not business_type:
         business_type = ((tenant_row.industry if tenant_row else None) or (agent_row.description if agent_row else None) or "")
     agent_instructions = (agent_row.system_prompt or "").strip()[:3000] if agent_row else ""
+    whatsapp_requested = _caller_requested_whatsapp(chat_in.message)
 
     detected_language = (chat_in.language_code or "hi-IN").strip()
     configured_language = getattr(agent_row, "language", None) if agent_row else None
@@ -1859,6 +1899,15 @@ async def voice_chat_endpoint(
     )
     if agent_instructions:
         system_prompt += "\n\nBusiness-specific agent instructions (apply only when consistent with verified knowledge):\n" + agent_instructions
+    system_prompt += (
+        "\n\nVoice persona rule: You are a woman. When speaking Hindi, use feminine first-person grammar consistently, "
+        "such as 'मैं बता रही हूँ', 'मैं भेज रही हूँ', 'मैं कर सकती हूँ'. Never use masculine self-reference and never say both gender forms."
+    )
+    if whatsapp_requested:
+        system_prompt += (
+            "\nThe application will attempt the approved WhatsApp template automatically. Do not say you cannot send WhatsApp. "
+            "Say truthfully that you are trying to send the available information; do not promise delivery."
+        )
 
     if not k_context and (active_tenant or chat_in.agent_id):
         try:
@@ -1980,7 +2029,9 @@ async def voice_chat_endpoint(
             knowledge_context=k_context
         )
 
-    if _caller_requested_whatsapp(chat_in.message):
+    ai_reply = _normalize_female_hindi(ai_reply, detected_language)
+
+    if whatsapp_requested:
         if chat_in.phone_number and active_tenant:
             safe_name = active_name if active_name.lower() not in ("सर", "sir", "ji", "customer") else "Customer"
             wa_values = _build_voice_whatsapp_values(
@@ -1992,7 +2043,21 @@ async def voice_chat_endpoint(
                 safe_name,
                 str(active_tenant),
                 wa_values,
+                chat_in.call_id,
             )
+            # Do not let a generated refusal contradict the automated action.
+            refusal_terms = (
+                "cannot send whatsapp", "can't send whatsapp", "cannot send a whatsapp",
+                "व्हाट्सऐप नहीं भेज", "व्हाट्सएप नहीं भेज", "वॉट्सऐप नहीं भेज",
+                "व्हाट्सऐप नहीं कर सकती", "whatsapp message नहीं भेज",
+            )
+            has_whatsapp_refusal = any(term in ai_reply.lower() for term in refusal_terms) or bool(
+                re.search(r"(?:whatsapp|व्हाट्स.?एप|वॉट्स.?एप).{0,60}(?:नहीं|नही|cannot|can't|unable)|(?:नहीं|नही|cannot|can't|unable).{0,60}(?:whatsapp|व्हाट्स.?एप|वॉट्स.?एप)", ai_reply, re.I | re.S)
+            )
+            if has_whatsapp_refusal:
+                ai_reply = "जी, मैं उपलब्ध जानकारी आपके WhatsApp पर भेजने की कोशिश कर रही हूँ।"
+            elif not any(term in ai_reply.lower() for term in ("whatsapp", "व्हाट्सऐप", "व्हाट्सएप", "वॉट्सऐप")):
+                ai_reply = (ai_reply.rstrip(" .।") + "। साथ ही, मैं उपलब्ध जानकारी आपके WhatsApp पर भेजने की कोशिश कर रही हूँ।").strip()
         elif not chat_in.phone_number:
             logger.warning("Caller requested WhatsApp but Exotel did not provide caller phone number")
         else:
@@ -2227,7 +2292,7 @@ async def _exotel_transcribe_pcm(pcm: bytes, sample_rate: int = 8000) -> tuple[s
         return "", "hi-IN"
 
 
-async def _exotel_get_ai_audio(transcript: str, business_name: str = "", business_type: str = "", conversation_history: Optional[List[Dict[str, str]]] = None, tenant_id: Optional[str] = None, agent_id: Optional[str] = None, sample_rate: int = 8000, phone_number: Optional[str] = None, business_phone: Optional[str] = None, language_code: str = "hi-IN", stream_tts: bool = False) -> tuple[str, bytes, Dict[str, str]]:
+async def _exotel_get_ai_audio(transcript: str, business_name: str = "", business_type: str = "", conversation_history: Optional[List[Dict[str, str]]] = None, tenant_id: Optional[str] = None, agent_id: Optional[str] = None, sample_rate: int = 8000, phone_number: Optional[str] = None, business_phone: Optional[str] = None, call_id: Optional[str] = None, language_code: str = "hi-IN", stream_tts: bool = False) -> tuple[str, bytes, Dict[str, str]]:
     """Reuse the deployed HTTP voice-chat API and convert Sarvam WAV to Exotel PCM."""
     api_url = "https://call-genie-bs6x.onrender.com/api/voice/chat"
     payload = {
@@ -2240,6 +2305,7 @@ async def _exotel_get_ai_audio(transcript: str, business_name: str = "", busines
         "agent_id": agent_id,
         "phone_number": phone_number,
         "business_phone": business_phone,
+        "call_id": call_id,
         "language_code": language_code,
         "stream_tts": stream_tts,
     }
@@ -2442,6 +2508,7 @@ async def exotel_voicebot_websocket(websocket: WebSocket):
                 sample_rate=sample_rate,
                 phone_number=voice_context.get("phone_number"),
                 business_phone=voice_context.get("business_phone"),
+                call_id=voice_context.get("call_id"),
                 language_code=detected_language,
                 stream_tts=True,
             )
