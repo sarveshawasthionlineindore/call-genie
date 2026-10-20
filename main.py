@@ -2528,7 +2528,71 @@ async def _exotel_rest_tts_fallback(text: str, language_code: str, sample_rate: 
         logger.warning("Exotel REST TTS fallback returned %s: %s", response.status_code, response.text[:250])
     except Exception as exc:
         logger.warning("Exotel REST TTS fallback failed: %s", exc)
-    return b""
+    return await _exotel_gemini_tts_fallback(text, language_code, sample_rate)
+
+
+async def _exotel_gemini_tts_fallback(text: str, language_code: str, sample_rate: int = 8000) -> bytes:
+    """Synthesize a spoken reply with Gemini TTS when Sarvam has no credits or is unavailable."""
+    if not settings.GEMINI_API_KEY or not (text or "").strip():
+        return b""
+    payload = {
+        "model": "gemini-3.8-flash-lite-tts",
+        "input": [{
+            "type": "user_input",
+            "content": [{
+                "type": "text",
+                "text": text[:2200],
+                "annotations": [{
+                    "type": "speech_metadata",
+                    "style": (
+                        f"Warm, natural, clear female Indian voice speaking {language_code}; "
+                        "conversational, polite, expressive, and at a brisk but easy-to-follow pace. "
+                        "Pronounce the supplied transcript exactly; do not add words."
+                    ),
+                }],
+            }],
+        }],
+        "response_format": {"type": "audio"},
+        "generation_config": {"speech_config": [{"voice": "Aoede"}]},
+    }
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            response = await client.post(
+                "https://generativelanguage.googleapis.com/v1beta/interactions",
+                headers={
+                    "x-goog-api-key": settings.GEMINI_API_KEY,
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+            )
+        if response.status_code != 200:
+            logger.warning("Gemini TTS fallback returned %s: %s", response.status_code, response.text[:300])
+            return b""
+        result = response.json()
+        audio_b64 = None
+        for step in reversed(result.get("steps", [])):
+            if step.get("type") != "model_output":
+                continue
+            for item in reversed(step.get("content", [])):
+                if item.get("type") == "audio" and item.get("data"):
+                    audio_b64 = item["data"]
+                    break
+            if audio_b64:
+                break
+        if not audio_b64:
+            logger.warning("Gemini TTS fallback returned no audio content")
+            return b""
+        wav_bytes = base64.b64decode(audio_b64)
+        if wav_bytes[:4] != b"RIFF":
+            logger.warning("Gemini TTS fallback returned an unexpected audio container")
+            return b""
+        pcm = _wav_to_pcm_mono(wav_bytes, target_sample_rate=sample_rate)
+        if pcm:
+            logger.info("Exotel Voicebot Gemini TTS fallback ready bytes=%s language=%s", len(pcm), language_code)
+        return pcm
+    except Exception as exc:
+        logger.warning("Exotel Gemini TTS fallback failed: %s", exc)
+        return b""
 
 
 @app.websocket("/api/telephony/exotel/voicebot")
