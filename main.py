@@ -248,6 +248,7 @@ class Agent(Base):
     llm_model = Column(String(50), default="llama-3.3-70b-versatile")
     tts_provider = Column(String(50), default="sarvam")
     tts_voice = Column(String(50), default="priya")
+    tts_pace = Column(Float, default=1.0)
     system_prompt = Column(Text, nullable=False)
     greeting_message = Column(Text, nullable=False)
     call_direction = Column(String(20), default="both")
@@ -273,6 +274,32 @@ class Agent(Base):
     @property
     def first_message(self):
         return self.greeting_message
+
+_SARVAM_V4_VOICE_IDS = {
+    # Hindi: conversational, support, and expressive styles
+    "aparna_hi_customer", "ritu_hi_customer_warm", "ritu_hi_customer", "ritu_hi_conversation",
+    "ritu_hi_sales", "ritu_hi_banking", "ritu_hi_medical", "ritu_hi_social_lively",
+    "ishita_hi_banking", "ishita_hi_social", "shreya_hi_conversational",
+    "simran_hi_conversation", "simran_hi_sales", "simran_hi_social_energetic",
+    "suhani_hi_social", "shalini_hi_social", "roopa_hi_conversational", "roopa_hi_companion",
+    "sanchita_hi_assistant", "sanchita_hi_social", "shubh_hi_customer", "shubh_hi_ecomm",
+    # English and Hindi-English code-mixed
+    "simran_en_customer", "simran_en_conversation", "simran_en_sales", "ishita_en_customer",
+    "neha_en_customer", "shalini_en_customer", "shubh_en_recovery", "ishita_enhi_customer",
+    "ishita_enhi_customer_expressive", "simran_enhi_customer", "shalini_enhi_customer",
+    "sunny_enhi_customer",
+    # Other Sarvam v4 language personas offered in the selector
+    "ishita_mr_conversational", "neha_mr_narration", "ritu_mr_insurance", "soham_mr_narration",
+    "chaitra_kn_conversation", "chetan_kn_conversation", "anand_pa_customer", "harpreet_pa_narration",
+    "gokul_ta_narration", "vijay_ta_narration", "kavitha_te_conversation", "pooja_te_conversation",
+    "pooja_gu_customer", "pooja_gu_conversational", "roopa_bn_conversational",
+}
+_SARVAM_V3_VOICE_IDS = {
+    "shubh", "aditya", "rahul", "rohan", "amit", "dev", "ritu", "priya", "neha", "pooja",
+    "simran", "kavya", "ishita", "shreya", "roopa", "tanya", "shruti", "suhani", "kavitha",
+    "rupali", "kabir", "aayan", "ashutosh", "advait", "anand", "tarun", "sunny", "mani",
+    "gokul", "vijay", "mohit", "rehan", "soham", "suman_hi_companion",
+}
 
 class KnowledgeDocument(Base):
     __tablename__ = "knowledge_documents"
@@ -434,6 +461,7 @@ class AgentCreate(BaseModel):
     tts_provider: Optional[str] = "sarvam"
     voice_provider: Optional[str] = None
     tts_voice: Optional[str] = "suman_hi_companion"
+    tts_pace: Optional[float] = 1.0
     custom_voice_id: Optional[str] = None
     system_prompt: str
     greeting_message: Optional[str] = None
@@ -449,6 +477,7 @@ class AgentOut(BaseModel):
     language: str
     tts_provider: Optional[str] = "sarvam"
     tts_voice: str
+    tts_pace: float = 1.0
     custom_voice_id: Optional[str] = None
     system_prompt: str
     greeting_message: str
@@ -457,6 +486,11 @@ class AgentOut(BaseModel):
     is_active: bool
     created_at: datetime
     class Config: from_attributes = True
+
+class AgentVoiceUpdate(BaseModel):
+    language: Optional[str] = None
+    tts_voice: str
+    tts_pace: float = 1.0
 
 class WalletOut(BaseModel):
     balance_inr: float
@@ -1417,6 +1451,14 @@ async def on_startup():
             )
             if not has_recording_url:
                 await conn.execute(text("ALTER TABLE call_logs ADD COLUMN recording_url VARCHAR(1200)"))
+            has_agent_pace = await conn.run_sync(
+                lambda sync_conn: any(
+                    column["name"] == "tts_pace"
+                    for column in inspect(sync_conn).get_columns("agents")
+                )
+            )
+            if not has_agent_pace:
+                await conn.execute(text("ALTER TABLE agents ADD COLUMN tts_pace FLOAT NOT NULL DEFAULT 1.0"))
 
     try:
         # Strict 3-second timeout for primary database connection
@@ -1596,6 +1638,11 @@ def _sarvam_tts_choice(language_code: Optional[str], configured_voice: Optional[
     """Return model, speaker and normalized language for the configured Sarvam voice."""
     language, v3_speaker, supported = _voice_language_settings(language_code)
     configured_voice = (configured_voice or "").strip()
+    # Pin the four voices used by the public demo so the dashboard can match them exactly.
+    if configured_voice.lower().startswith("v3:"):
+        pinned_speaker = configured_voice.split(":", 1)[1].strip().lower()
+        if pinned_speaker in _SARVAM_V3_VOICE_IDS:
+            return "bulbul:v3", pinned_speaker, language
     # The deployed dashboard still stores this legacy value; force a known female Hindi voice.
     if configured_voice.lower() == "suman_hi_companion":
         configured_voice = "ritu_hi_customer"
@@ -2134,6 +2181,7 @@ async def voice_chat_endpoint(
 
     audio_base64 = None
     agent_tts_voice = getattr(agent_row, "tts_voice", None) if agent_row else None
+    agent_tts_pace = max(0.8, min(1.2, float(getattr(agent_row, "tts_pace", 1.0) or 1.0))) if agent_row else 1.0
     tts_model, tts_speaker, tts_language = _sarvam_tts_choice(
         speech_language_code, agent_tts_voice
     )
@@ -2182,7 +2230,7 @@ async def voice_chat_endpoint(
                     "language_code": tts_language,
                     "speaker": tts_speaker,
                     "model": tts_model,
-                    "pace": 1.0,
+                    "pace": agent_tts_pace,
                     "speech_sample_rate": 16000,
                     "enable_preprocessing": True
                 }
@@ -2217,6 +2265,7 @@ async def voice_chat_endpoint(
         "audio_base64": audio_base64,
         "tts_model": tts_model,
         "tts_speaker": tts_speaker,
+        "tts_pace": agent_tts_pace,
         "tts_language_code": tts_language,
         "tts_provider": "cartesia_clone" if audio_base64 and custom_voice_id else "sarvam",
     }
@@ -2389,6 +2438,7 @@ async def _exotel_get_ai_audio(transcript: str, business_name: str = "", busines
             "model": str(data.get("tts_model") or ""),
             "speaker": str(data.get("tts_speaker") or ""),
             "language_code": str(data.get("tts_language_code") or language_code),
+            "pace": str(data.get("tts_pace") or "1.0"),
         }
         audio_b64 = data.get("audio_base64")
         if not audio_b64 and not stream_tts:
@@ -2429,6 +2479,7 @@ async def _exotel_send_pcm(websocket: WebSocket, stream_sid: str, pcm: bytes, sa
 async def _exotel_stream_tts_to_exotel(
     websocket: WebSocket, stream_sid: str, text: str, language_code: str, sample_rate: int = 8000,
     model_override: Optional[str] = None, speaker_override: Optional[str] = None,
+    pace_override: Optional[float] = None,
 ) -> bool:
     """Stream Sarvam audio chunks directly to Exotel instead of waiting for a full WAV."""
     if not settings.SARVAM_API_KEY or not text.strip():
@@ -2443,7 +2494,7 @@ async def _exotel_stream_tts_to_exotel(
     payload = {
         "text": text[:3500], "model": model, "language_code": language_code,
         "speaker": speaker, "speech_sample_rate": 8000,
-        "output_audio_codec": "wav", "pace": 1.0, "enable_preprocessing": True,
+        "output_audio_codec": "wav", "pace": max(0.8, min(1.2, float(pace_override or 1.0))), "enable_preprocessing": True,
     }
     if model == "bulbul:v3":
         payload["temperature"] = 0.72
@@ -2502,7 +2553,7 @@ async def _exotel_stream_tts_to_exotel(
     return sent_packets > 0
 
 
-async def _exotel_rest_tts_fallback(text: str, language_code: str, sample_rate: int = 8000, model_override: Optional[str] = None, speaker_override: Optional[str] = None) -> bytes:
+async def _exotel_rest_tts_fallback(text: str, language_code: str, sample_rate: int = 8000, model_override: Optional[str] = None, speaker_override: Optional[str] = None, pace_override: Optional[float] = None) -> bytes:
     """Fallback to complete v3 audio if the live HTTP stream cannot start."""
     if not settings.SARVAM_API_KEY or not text.strip():
         return b""
@@ -2514,7 +2565,7 @@ async def _exotel_rest_tts_fallback(text: str, language_code: str, sample_rate: 
     payload = {
         "inputs": [text[:2500]], "model": model,
         "language_code": language_code, "speaker": speaker,
-        "speech_sample_rate": sample_rate, "pace": 1.0,
+        "speech_sample_rate": sample_rate, "pace": max(0.8, min(1.2, float(pace_override or 1.0))),
     }
     if model == "bulbul:v3":
         payload["temperature"] = 0.72
@@ -2659,12 +2710,14 @@ async def exotel_voicebot_websocket(websocket: WebSocket):
                         websocket, active_stream_sid, reply, voice_meta.get("language_code") or detected_language,
                         sample_rate=sample_rate, model_override=voice_meta.get("model"),
                         speaker_override=voice_meta.get("speaker"),
+                        pace_override=float(voice_meta.get("pace") or 1.0),
                     )
                     if not audio_started:
                         logger.warning("Streaming TTS unavailable; using complete-audio fallback")
                         fallback_pcm = await _exotel_rest_tts_fallback(
                             reply, voice_meta.get("language_code") or detected_language, sample_rate,
                             model_override=voice_meta.get("model"), speaker_override=voice_meta.get("speaker"),
+                            pace_override=float(voice_meta.get("pace") or 1.0),
                         )
                         if fallback_pcm:
                             await _exotel_send_pcm(websocket, active_stream_sid, fallback_pcm, sample_rate=sample_rate)
@@ -3400,6 +3453,7 @@ async def create_agent(agent_in: AgentCreate, user: User = Depends(get_current_u
         "language": agent_in.language or "hi-IN",
         "tts_provider": tts_provider,
         "tts_voice": agent_in.tts_voice or "suman_hi_companion",
+        "tts_pace": max(0.8, min(1.2, float(agent_in.tts_pace or 1.0))),
         "custom_voice_id": custom_v_id,
         "system_prompt": agent_in.system_prompt,
         "greeting_message": greeting,
@@ -3416,6 +3470,28 @@ async def create_agent(agent_in: AgentCreate, user: User = Depends(get_current_u
 @app.get("/api/agents", response_model=List[AgentOut])
 async def list_agents(user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
     return (await db.execute(select(Agent).where(Agent.tenant_id == user.tenant_id).order_by(desc(Agent.created_at)))).scalars().all()
+
+@app.patch("/api/agents/{agent_id}/voice", response_model=AgentOut)
+async def update_agent_voice(agent_id: str, voice_in: AgentVoiceUpdate, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    agent = (await db.execute(select(Agent).where(Agent.id == agent_id, Agent.tenant_id == user.tenant_id))).scalar_one_or_none()
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found in this workspace")
+    language = (voice_in.language or agent.language or "hi-IN").strip()
+    requested_voice = (voice_in.tts_voice or "").strip()
+    is_pinned_v3_voice = requested_voice.lower().startswith("v3:") and requested_voice.split(":", 1)[1].strip().lower() in _SARVAM_V3_VOICE_IDS
+    if requested_voice not in _SARVAM_V4_VOICE_IDS and requested_voice not in _SARVAM_V3_VOICE_IDS and not is_pinned_v3_voice:
+        raise HTTPException(status_code=422, detail="Please choose a supported Sarvam voice")
+    model, _, normalized_language = _sarvam_tts_choice(language, requested_voice)
+    if model == "bulbul:v4-flash" and voice_in.tts_voice not in _SARVAM_V4_VOICE_IDS:
+        raise HTTPException(status_code=422, detail="Please choose a supported Sarvam v4 voice")
+    agent.language = normalized_language
+    agent.tts_provider = "sarvam"
+    agent.tts_voice = voice_in.tts_voice
+    agent.tts_pace = max(0.8, min(1.2, float(voice_in.tts_pace)))
+    agent.custom_voice_id = None
+    await db.commit()
+    await db.refresh(agent)
+    return agent
 
 @app.get("/api/wallet", response_model=WalletOut)
 async def get_wallet(user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
@@ -4885,6 +4961,7 @@ async def exotel_greeting_audio(
     greeting_text = ""
     greeting_language = "hi-IN"
     greeting_voice = "priya"
+    greeting_pace = 1.0
     greeting_custom_voice = ""
     is_public_demo = (demo_mode or "").strip().lower() in {"true", "1", "yes"}
     if is_public_demo:
@@ -4927,6 +5004,7 @@ async def exotel_greeting_audio(
                     _, mapped_voice, _ = _voice_language_settings(greeting_language)
                     configured_voice = getattr(agent_row, "tts_voice", None)
                     greeting_voice = configured_voice or mapped_voice
+                    greeting_pace = max(0.8, min(1.2, float(getattr(agent_row, "tts_pace", 1.0) or 1.0)))
                     greeting_custom_voice = (getattr(agent_row, "custom_voice_id", None) or "").strip()
                     tenant_row = (await greeting_db.execute(select(Tenant).where(Tenant.id == agent_row.tenant_id))).scalar_one_or_none()
                     business = (getattr(tenant_row, "name", None) or "").strip()
@@ -4945,7 +5023,7 @@ async def exotel_greeting_audio(
         else:
             greeting_text = "नमस्ते, क्या अभी बात करने का सही समय है?"
 
-    cache_key = hashlib.sha256(f"{greeting_language}|{greeting_voice}|{greeting_custom_voice}|{greeting_text}".encode("utf-8")).hexdigest()
+    cache_key = hashlib.sha256(f"{greeting_language}|{greeting_voice}|{greeting_pace}|{greeting_custom_voice}|{greeting_text}".encode("utf-8")).hexdigest()
     cached_audio = EXOTEL_AUDIO_CACHE.get(cache_key)
     if cached_audio and len(cached_audio) > 500:
         return Response(
@@ -4990,7 +5068,7 @@ async def exotel_greeting_audio(
                 "language_code": normalized_greeting_language,
                 "speaker": greeting_speaker,
                 "model": greeting_model,
-                "pace": 1.0,
+                "pace": greeting_pace,
                 "speech_sample_rate": 8000,
                 "enable_preprocessing": True
             }
