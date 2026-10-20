@@ -1486,6 +1486,31 @@ async def health(): return {"status": "healthy", "app": settings.APP_NAME}
 # IN-MEMORY IP RATE LIMITER FOR PUBLIC DEMO ENDPOINTS (Protection against API drain)
 # ==============================================================================
 _ip_request_history: Dict[str, List[float]] = {}
+_pending_public_demo_contexts: Dict[str, Dict[str, Any]] = {}
+
+def _clean_demo_phone(value: Optional[str]) -> str:
+    digits = "".join(filter(str.isdigit, value or ""))
+    return digits[-10:] if len(digits) >= 10 else digits
+
+def _take_public_demo_context(phone_number: Optional[str], demo_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    now = time.time()
+    for key, value in list(_pending_public_demo_contexts.items()):
+        if float(value.get("expires_at", 0)) < now:
+            _pending_public_demo_contexts.pop(key, None)
+    if demo_id and demo_id in _pending_public_demo_contexts:
+        return _pending_public_demo_contexts.pop(demo_id, None)
+    phone_key = _clean_demo_phone(phone_number)
+    if not phone_key:
+        return None
+    candidates = [
+        (key, value) for key, value in _pending_public_demo_contexts.items()
+        if value.get("phone_key") == phone_key
+    ]
+    if not candidates:
+        return None
+    key, context = min(candidates, key=lambda item: item[1].get("created_at", now))
+    _pending_public_demo_contexts.pop(key, None)
+    return context
 
 def check_rate_limit(ip: str, max_requests: int = 20, window_seconds: int = 60) -> bool:
     now = time.time()
@@ -1511,6 +1536,7 @@ class VoiceChatRequest(BaseModel):
     call_id: Optional[str] = None
     language_code: Optional[str] = None
     stream_tts: bool = False
+    demo_mode: bool = False
 
 
 # Saaras can detect 22 Indian languages; Bulbul v3 can synthesize 10 Indian
@@ -1832,7 +1858,7 @@ async def voice_chat_endpoint(
     High-Class Corporate AI Telecaller powered by Google Gemini and Sarvam AI Bulbul with Voice RAG 2.0.
     Adapts dynamically to any universal business and strictly cites trained knowledge base facts.
     """
-    client_ip = request.headers.get("x-forwarded-for", "").split(",")[0].strip() or (request.client.host if request.client else "unknown")
+        client_ip = request.headers.get("x-forwarded-for", "").split(",")[0].strip() or (request.client.host if request.client else "unknown")
     if not check_rate_limit(client_ip, max_requests=30, window_seconds=60):
         raise HTTPException(status_code=429, detail="Too many messages sent. Please wait a moment before trying again.")
 
@@ -1905,6 +1931,32 @@ async def voice_chat_endpoint(
         f"Speak naturally in {reply_language}; do not switch to another language unless the caller does. "
         "Use one or two short, conversational sentences."
     )
+    public_business_demo = bool(chat_in.demo_mode and not active_tenant and not agent_row)
+    if public_business_demo:
+        category = business_type or "local business"
+        system_prompt += (
+            f"\n\nPUBLIC LIVE BUSINESS DEMO: The prospect entered the business name '{business_name}' and category '{category}'. "
+            f"Speak as a helpful female AI receptionist/sales caller representing {business_name}; demonstrate a real two-way conversation for that category. "
+            "Do not pitch Call Genie unless the caller asks what this demo is. This is a demonstration, not an actual business support line. "
+            "Only the business name and category are known; no verified address, hours, staff, prices, inventory, records, or booking calendar were supplied. "
+            "At the start of the conversation, naturally disclose once that this is a live demonstration and the business's real records are not connected yet. Never present generated/sample facts as real, and never claim a booking/action was completed. Say briefly that exact business information is not connected, then continue by demonstrating the relevant questions and workflow. "
+            "Keep every turn short and natural, and ask one useful follow-up question."
+        )
+        category_lower = category.lower()
+        if any(term in category_lower for term in ("hospital", "clinic", "doctor", "health")):
+            system_prompt += (
+                "\nHealthcare demo behavior: greet as the named hospital/clinic's female AI receptionist. Ask which department or medical specialty the caller needs and whether they need appointment, billing, admission, or report help. For a realistic demonstration, you may describe a clearly hypothetical example (for example, a sample appointment slot), but explicitly say it is only a demo example and is not available or booked in the real hospital. "
+                "For real doctor names, timings, address, prices, or available slots, explain that the hospital's verified directory/calendar must be connected first; do not invent these as actual facts. Do not diagnose, recommend treatment, or interpret reports. "
+                "For urgent or severe symptoms, advise contacting local emergency services or the hospital directly. Mention missed-call callbacks, appointment reminders, and post-discharge check-ins only as capabilities the hospital could configure, never as actions already scheduled."
+            )
+        elif any(term in category_lower for term in ("real estate", "property")):
+            system_prompt += "\nReal-estate demo behavior: ask preferred area, budget, and property type; do not invent available listings, prices, or visits."
+        elif any(term in category_lower for term in ("coaching", "education", "college")):
+            system_prompt += "\nEducation demo behavior: ask course/class and learner needs; do not invent fees, results, or batch availability."
+        elif any(term in category_lower for term in ("finance", "loan", "emi")):
+            system_prompt += "\nFinance demo behavior: ask the caller's general requirement; do not promise eligibility, approval, rates, or financial outcomes."
+        elif any(term in category_lower for term in ("automobile", "car", "dealership", "service")):
+            system_prompt += "\nAutomobile demo behavior: ask vehicle model and whether the caller needs sales, service, or booking; do not invent stock, prices, or appointment availability."
     if agent_instructions:
         system_prompt += "\n\nBusiness-specific agent instructions (apply only when consistent with verified knowledge):\n" + agent_instructions
     system_prompt += (
@@ -2300,12 +2352,12 @@ async def _exotel_transcribe_pcm(pcm: bytes, sample_rate: int = 8000) -> tuple[s
         return "", "hi-IN"
 
 
-async def _exotel_get_ai_audio(transcript: str, business_name: str = "", business_type: str = "", conversation_history: Optional[List[Dict[str, str]]] = None, tenant_id: Optional[str] = None, agent_id: Optional[str] = None, sample_rate: int = 8000, phone_number: Optional[str] = None, business_phone: Optional[str] = None, call_id: Optional[str] = None, language_code: str = "hi-IN", stream_tts: bool = False) -> tuple[str, bytes, Dict[str, str]]:
+async def _exotel_get_ai_audio(transcript: str, business_name: str = "", business_type: str = "", conversation_history: Optional[List[Dict[str, str]]] = None, tenant_id: Optional[str] = None, agent_id: Optional[str] = None, sample_rate: int = 8000, phone_number: Optional[str] = None, business_phone: Optional[str] = None, call_id: Optional[str] = None, language_code: str = "hi-IN", stream_tts: bool = False, client_name: Optional[str] = None, demo_mode: bool = False) -> tuple[str, bytes, Dict[str, str]]:
     """Reuse the deployed HTTP voice-chat API and convert Sarvam WAV to Exotel PCM."""
     api_url = "https://call-genie-bs6x.onrender.com/api/voice/chat"
     payload = {
         "message": transcript,
-        "client_name": "सर",
+        "client_name": client_name or "सर",
         "business_name": business_name,
         "business_type": business_type,
         "conversation_history": (conversation_history or [])[-6:],
@@ -2316,6 +2368,7 @@ async def _exotel_get_ai_audio(transcript: str, business_name: str = "", busines
         "call_id": call_id,
         "language_code": language_code,
         "stream_tts": stream_tts,
+        "demo_mode": demo_mode,
     }
     try:
         async with httpx.AsyncClient(timeout=25.0) as client:
@@ -2519,6 +2572,8 @@ async def exotel_voicebot_websocket(websocket: WebSocket):
                 call_id=voice_context.get("call_id"),
                 language_code=detected_language,
                 stream_tts=True,
+                client_name=voice_context.get("client_name"),
+                demo_mode=voice_context.get("demo_mode") == "true",
             )
             conversation_history.extend([{"role": "user", "content": transcript}, {"role": "assistant", "content": reply}])
             del conversation_history[:-6]
@@ -2589,10 +2644,19 @@ async def exotel_voicebot_websocket(websocket: WebSocket):
                 max_utterance_bytes = int(sample_rate * 2 * 10)
                 custom = start_data.get("custom_parameters") or {}
                 if isinstance(custom, dict):
-                    for key in ("tenant_id", "agent_id", "business_name", "business_type", "client_name", "call_id"):
+                    for key in ("tenant_id", "agent_id", "business_name", "business_type", "client_name", "call_id", "demo_id", "demo_mode"):
                         value = custom.get(key)
                         if value:
                             voice_context[key] = str(value)
+                public_demo = _take_public_demo_context(
+                    voice_context.get("phone_number"), voice_context.get("demo_id")
+                )
+                if public_demo:
+                    voice_context.update({
+                        key: str(public_demo[key])
+                        for key in ("client_name", "business_name", "business_type", "demo_mode", "demo_id")
+                        if public_demo.get(key) is not None
+                    })
                 logger.info("Exotel Voicebot stream started sid=%s from=%s rate=%s context=%s",
                             stream_sid, start_data.get("from", ""), sample_rate,
                             ",".join(sorted(voice_context.keys())))
@@ -3318,21 +3382,39 @@ async def personalized_demo(demo_in: PersonalizedDemoRequest, request: Request):
         digits = digits[1:]
     if len(digits) != 10:
         raise HTTPException(status_code=400, detail="Please enter a valid 10-digit Indian mobile number.")
+    client_name = (demo_in.client_name or "").strip()[:100]
+    business_name = (demo_in.business_name or "").strip()[:150]
+    business_type = (demo_in.business_type or "").strip()[:150]
+    if not business_name or not business_type:
+        raise HTTPException(status_code=400, detail="Please enter your business name and select a business category.")
 
     if not (settings.EXOTEL_SID and settings.EXOTEL_API_KEY and settings.EXOTEL_API_TOKEN and settings.EXOTEL_CALLER_NUMBER):
         raise HTTPException(status_code=503, detail="Phone demo is unavailable: Exotel credentials are not fully configured.")
 
+    demo_id = uuid.uuid4().hex
+    _pending_public_demo_contexts[demo_id] = {
+        "demo_id": demo_id,
+        "phone_key": digits,
+        "client_name": client_name,
+        "business_name": business_name,
+        "business_type": business_type,
+        "demo_mode": "true",
+        "created_at": time.time(),
+        "expires_at": time.time() + 300,
+    }
     result = await ExotelService.trigger_outbound_call(
         to_phone=f"+91{digits}",
         caller_id=settings.EXOTEL_CALLER_NUMBER,
         extra_custom_fields={
-            "client_name": demo_in.client_name.strip()[:100],
-            "business_name": demo_in.business_name.strip()[:150],
-            "business_type": demo_in.business_type.strip()[:150],
+            "demo_id": demo_id,
+            "client_name": client_name,
+            "business_name": business_name,
+            "business_type": business_type,
             "language": (demo_in.language or "hi-IN")[:20],
         },
     )
     if result.get("status") != "success":
+        _pending_public_demo_contexts.pop(demo_id, None)
         detail = result.get("detail") or result.get("message") or "Exotel did not accept the call request."
         logger.warning("Homepage demo Exotel dispatch failed: %s", detail)
         raise HTTPException(status_code=502, detail=f"Call could not be placed: {str(detail)[:350]}")
