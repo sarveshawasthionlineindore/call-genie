@@ -1866,11 +1866,14 @@ async def voice_chat_endpoint(
     active_name = discovered or chat_in.client_name or "सर"
 
     # DYNAMIC ENTERPRISE KNOWLEDGE INJECTION (Voice RAG 2.0)
-    k_context = (chat_in.knowledge_context or "").strip()
-    active_tenant = chat_in.tenant_id
+    public_demo_request = bool(chat_in.demo_mode)
+    k_context = "" if public_demo_request else (chat_in.knowledge_context or "").strip()
+    active_tenant = None if public_demo_request else chat_in.tenant_id
     agent_row = None
 
-    if chat_in.agent_id:
+    # Public homepage demos must never inherit an Exotel flow's static agent,
+    # tenant, or knowledge base (which may belong to an unrelated customer).
+    if chat_in.agent_id and not public_demo_request:
         try:
             agent_row = (await db.execute(select(Agent).where(Agent.id == chat_in.agent_id))).scalar_one_or_none()
             if agent_row:
@@ -1881,7 +1884,7 @@ async def voice_chat_endpoint(
             logger.warning("Could not load voice agent settings: %s", agent_err)
 
     # Auto-extract tenant_id from Bearer token if not explicitly passed in body
-    if not active_tenant:
+    if not active_tenant and not public_demo_request:
         auth_hdr = request.headers.get("authorization", "")
         if auth_hdr.startswith("Bearer "):
             try:
@@ -1927,11 +1930,11 @@ async def voice_chat_endpoint(
         "Use recent conversation for context. Do not repeat greetings or give a sales pitch unless asked. "
         "If the question is understandable, do not ask the caller to explain it again. "
         "Use this business's supplied knowledge for products, prices, availability, dealer/contact details, property listings, and services; never invent facts. "
-        "If a requested fact is not in the knowledge, briefly say it is not confirmed and offer to send only the available information. "
+        "If a requested fact is not in the knowledge, briefly say it is not confirmed and ask a useful next question. "
         f"Speak naturally in {reply_language}; do not switch to another language unless the caller does. "
         "Use one or two short, conversational sentences."
     )
-    public_business_demo = bool(chat_in.demo_mode and not active_tenant and not agent_row)
+    public_business_demo = public_demo_request
     if public_business_demo:
         category = business_type or "local business"
         system_prompt += (
@@ -1941,6 +1944,10 @@ async def voice_chat_endpoint(
             "Only the business name and category are known; no verified address, hours, staff, prices, inventory, records, or booking calendar were supplied. "
             "At the start of the conversation, naturally disclose once that this is a live demonstration and the business's real records are not connected yet. Never present generated/sample facts as real, and never claim a booking/action was completed. Say briefly that exact business information is not connected, then continue by demonstrating the relevant questions and workflow. "
             "Keep every turn short and natural, and ask one useful follow-up question."
+        )
+        system_prompt += (
+            " Do not mention MyBot Genie, another customer's business, or unrelated customer records. "
+            "Do not say you will send WhatsApp unless the caller explicitly asks; this public demo has no business WhatsApp account connected, so never claim a message was sent."
         )
         category_lower = category.lower()
         if any(term in category_lower for term in ("hospital", "clinic", "doctor", "health")):
@@ -1963,13 +1970,13 @@ async def voice_chat_endpoint(
         "\n\nVoice persona rule: You are a woman. When speaking Hindi, use feminine first-person grammar consistently, "
         "such as 'मैं बता रही हूँ', 'मैं भेज रही हूँ', 'मैं कर सकती हूँ'. Never use masculine self-reference and never say both gender forms."
     )
-    if whatsapp_requested:
+    if whatsapp_requested and not public_business_demo:
         system_prompt += (
             "\nThe application will attempt the approved WhatsApp template automatically. Do not say you cannot send WhatsApp. "
             "Say truthfully that you are trying to send the available information; do not promise delivery."
         )
 
-    if not k_context and (active_tenant or chat_in.agent_id):
+    if not public_business_demo and not k_context and (active_tenant or chat_in.agent_id):
         try:
             stmt = select(KnowledgeDocument)
             if active_tenant:
@@ -2091,7 +2098,7 @@ async def voice_chat_endpoint(
 
     ai_reply = _normalize_female_hindi(ai_reply, detected_language)
 
-    if whatsapp_requested:
+    if whatsapp_requested and not public_business_demo:
         if chat_in.phone_number and active_tenant:
             safe_name = active_name if active_name.lower() not in ("सर", "sir", "ji", "customer") else "Customer"
             wa_values = _build_voice_whatsapp_values(
@@ -4867,7 +4874,8 @@ def get_builtin_fallback_wav() -> bytes:
 async def exotel_greeting_audio(
     request: Request, phone: Optional[str] = None,
     tenant_id: Optional[str] = None, agent_id: Optional[str] = None,
-    business_name: Optional[str] = None, client_name: Optional[str] = None,
+    business_name: Optional[str] = None, business_type: Optional[str] = None,
+    client_name: Optional[str] = None, demo_mode: Optional[str] = None,
 ):
     """
     Streams authentic Hindi Priya Voice WAV/MP3 to Exotel telecom line.
@@ -4878,34 +4886,57 @@ async def exotel_greeting_audio(
     greeting_language = "hi-IN"
     greeting_voice = "priya"
     greeting_custom_voice = ""
-    try:
-        async with AsyncSessionLocal() as greeting_db:
-            agent_row = None
-            if agent_id:
-                agent_stmt = select(Agent).where(Agent.id == agent_id)
-                if tenant_id:
-                    agent_stmt = agent_stmt.where(Agent.tenant_id == tenant_id)
-                agent_row = (await greeting_db.execute(agent_stmt)).scalar_one_or_none()
-            elif tenant_id:
-                agent_row = (await greeting_db.execute(
-                    select(Agent).where(Agent.tenant_id == tenant_id).order_by(Agent.created_at.asc())
-                )).scalars().first()
-            if agent_row:
-                greeting_text = (getattr(agent_row, "greeting_message", None) or getattr(agent_row, "first_message", None) or "").strip()
-                greeting_language = getattr(agent_row, "language", None) or "hi-IN"
-                _, mapped_voice, _ = _voice_language_settings(greeting_language)
-                configured_voice = getattr(agent_row, "tts_voice", None)
-                greeting_voice = configured_voice or mapped_voice
-                greeting_custom_voice = (getattr(agent_row, "custom_voice_id", None) or "").strip()
-                tenant_row = (await greeting_db.execute(select(Tenant).where(Tenant.id == agent_row.tenant_id))).scalar_one_or_none()
-                business = (getattr(tenant_row, "name", None) or "").strip()
-                if not greeting_text:
-                    agent_name = (getattr(agent_row, "name", None) or "हमारी टीम").strip()
-                    greeting_text = f"नमस्ते, मैं {agent_name} की ओर से बात कर रही हूँ। क्या अभी बात करने का सही समय है?"
-                    if business and business.lower() not in {"mybot genie", "mybot genie hq"}:
-                        greeting_text = f"नमस्ते, मैं {business} की ओर से बात कर रही हूँ। क्या अभी बात करने का सही समय है?"
-    except Exception as greeting_err:
-        logger.warning("Could not load agent-specific Exotel greeting: %s", greeting_err)
+    is_public_demo = (demo_mode or "").strip().lower() in {"true", "1", "yes"}
+    if is_public_demo:
+        clean_business = (business_name or "aapka business").strip()[:150]
+        clean_client = (client_name or "").strip()[:100]
+        category = (business_type or "local business").lower()
+        name_prefix = f"{clean_client} जी, " if clean_client else ""
+        if any(term in category for term in ("hospital", "clinic", "doctor", "health")):
+            next_step = "आपको appointment, billing, admission या report में किस चीज़ की मदद चाहिए?"
+        elif any(term in category for term in ("real estate", "property")):
+            next_step = "आप किस area और किस तरह की property देख रहे हैं?"
+        elif any(term in category for term in ("coaching", "education", "college")):
+            next_step = "आप किस course या class के बारे में जानना चाहते हैं?"
+        elif any(term in category for term in ("finance", "loan", "emi")):
+            next_step = "आपको किस तरह के loan या financial service की जानकारी चाहिए?"
+        elif any(term in category for term in ("automobile", "car", "dealership", "service")):
+            next_step = "आपको vehicle खरीदने या service कराने में मदद चाहिए?"
+        else:
+            next_step = "बताइए, आपको किस चीज़ की जानकारी चाहिए?"
+        greeting_text = (
+            f"नमस्ते {name_prefix}मैं {clean_business} की AI सहायक बोल रही हूँ। "
+            f"यह live demo है। {next_step}"
+        )
+    else:
+        try:
+            async with AsyncSessionLocal() as greeting_db:
+                agent_row = None
+                if agent_id:
+                    agent_stmt = select(Agent).where(Agent.id == agent_id)
+                    if tenant_id:
+                        agent_stmt = agent_stmt.where(Agent.tenant_id == tenant_id)
+                    agent_row = (await greeting_db.execute(agent_stmt)).scalar_one_or_none()
+                elif tenant_id:
+                    agent_row = (await greeting_db.execute(
+                        select(Agent).where(Agent.tenant_id == tenant_id).order_by(Agent.created_at.asc())
+                    )).scalars().first()
+                if agent_row:
+                    greeting_text = (getattr(agent_row, "greeting_message", None) or getattr(agent_row, "first_message", None) or "").strip()
+                    greeting_language = getattr(agent_row, "language", None) or "hi-IN"
+                    _, mapped_voice, _ = _voice_language_settings(greeting_language)
+                    configured_voice = getattr(agent_row, "tts_voice", None)
+                    greeting_voice = configured_voice or mapped_voice
+                    greeting_custom_voice = (getattr(agent_row, "custom_voice_id", None) or "").strip()
+                    tenant_row = (await greeting_db.execute(select(Tenant).where(Tenant.id == agent_row.tenant_id))).scalar_one_or_none()
+                    business = (getattr(tenant_row, "name", None) or "").strip()
+                    if not greeting_text:
+                        agent_name = (getattr(agent_row, "name", None) or "हमारी टीम").strip()
+                        greeting_text = f"नमस्ते, मैं {agent_name} की ओर से बात कर रही हूँ। क्या अभी बात करने का सही समय है?"
+                        if business and business.lower() not in {"mybot genie", "mybot genie hq"}:
+                            greeting_text = f"नमस्ते, मैं {business} की ओर से बात कर रही हूँ। क्या अभी बात करने का सही समय है?"
+        except Exception as greeting_err:
+            logger.warning("Could not load agent-specific Exotel greeting: %s", greeting_err)
     if not greeting_text:
         clean_business = (business_name or "").strip()[:150]
         clean_client = (client_name or "").strip()[:100]
@@ -5046,7 +5077,7 @@ async def exotel_voice_flow(request: Request, phone: Optional[str] = None, call_
         audio_params["tenant_id"] = tenant_id
     if agent_id:
         audio_params["agent_id"] = agent_id
-    for key in ("business_name", "business_type", "client_name"):
+    for key in ("business_name", "business_type", "client_name", "demo_mode"):
         value = query.get(key) or (parsed_custom.get(key) or [None])[0]
         if value:
             audio_params[key] = value[:150]
