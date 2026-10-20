@@ -872,6 +872,7 @@ class ExotelService:
         call_id: Optional[str] = None,
         tenant_id: Optional[str] = None,
         agent_id: Optional[str] = None,
+        extra_custom_fields: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
         if not settings.EXOTEL_SID or not settings.EXOTEL_API_KEY or not settings.EXOTEL_API_TOKEN:
             logger.info("Exotel credentials not provided in environment; continuing in WebRTC / SIP simulation mode.")
@@ -911,14 +912,21 @@ class ExotelService:
             "TimeLimit": str(time_limit),
             "StatusCallback": callback_url
         }
-        custom_fields = {"phone": customer_phone}
+        exotel_fields = {"phone": customer_phone}
         if call_id:
-            custom_fields["call_id"] = str(call_id)
+            exotel_fields["call_id"] = str(call_id)
         if tenant_id:
-            custom_fields["tenant_id"] = str(tenant_id)
+            exotel_fields["tenant_id"] = str(tenant_id)
         if agent_id:
-            custom_fields["agent_id"] = str(agent_id)
-        payload["CustomField"] = urlencode(custom_fields)
+            exotel_fields["agent_id"] = str(agent_id)
+        # Include explicitly supplied demo context without allowing it to
+        # overwrite the routing fields that identify the destination/call.
+        if isinstance(extra_custom_fields, dict):
+            for key, value in extra_custom_fields.items():
+                safe_key = str(key).strip()[:50]
+                if safe_key and safe_key not in {"phone", "call_id", "tenant_id", "agent_id"} and value is not None:
+                    exotel_fields[safe_key] = str(value)[:500]
+        payload["CustomField"] = urlencode(exotel_fields)
 
         try:
             auth = httpx.BasicAuth(api_key, api_token)
@@ -2581,7 +2589,7 @@ async def exotel_voicebot_websocket(websocket: WebSocket):
                 max_utterance_bytes = int(sample_rate * 2 * 10)
                 custom = start_data.get("custom_parameters") or {}
                 if isinstance(custom, dict):
-                    for key in ("tenant_id", "agent_id", "business_name", "business_type", "call_id"):
+                    for key in ("tenant_id", "agent_id", "business_name", "business_type", "client_name", "call_id"):
                         value = custom.get(key)
                         if value:
                             voice_context[key] = str(value)
@@ -3297,10 +3305,45 @@ class PersonalizedDemoRequest(BaseModel):
     language: Optional[str] = "hi-IN"
 
 @app.post("/api/demo/personalized-call")
-async def personalized_demo(demo_in: PersonalizedDemoRequest, bg: BackgroundTasks):
-    clean_phone = demo_in.phone_number.strip().replace(" ", "").replace("-", "")
-    bg.add_task(LiveKitService.create_outbound_call, clean_phone, "demo", "demo_tenant", {"system_prompt": "Speak warm Hindi."})
-    return {"status": "initiated", "message": f"Demo call queued for {clean_phone}"}
+async def personalized_demo(demo_in: PersonalizedDemoRequest, request: Request):
+    """Place the public homepage demo through Exotel; never claim a room is a phone call."""
+    client_ip = request.headers.get("x-forwarded-for", "").split(",")[0].strip() or (request.client.host if request.client else "unknown")
+    if not check_rate_limit(f"demo:{client_ip}", max_requests=3, window_seconds=300):
+        raise HTTPException(status_code=429, detail="Demo call limit reached. Please try again in a few minutes.")
+
+    digits = "".join(filter(str.isdigit, demo_in.phone_number or ""))
+    if digits.startswith("91") and len(digits) == 12:
+        digits = digits[2:]
+    elif digits.startswith("0") and len(digits) == 11:
+        digits = digits[1:]
+    if len(digits) != 10:
+        raise HTTPException(status_code=400, detail="Please enter a valid 10-digit Indian mobile number.")
+
+    if not (settings.EXOTEL_SID and settings.EXOTEL_API_KEY and settings.EXOTEL_API_TOKEN and settings.EXOTEL_CALLER_NUMBER):
+        raise HTTPException(status_code=503, detail="Phone demo is unavailable: Exotel credentials are not fully configured.")
+
+    result = await ExotelService.trigger_outbound_call(
+        to_phone=f"+91{digits}",
+        caller_id=settings.EXOTEL_CALLER_NUMBER,
+        extra_custom_fields={
+            "client_name": demo_in.client_name.strip()[:100],
+            "business_name": demo_in.business_name.strip()[:150],
+            "business_type": demo_in.business_type.strip()[:150],
+            "language": (demo_in.language or "hi-IN")[:20],
+        },
+    )
+    if result.get("status") != "success":
+        detail = result.get("detail") or result.get("message") or "Exotel did not accept the call request."
+        logger.warning("Homepage demo Exotel dispatch failed: %s", detail)
+        raise HTTPException(status_code=502, detail=f"Call could not be placed: {str(detail)[:350]}")
+
+    return {
+        "status": "initiated",
+        "provider": "exotel",
+        "call_sid": result.get("call_sid"),
+        "phone": result.get("phone"),
+        "message": f"Exotel accepted the demo call request for +91{digits}.",
+    }
 
 @app.post("/api/campaigns/single-call")
 async def place_single_call(
@@ -3309,14 +3352,18 @@ async def place_single_call(
     db: AsyncSession = Depends(get_db)
 ):
     try:
+        if not (settings.EXOTEL_SID and settings.EXOTEL_API_KEY and settings.EXOTEL_API_TOKEN and settings.EXOTEL_CALLER_NUMBER):
+            raise HTTPException(status_code=503, detail="Outbound phone calls are unavailable: Exotel credentials are not fully configured.")
+
         raw_phone = call_req.phone_number.strip().replace(" ", "").replace("-", "")
         clean_phone = raw_phone.lstrip("+")
         if clean_phone.startswith("91") and len(clean_phone) == 12:
             clean_phone = clean_phone[2:]
-        if len(clean_phone) == 10:
-            formatted_dest = f"+91{clean_phone}"
-        else:
-            formatted_dest = f"+{clean_phone}"
+        if clean_phone.startswith("0") and len(clean_phone) == 11:
+            clean_phone = clean_phone[1:]
+        if len(clean_phone) != 10:
+            raise HTTPException(status_code=400, detail="Please enter a valid 10-digit Indian mobile number.")
+        formatted_dest = f"+91{clean_phone}"
 
         # 1. Fetch Agent details safely (Prevent PostgreSQL Foreign Key Violation!)
         agent = None
@@ -3373,8 +3420,9 @@ async def place_single_call(
             "system_prompt": agent_prompt
         }
 
-        # 3. Create LiveKit Room
-        room = await LiveKitService.create_outbound_call(formatted_dest, agent_id_val, user.tenant_id, custom_meta)
+        # Exotel handles the PSTN call and connects directly to the Exotel
+        # Voicebot WebSocket; a separate LiveKit room is not required here.
+        room = None
 
         # 4. Initialize CallLog in DB with valid agent foreign key!
         new_call_log = CallLog(
@@ -3397,21 +3445,29 @@ async def place_single_call(
 
         # 5. Trigger Exotel Outbound Call
         exotel_result = None
-        if settings.EXOTEL_SID and settings.EXOTEL_API_KEY:
-            try:
-                exotel_result = await ExotelService.trigger_outbound_call(
-                    to_phone=formatted_dest,
-                    caller_id=settings.EXOTEL_CALLER_NUMBER,
-                    call_id=new_call_log.id,
-                    tenant_id=user.tenant_id,
-                    agent_id=agent_id_val,
-                )
-                logger.info(f"Exotel call result: {exotel_result}")
-            except Exception as ex_err:
-                logger.warning(f"Exotel outbound error: {ex_err}")
+        try:
+            exotel_result = await ExotelService.trigger_outbound_call(
+                to_phone=formatted_dest,
+                caller_id=settings.EXOTEL_CALLER_NUMBER,
+                call_id=new_call_log.id,
+                tenant_id=user.tenant_id,
+                agent_id=agent_id_val,
+            )
+            logger.info(f"Exotel call result: {exotel_result}")
+        except Exception as ex_err:
+            logger.warning(f"Exotel outbound error: {ex_err}")
+            exotel_result = {"status": "error", "detail": str(ex_err)}
+
+        if not exotel_result or exotel_result.get("status") != "success":
+            detail = (exotel_result or {}).get("detail") or (exotel_result or {}).get("message") or "Exotel did not accept the call request."
+            new_call_log.call_status = "failed"
+            new_call_log.summary = f"Call failed: {str(detail)[:300]}"
+            new_call_log.whatsapp_status = "NONE"
+            await db.commit()
+            return JSONResponse(status_code=502, content={"status": "error", "detail": f"Exotel call failed: {str(detail)[:350]}"})
 
         wallet = (await db.execute(select(Wallet).where(Wallet.tenant_id == user.tenant_id))).scalar_one_or_none()
-        telephony_mode = "exotel_gsm" if (settings.EXOTEL_SID and settings.EXOTEL_API_KEY) else ("sip_trunk" if settings.EXOTEL_SIP_TRUNK_ID else "webrtc")
+        telephony_mode = "exotel_gsm"
         return {
             "status": "success",
             "room_name": room,
@@ -3422,6 +3478,8 @@ async def place_single_call(
             "exotel": exotel_result,
             "call_log_id": new_call_log.id
         }
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error in place_single_call: {e}", exc_info=True)
         return JSONResponse(
@@ -4663,6 +4721,7 @@ def get_builtin_fallback_wav() -> bytes:
 async def exotel_greeting_audio(
     request: Request, phone: Optional[str] = None,
     tenant_id: Optional[str] = None, agent_id: Optional[str] = None,
+    business_name: Optional[str] = None, client_name: Optional[str] = None,
 ):
     """
     Streams authentic Hindi Priya Voice WAV/MP3 to Exotel telecom line.
@@ -4702,7 +4761,12 @@ async def exotel_greeting_audio(
     except Exception as greeting_err:
         logger.warning("Could not load agent-specific Exotel greeting: %s", greeting_err)
     if not greeting_text:
-        greeting_text = "नमस्ते, क्या अभी बात करने का सही समय है?"
+        clean_business = (business_name or "").strip()[:150]
+        clean_client = (client_name or "").strip()[:100]
+        if clean_business:
+            greeting_text = f"नमस्ते {clean_client + ' जी, ' if clean_client else ''}मैं {clean_business} की AI सहायक बोल रही हूँ। क्या अभी बात करने का सही समय है?"
+        else:
+            greeting_text = "नमस्ते, क्या अभी बात करने का सही समय है?"
 
     cache_key = hashlib.sha256(f"{greeting_language}|{greeting_voice}|{greeting_custom_voice}|{greeting_text}".encode("utf-8")).hexdigest()
     cached_audio = EXOTEL_AUDIO_CACHE.get(cache_key)
@@ -4836,6 +4900,10 @@ async def exotel_voice_flow(request: Request, phone: Optional[str] = None, call_
         audio_params["tenant_id"] = tenant_id
     if agent_id:
         audio_params["agent_id"] = agent_id
+    for key in ("business_name", "business_type", "client_name"):
+        value = query.get(key) or (parsed_custom.get(key) or [None])[0]
+        if value:
+            audio_params[key] = value[:150]
     if phone or query.get("from"):
         audio_params["phone"] = phone or query.get("from")
     audio_stream_url = "https://call-genie-bs6x.onrender.com/api/telephony/exotel/greeting.wav"
