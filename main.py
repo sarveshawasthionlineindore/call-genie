@@ -1858,7 +1858,7 @@ async def voice_chat_endpoint(
     High-Class Corporate AI Telecaller powered by Google Gemini and Sarvam AI Bulbul with Voice RAG 2.0.
     Adapts dynamically to any universal business and strictly cites trained knowledge base facts.
     """
-        client_ip = request.headers.get("x-forwarded-for", "").split(",")[0].strip() or (request.client.host if request.client else "unknown")
+    client_ip = request.headers.get("x-forwarded-for", "").split(",")[0].strip() or (request.client.host if request.client else "unknown")
     if not check_rate_limit(client_ip, max_requests=30, window_seconds=60):
         raise HTTPException(status_code=429, detail="Too many messages sent. Please wait a moment before trying again.")
 
